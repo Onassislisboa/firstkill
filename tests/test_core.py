@@ -1590,6 +1590,40 @@ class TestPlaybook(unittest.TestCase):
         self.assertEqual(chart["by_chain"]["bnb"], -3)
         self.assertEqual(chart["series"]["total"][-1]["y"], 1        )
 
+    def test_pnl_windows_marks_partial_history(self):
+        from alphahound.preview import pnl_windows
+        from alphahound.store import Store
+
+        root = Path(tempfile.mkdtemp())
+        store = Store(root)
+        now = now_ms()
+        day = 86_400_000
+        store.record_trade(
+            TradeRecord(
+                key="solana:a",
+                chain=Chain.SOLANA,
+                venue=VenueId.PAPER,
+                opened_at_ms=now - 3 * day,
+                closed_at_ms=now - 3 * day,
+                entry_price=1,
+                exit_price=2,
+                size_usd=10,
+                pnl_usd=5,
+                fees_usd=0,
+                exit_reason=ExitReason.TAKE_PROFIT,
+                error_class=ErrorClass.WIN,
+                features=Features(),
+                weights_version=0,
+            )
+        )
+        w = pnl_windows(store, now=now)
+        by = {x["label"]: x for x in w["windows"]}
+        self.assertEqual(by["hoje"]["pnl_usd"], 0)
+        self.assertEqual(by["7d"]["pnl_usd"], 5)
+        self.assertTrue(by["30d"]["partial"])
+        self.assertEqual(by["30d"]["history_days"], w["history_days"])
+        self.assertLess(w["history_days"], 30)
+
 
 class TestVerdict(unittest.TestCase):
     def test_cluster_over_20_is_bundled_hard(self):

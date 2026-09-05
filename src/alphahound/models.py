@@ -115,6 +115,47 @@ def describe_exit(code: str | ExitReason) -> str:
     return EXIT_WHY.get(key, "")
 
 
+def _opt_num(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def legs_for_display(trade: TradeRecord) -> list[dict]:
+    """One row per sell fill. Old sqlite rows without legs get a single close."""
+    raw = [leg for leg in (trade.exit_legs or []) if isinstance(leg, dict)]
+    if not raw:
+        raw = [
+            {
+                "ts_ms": trade.closed_at_ms,
+                "usd_out": None,
+                "size_usd": round(trade.size_usd, 2),
+                "pnl_usd": round(trade.pnl_usd, 2),
+                "mcap": round(trade.mcap_exit_usd) if trade.mcap_exit_usd else None,
+                "reason": trade.exit_reason.value,
+                "why": describe_exit(trade.exit_reason),
+            }
+        ]
+    out: list[dict] = []
+    for leg in raw:
+        reason = str(leg.get("reason") or trade.exit_reason.value)
+        out.append(
+            {
+                "ts_ms": int(leg.get("ts_ms") or trade.closed_at_ms),
+                "usd_out": _opt_num(leg.get("usd_out")),
+                "size_usd": _opt_num(leg.get("size_usd")),
+                "pnl_usd": _opt_num(leg.get("pnl_usd")),
+                "mcap": _opt_num(leg.get("mcap")),
+                "reason": reason,
+                "why": str(leg.get("why") or describe_exit(reason)),
+            }
+        )
+    return out
+
+
 def describe_error(code: str | ErrorClass) -> str:
     key = code.value if isinstance(code, ErrorClass) else (code or "")
     return ERROR_WHY.get(key, "")
@@ -432,6 +473,7 @@ class Position:
     last_hold_rubric: float = 0.0
     last_hold_why: str = ""
     entry_mcap_usd: float = 0.0
+    exit_legs: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.tokens_remaining == 0.0:
@@ -483,6 +525,9 @@ class TradeRecord:
     symbol: str = ""
     mcap_entry_usd: float = 0.0
     mcap_exit_usd: float = 0.0
+    # One dict per fill. Ladder rungs land here; the sqlite row is still the
+    # round-trip total the learner uses.
+    exit_legs: list[dict] = field(default_factory=list)
 
     @property
     def pnl_pct(self) -> float:

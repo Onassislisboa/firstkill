@@ -14,9 +14,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .models import Chain, now_ms, describe_error, describe_exit
+from .models import Chain, now_ms, describe_error, describe_exit, legs_for_display
 from .playbook import max_age_minutes
-from .risk import RiskEngine
+from .risk import RiskEngine, utc_day_start_ms
 from .settings import (
     Config,
     Settings,
@@ -101,6 +101,37 @@ def pnl_curves(trades: list) -> dict[str, Any]:
     }
 
 
+_DAY_MS = 86_400_000
+
+
+def pnl_windows(store: Store, now: int | None = None) -> dict[str, Any]:
+    now = int(now or now_ms())
+    oldest = store.oldest_close_ms()
+    hist_days = 0
+    if oldest:
+        hist_days = max(1, (now - oldest + _DAY_MS - 1) // _DAY_MS)
+
+    def pack(label: str, since_ms: int, span_days: int | None = None) -> dict[str, Any]:
+        partial = bool(span_days and hist_days and hist_days < span_days)
+        return {
+            "label": label,
+            "pnl_usd": round(store.realized_pnl(since_ms=since_ms), 2),
+            "since_ms": since_ms,
+            "partial": partial,
+            "history_days": hist_days if partial else (min(hist_days, span_days) if span_days else hist_days),
+        }
+
+    return {
+        "history_days": hist_days,
+        "windows": [
+            pack("hoje", utc_day_start_ms(now / 1000.0)),
+            pack("7d", now - 7 * _DAY_MS, 7),
+            pack("15d", now - 15 * _DAY_MS, 15),
+            pack("30d", now - 30 * _DAY_MS, 30),
+        ],
+    }
+
+
 _BOOK: tuple[float, dict[str, Any]] | None = None
 
 
@@ -132,6 +163,7 @@ def _closed_book(store: Store) -> dict[str, Any]:
                 "symbol": t.symbol or "",
                 "mcap_entry": round(t.mcap_entry_usd),
                 "mcap_exit": round(t.mcap_exit_usd),
+                "exit_legs": legs_for_display(t),
             }
             for t in reversed(recent)
         ],
@@ -141,6 +173,7 @@ def _closed_book(store: Store) -> dict[str, Any]:
         "realized": round(store.realized_pnl(), 2),
         "closed_n": store.trade_count(),
         "pnl_chart": pnl_curves(sample),
+        "pnl_windows": pnl_windows(store),
         "sample_n": len(sample),
     }
     _BOOK = (now, book)
@@ -200,6 +233,7 @@ def assemble(
         "kols": load_kols(state_dir),
         "fomo": load_fomo(state_dir),
         "pnl_chart": book["pnl_chart"],
+        "pnl_windows": book["pnl_windows"],
         "aggressive": bool(strategy and strategy.get("aggressive_learning._active")),
         "aggressive_closes": aggressive_closes_since_on(store) if strategy else 0,
         "min_p": score_floors(strategy, store)[0] if strategy else None,
@@ -263,6 +297,12 @@ HTML = """<!doctype html>
   #pnl-chart { width: 100%; height: 240px; display: block; }
   .pnl-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
                gap: 10px; padding: 14px 20px; }
+  .pnl-windows { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+                 gap: 8px; margin: 0; padding: 14px 20px 0; }
+  .pnl-windows .pw { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: #050505; }
+  .pnl-windows .pw .n { font-size: 18px; font-weight: 800; }
+  .exit-legs { margin: 6px 0 0; padding-left: 16px; color: var(--muted); font-size: 11px; }
+  .exit-legs li { margin: 2px 0; }
   .v-bundled { color: #ff3b4e; } .v-cabaled { color: #ffb020; }
   .v-organic { color: #5b8cff; } .v-unverified { color: #6a6a6a; }
   tr.pick { cursor: pointer; }
@@ -460,6 +500,7 @@ HTML = """<!doctype html>
   </section>
 </div>
 <div id="tab-pnl" class="panel">
+  <div class="pnl-windows" id="pnl-windows"></div>
   <div class="pnl-cards" id="pnl-cards"></div>
   <section>
     <h1>equity curve</h1>
@@ -878,7 +919,7 @@ document.addEventListener('click', e => {
     return;
   }
   const rev = e.target.closest('.rev-row');
-  if (rev) {
+  if (rev && !e.target.closest('[data-copy]')) {
     const feat = document.querySelector('[data-rev-feat="'+rev.dataset.rev+'"]');
     if (feat) feat.hidden = !feat.hidden;
     return;
@@ -904,7 +945,7 @@ document.addEventListener('click', e => {
   const b = e.target.closest('[data-copy]');
   if (!b) return;
   const s = b.dataset.copy;
-  const done = () => { const old = b.textContent; b.textContent = 'ok'; setTimeout(() => { b.textContent = old; }, 700); };
+  const done = () => { const old = b.textContent; b.textContent = 'copiado'; setTimeout(() => { b.textContent = old; }, 700); };
   const go = (navigator.clipboard && navigator.clipboard.writeText)
     ? navigator.clipboard.writeText(s) : Promise.reject();
   go.then(done).catch(() => {
@@ -981,6 +1022,27 @@ function paintFomo(list) {
   </tr>`, 'nenhum perfil', 4);
 }
 
+function paintPnlWindows(w) {
+  const el = $('pnl-windows');
+  if (!el) return;
+  const wins = (w && w.windows) || [];
+  el.innerHTML = wins.map(x => {
+    const lab = x.partial
+      ? x.label+' (parcial, '+x.history_days+' dias de histórico)'
+      : x.label;
+    return '<div class="pw"><div class="muted">'+esc(lab)+'</div><div class="n '+cls(x.pnl_usd)+'">'+usd(x.pnl_usd||0)+'</div></div>';
+  }).join('');
+}
+const clock = ms => ms ? new Date(ms).toLocaleString(undefined, {year:'numeric', month:'short', day:'numeric', hour:'2-digit', minute:'2-digit', second:'2-digit'}) : '—';
+function exitLegsHtml(legs) {
+  if (!legs || !legs.length) return '';
+  return '<ul class="exit-legs">'+legs.map(l => {
+    const amt = l.usd_out != null ? usd(l.usd_out) : (l.size_usd != null ? usd(l.size_usd) : '—');
+    const mcap = l.mcap != null ? mcapTxt(l.mcap) : '—';
+    const pnl = l.pnl_usd != null ? (' · pnl '+usd(l.pnl_usd)) : '';
+    return '<li>'+clock(l.ts_ms)+' · vendeu '+amt+pnl+' · mcap '+mcap+(l.reason ? ' · '+esc(l.reason) : '')+'</li>';
+  }).join('')+'</ul>';
+}
 let lastPnlSig = '';
 function paintPnl(chart) {
   const cards = $('pnl-cards');
@@ -1066,10 +1128,15 @@ async function tick() {
     <td class="pnl ${cls(t.pnl_usd)}">${usd(t.pnl_usd)} <span class="muted">${pct(t.pnl_pct)}</span></td>
     <td class="mcap-path">${mcapPath(t.mcap_entry, t.mcap_exit)}</td>
     <td>${t.hold_min != null ? mins(t.hold_min) : '—'}</td>
-    <td class="muted" title="${esc(t.exit_why||'')}">${t.exit}<div class="meta">${esc(t.exit_why||'')}</div></td></tr>`, 'none closed', 6);
+    <td class="muted" title="${esc(t.exit_why||'')}">${t.exit}
+      <div class="meta">${esc(t.exit_why||'')}</div>
+      <div class="meta">${clock(t.closed_at_ms)}</div>
+      ${exitLegsHtml(t.exit_legs)}
+    </td></tr>`, 'none closed', 6);
   paintKols(d.kols);
   paintFomo(d.fomo);
   paintPnl(d.pnl_chart);
+  paintPnlWindows(d.pnl_windows);
   inflight = false;
 }
 const OUT_LAB = {fumble:'fumble', rejeicao_correta:'rejeição correta', entrada_correta:'entrada correta',
@@ -1090,11 +1157,14 @@ async function loadReview() {
         : (r.mfe==null ? '—' : pct(r.mfe));
       const feat = (r.contrib||[]).map(kv => kv[0]+' '+(kv[1]>=0?'+':'')+Number(kv[1]).toFixed(2)).join(' · ') || '—';
       const why = [r.exit_why, r.error_why, r.reason_why].filter((s,i,a) => s && a.indexOf(s)===i).join(' · ');
+      const soldBits = r.action==='enter'
+        ? ('<div class="meta">'+clock(r.closed_at_ms || r.ts_ms)+'</div>'+exitLegsHtml(r.exit_legs))
+        : '';
       return `<tr class="rev-row" data-rev="${i}"><td>${when(r.ts_ms)}</td>
-        <td><div class="sym">${esc(r.symbol||caHead(ca))}</div><div class="ca">${chainShort(r.chain||'')} ${esc(caHead(ca))}</div></td>
+        <td><div class="sym">${esc(r.symbol||caHead(ca))}</div><div class="ca">${chainShort(r.chain||'')} ${esc(caHead(ca))} ${copyBtn(ca)}</div></td>
         <td>${esc(r.action)}<div class="meta">${esc(r.reason||'')}</div></td>
         <td>${pct(r.p)} / ${pct(r.ev)}</td>
-        <td>${res}</td>
+        <td>${res}${soldBits}</td>
         <td class="out-${esc(r.outcome)}">${OUT_LAB[r.outcome]||r.outcome}</td></tr>
         <tr class="rev-feat" data-rev-feat="${i}" hidden><td colspan="6">${esc(why ? why+' · ' : '')}${esc(feat)}</td></tr>`;
     }).join('') || '<tr><td colspan="6" class="muted">vazio</td></tr>';

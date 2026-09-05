@@ -31,6 +31,7 @@ from .models import (
     describe_code,
     describe_error,
     describe_exit,
+    legs_for_display,
     now_ms,
 )
 
@@ -90,7 +91,8 @@ CREATE TABLE IF NOT EXISTS trades (
     unknown TEXT NOT NULL DEFAULT '[]',
     symbol TEXT NOT NULL DEFAULT '',
     mcap_entry_usd REAL NOT NULL DEFAULT 0,
-    mcap_exit_usd REAL NOT NULL DEFAULT 0
+    mcap_exit_usd REAL NOT NULL DEFAULT 0,
+    exit_legs TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_trades_closed ON trades(closed_at_ms);
 
@@ -194,6 +196,19 @@ def unknown_from_json(payload: str | None) -> set[str]:
         return set()
 
 
+def _legs_from_row(row: sqlite3.Row) -> list[dict]:
+    if "exit_legs" not in row.keys():
+        return []
+    raw = row["exit_legs"]
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return []
+    return data if isinstance(data, list) else []
+
+
 class Store:
     def __init__(self, state_dir: Path) -> None:
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -211,6 +226,7 @@ class Store:
             ("trades", "symbol", "TEXT NOT NULL DEFAULT ''"),
             ("trades", "mcap_entry_usd", "REAL NOT NULL DEFAULT 0"),
             ("trades", "mcap_exit_usd", "REAL NOT NULL DEFAULT 0"),
+            ("trades", "exit_legs", "TEXT NOT NULL DEFAULT '[]'"),
         ):
             existing = {
                 r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -406,6 +422,10 @@ class Store:
                         "pnl_usd": round(float(t.pnl_usd), 2),
                         "outcome": kind,
                         "contrib": contribs(d["contributions"] if d else "{}"),
+                        "closed_at_ms": int(t.closed_at_ms),
+                        "mcap_entry": round(t.mcap_entry_usd),
+                        "mcap_exit": round(t.mcap_exit_usd),
+                        "exit_legs": legs_for_display(t),
                     }
                 )
 
@@ -423,8 +443,8 @@ class Store:
             """INSERT INTO trades (key, chain, venue, opened_at_ms, closed_at_ms,
                    entry_price, exit_price, signal_price, size_usd, pnl_usd, fees_usd,
                    exit_reason, error_class, mfe, mae, entry_slippage, features,
-                   weights_version, notes, unknown, symbol, mcap_entry_usd, mcap_exit_usd)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   weights_version, notes, unknown, symbol, mcap_entry_usd, mcap_exit_usd, exit_legs)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 trade.key,
                 trade.chain.value,
@@ -449,6 +469,7 @@ class Store:
                 trade.symbol,
                 trade.mcap_entry_usd,
                 trade.mcap_exit_usd,
+                json.dumps(trade.exit_legs or []),
             ),
         )
         return int(cur.lastrowid or 0)
@@ -489,11 +510,16 @@ class Store:
             symbol=row["symbol"] if "symbol" in row.keys() else "",
             mcap_entry_usd=float(row["mcap_entry_usd"] or 0) if "mcap_entry_usd" in row.keys() else 0.0,
             mcap_exit_usd=float(row["mcap_exit_usd"] or 0) if "mcap_exit_usd" in row.keys() else 0.0,
+            exit_legs=_legs_from_row(row),
         )
 
     def trade_count(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) AS n FROM trades").fetchone()
         return int(row["n"])
+
+    def oldest_close_ms(self) -> int:
+        row = self.conn.execute("SELECT MIN(closed_at_ms) AS t FROM trades").fetchone()
+        return int(row["t"] or 0)
 
     def realized_pnl(self, since_ms: int = 0) -> float:
         row = self.conn.execute(

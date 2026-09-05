@@ -41,6 +41,7 @@ from .models import (
     Score,
     TradeRecord,
     VenueId,
+    describe_exit,
     now_ms,
 )
 from .net import Http
@@ -552,6 +553,18 @@ class Engine:
         position.tokens_remaining = max(0.0, position.tokens_remaining - tokens)
         position.last_exit_price = fill.price
         position.last_exit_reason = reason.value
+        position.exit_legs.append(
+            {
+                "ts_ms": now_ms(),
+                "usd_out": round(fill.amount_out, 2),
+                "size_usd": round(cost_basis, 2),
+                "pnl_usd": round(fill.amount_out - cost_basis, 2),
+                "mcap": round(position.candidate.mcap_usd),
+                "reason": reason.value,
+                "why": describe_exit(reason),
+                "tokens": tokens,
+            }
+        )
 
         log.info(
             "exit",
@@ -595,6 +608,7 @@ class Engine:
             symbol=position.candidate.symbol or "",
             mcap_entry_usd=position.entry_mcap_usd or position.candidate.mcap_usd,
             mcap_exit_usd=position.candidate.mcap_usd,
+            exit_legs=list(position.exit_legs),
         )
         trade.error_class = learning.classify(trade, self.strategy)
         self.store.record_trade(trade)
