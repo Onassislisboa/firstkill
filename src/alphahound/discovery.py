@@ -63,6 +63,7 @@ class Discovery:
         self.stats = DiscoveryStats()
 
         self._seen: dict[str, int] = {}
+        self._seen_addr: dict[str, int] = {}
         self._queue: asyncio.Queue[Candidate] = asyncio.Queue(maxsize=2000)
         self._tasks: list[asyncio.Task] = []
         self._watchlist: set[str] = set()
@@ -96,14 +97,17 @@ class Discovery:
         addresses: list[str] = []
         sources: dict[str, str] = {}
 
-        for source, coro in (
-            ("dexscreener_profiles", self.dex.new_profiles()),
-            ("dexscreener_boosts", self.dex.boosted()),
+        fetched = await asyncio.gather(
+            self.dex.new_profiles(),
+            self.dex.boosted(),
+            return_exceptions=True,
+        )
+        for source, found in (
+            ("dexscreener_profiles", fetched[0]),
+            ("dexscreener_boosts", fetched[1]),
         ):
-            try:
-                found = await coro
-            except Exception as exc:  # noqa: BLE001
-                log.warning("source failed", extra={"source": source, "error": str(exc)})
+            if isinstance(found, Exception):
+                log.warning("source failed", extra={"source": source, "error": str(found)})
                 continue
             for address in found:
                 if address not in sources:
@@ -116,6 +120,13 @@ class Discovery:
                 addresses.append(address)
 
         out: list[Candidate] = []
+        # Repeat profile CAs don't need token_pairs again this minute; that
+        # call was starving the visor quote loop on the same Dexscreener bucket.
+        addresses = [
+            a
+            for a in addresses
+            if sources.get(a) in {"dexscreener_boosts", "inspect"} or self._pair_unknown(a)
+        ]
         # token_pairs takes 30 addresses per call, so this is len/30 requests
         # rather than len.
         for chunk_start in range(0, len(addresses), 30):
@@ -162,16 +173,25 @@ class Discovery:
             self.stats.dropped_duplicate += 1
             return False
         self._seen[candidate.key] = now_ms()
+        if candidate.address:
+            self._seen_addr[candidate.address.lower()] = now_ms()
 
         self.stats.emitted += 1
         self.stats.by_source[candidate.source] = self.stats.by_source.get(candidate.source, 0) + 1
         return True
+
+    def _pair_unknown(self, address: str) -> bool:
+        ts = self._seen_addr.get((address or "").lower(), 0)
+        return now_ms() - ts >= 60_000
 
     def prune(self) -> None:
         cutoff = now_ms() - int(self.max_age_minutes * 60_000) * 2
         for key, ts in list(self._seen.items()):
             if ts < cutoff:
                 del self._seen[key]
+        for addr, ts in list(self._seen_addr.items()):
+            if ts < cutoff:
+                del self._seen_addr[addr]
 
     # -- streaming ---------------------------------------------------------
     async def _pump_stream(self) -> None:

@@ -124,7 +124,8 @@ class Enricher:
     async def refresh(self, candidate: Candidate) -> PairSnapshot | None:
         """Update price/liquidity in place from the free provider."""
         snaps = await self.dex.token_pairs([candidate.address])
-        snap = next((s for s in snaps if s.token_address == candidate.address), None)
+        want = candidate.address.lower()
+        snap = next((s for s in snaps if s.token_address.lower() == want), None)
         if snap is None:
             return None
         candidate.price_usd = snap.price_usd or candidate.price_usd
@@ -132,8 +133,8 @@ class Enricher:
         candidate.mcap_usd = snap.mcap_usd or candidate.mcap_usd
         candidate.volume_5m_usd = snap.volume_m5
         candidate.pool_address = candidate.pool_address or snap.pair_address
-        candidate.created_at_ms = candidate.created_at_ms or snap.created_at_ms
         candidate.symbol = candidate.symbol or snap.symbol
+        candidate.name = candidate.name or snap.name
         candidate.dex_id = candidate.dex_id or snap.dex_id
         candidate.ret_5m = snap.price_change_m5
         snap.stamp(candidate)
@@ -162,6 +163,11 @@ class Enricher:
         }
         if candidate.pack_role:
             measured.update(pack)
+        vol_score = chart.volatility_volume_score(
+            candidate.volume_5m_usd, candidate.mcap_usd, candidate.ret_5m
+        )
+        if candidate.mcap_usd > 0 and candidate.volume_5m_usd > 0:
+            measured.add("volatility_volume_score")
         result.unknown.update(set(Features.names()) - measured)
         result.features = Features(
             liquidity_usd=candidate.liquidity_usd,
@@ -170,6 +176,7 @@ class Enricher:
             ),
             token_age_minutes=candidate.age_minutes,
             dex_profile=candidate.dex_profile,
+            volatility_volume_score=vol_score,
             **pack,
         )
         return result
@@ -225,25 +232,38 @@ class Enricher:
                 minutes=int(cfg.get("lookback_candles", 30)),
             )
         result.candles = candles
+        vol_5m = candidate.volume_5m_usd
+        mcap = candidate.mcap_usd
+        ret_5m = candidate.ret_5m
         if candles:
-            return chart.extract(candles, cfg)
-
-        # No candle provider. On Solana the trade stream gives us real candles
-        # a few lines further down; everywhere else we fall back to the
-        # aggregate price changes, which are coarse but not wrong.
-        if snap is not None:
+            values = chart.extract(candles, cfg)
+            values["volatility_volume_score"] = chart.volatility_volume_score(
+                vol_5m, mcap, values.get("ret_5m", ret_5m), chart.swing_range_pct(candles)
+            )
+        elif snap is not None:
+            # No candle provider. On Solana the trade stream gives us real candles
+            # a few lines further down; everywhere else we fall back to the
+            # aggregate price changes, which are coarse but not wrong.
             result.unknown.update({"vwap_dev", "atr_pct", "breakout", "volume_z", "body_ratio"})
             result.notes.append("chart from aggregate price changes, no candles")
-            return {
+            values = {
                 "ret_5m": snap.price_change_m5,
                 "ret_15m": snap.price_change_h1,
                 "parabolic": min(
                     1.0,
                     max(0.0, snap.price_change_h1 / float(cfg.get("parabolic_return_threshold", 1.5))),
                 ),
+                "volatility_volume_score": chart.volatility_volume_score(
+                    vol_5m, mcap, snap.price_change_m5
+                ),
             }
-        result.unknown.add("chart")
-        return {}
+        else:
+            result.unknown.add("chart")
+            values = {}
+        if mcap <= 0 or vol_5m <= 0:
+            result.unknown.add("volatility_volume_score")
+            values.pop("volatility_volume_score", None)
+        return values
 
     # -- chain -------------------------------------------------------------
     async def _onchain_features(
@@ -256,7 +276,54 @@ class Enricher:
         values = self._aggregate_only_features(candidate, result)
         values.update(await self._evm_launch_distribution(candidate, result))
         values.update(await self._evm_labeled_crowd(candidate, result))
+        values.update(await self._evm_lp_lock(candidate, result))
         result.chain_probed = True
+        return values
+
+    async def _evm_lp_lock(self, candidate: Candidate, result: Enrichment) -> dict[str, float]:
+        """Fill lp_locked_pct from V4/V3 NFTs (Hood) or V2 LP token (BNB)."""
+        if candidate.chain not in (Chain.ROBINHOOD_CHAIN, Chain.BNB):
+            result.unknown.add("lp_locked_pct")
+            return {}
+        cached = self._evm_cached(f"lp:{candidate.key}")
+        if cached is not None:
+            if cached.get("unknown"):
+                result.unknown.add("lp_locked_pct")
+            else:
+                result.unknown.discard("lp_locked_pct")
+            if cached.get("note"):
+                result.notes.append(str(cached["note"]))
+            return dict(cached.get("values") or {})
+        rpc = self.evm_rpcs.get(candidate.chain)
+        if rpc is None:
+            result.unknown.add("lp_locked_pct")
+            result.notes.append("lp lock skipped: no RPC")
+            return {}
+        from .lp_lock import probe_lp_lock
+
+        extra = [
+            str(a).strip()
+            for a in (self.strategy.get("gates.lp_locker_addresses") or [])
+            if str(a).strip()
+        ]
+        probe = await probe_lp_lock(
+            rpc,
+            chain=candidate.chain,
+            pool=candidate.pool_address,
+            created_at_ms=candidate.created_at_ms,
+            extra_lockers=extra,
+        )
+        result.notes.append(probe.note)
+        values = {"lp_locked_pct": probe.locked_pct}
+        if not probe.ok:
+            result.unknown.add("lp_locked_pct")
+            values = {}
+        else:
+            result.unknown.discard("lp_locked_pct")
+        self._evm_put(
+            f"lp:{candidate.key}",
+            {"values": values, "note": probe.note, "unknown": not probe.ok},
+        )
         return values
 
     def _evm_cached(self, key: str) -> dict[str, Any] | None:
@@ -275,6 +342,7 @@ class Enricher:
         """Launch bundle + token-source cluster from ERC-20 Transfer logs."""
         rpc = self.evm_rpcs.get(candidate.chain)
         if rpc is None or not candidate.address:
+            result.unknown.add("cluster_pct")
             return {}
         cached = self._evm_cached(f"dist:{candidate.key}")
         if cached is not None:
@@ -320,16 +388,19 @@ class Enricher:
             )
         except Exception as exc:  # noqa: BLE001
             result.notes.append(f"transfer logs failed: {exc}")
+            result.unknown.add("cluster_pct")
             return {}
         moves = [m for m in (decode_transfer_log(x) for x in raw) if m]
         if not moves:
             result.notes.append("transfer logs empty in lookback")
+            result.unknown.add("cluster_pct")
             return {}
         pools = {candidate.pool_address.lower()} if candidate.pool_address else set()
         holders, launch = holders_from_moves(
             moves, pools=pools, deployer=candidate.deployer, first_n=first_n
         )
         if not holders:
+            result.unknown.add("cluster_pct")
             return {}
         stats = analyze(holders, now_ms=now_ms(), launch_slot=launch, bundle_slot_window=window)
         token_cluster = stats.largest_funding_cluster_pct
@@ -570,7 +641,15 @@ class Enricher:
             )
             if result.candles:
                 values.update(chart.extract(result.candles, self.strategy.section("chart")))
+                values["volatility_volume_score"] = chart.volatility_volume_score(
+                    candidate.volume_5m_usd,
+                    candidate.mcap_usd,
+                    values.get("ret_5m", candidate.ret_5m),
+                    chart.swing_range_pct(result.candles),
+                )
                 result.unknown -= {"vwap_dev", "atr_pct", "breakout", "volume_z", "body_ratio"}
+                if candidate.mcap_usd > 0 and candidate.volume_5m_usd > 0:
+                    result.unknown.discard("volatility_volume_score")
 
         attribution = terminals.attribute(buys, self.registry)
         result.attribution = attribution
@@ -740,6 +819,7 @@ class Enricher:
                 holders_ok = True
         if holders_ok:
             out["cluster_pct"] = cluster
+            result.unknown.discard("cluster_pct")
         else:
             result.unknown.add("cluster_pct")
 
@@ -805,6 +885,7 @@ class Enricher:
         result.unknown.update(
             {
                 "holder_count",
+                "holder_growth_5m",
                 "top10_pct",
                 "gini",
                 "fresh_wallet_pct",
@@ -814,6 +895,8 @@ class Enricher:
                 "retail_share_delta_5m",
                 "bot_share",
                 "axiom_share",
+                "axiom_share_delta_5m",
+                "unknown_share",
                 "known_holder_pct",
                 "top1_pct",
                 "mint_authority",
@@ -822,6 +905,9 @@ class Enricher:
                 "fomo_net_flow",
                 "whale_hold_pct",
                 "whale_net_flow",
+                "smart_money_buys",
+                "cluster_pct",
+                "lp_locked_pct",
             }
         )
         result.notes.append(f"{candidate.chain.value}: aggregate-only enrichment")
@@ -946,3 +1032,11 @@ class Enricher:
         self._holder_history.pop(key, None)
         self._evm_cache.pop(f"dist:{key}", None)
         self._evm_cache.pop(f"crowd:{key}", None)
+
+    def exit_tape(self, candidate: Candidate) -> dict[str, float]:
+        """Volume/holder slope at this tick. Entry features are stale by exit."""
+        out = {"vol5m": round(float(candidate.volume_5m_usd or 0.0), 2)}
+        hist = self._holder_history.get(candidate.key) or []
+        if len(hist) >= 2:
+            out["holder_growth_5m"] = round(holder_growth(hist, 300_000), 4)
+        return out

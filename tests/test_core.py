@@ -37,6 +37,7 @@ from alphahound.models import (  # noqa: E402
     Side,
     TradeRecord,
     VenueId,
+    legs_for_display,
     now_ms,
 )
 from alphahound.engine import enrich_due, loop_bug  # noqa: E402
@@ -204,6 +205,47 @@ class TestDistribution(unittest.TestCase):
         self.assertNotIn("fresh_wallet_pct", honest)
         self.assertGreater(lied.get("bundle_pct", 0.0), 0.3)
         self.assertNotIn("bundle_pct", honest)
+
+    def test_evm_aggregate_marks_unmeasured_features_unknown(self):
+        from alphahound.signals import Enricher, Enrichment
+
+        c = Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0x" + "ab" * 20, symbol="X")
+        enr = Enrichment(candidate=c, features=Features())
+        Enricher.__new__(Enricher)._aggregate_only_features(c, enr)
+        for name in (
+            "holder_growth_5m",
+            "axiom_share_delta_5m",
+            "unknown_share",
+            "smart_money_buys",
+            "cluster_pct",
+            "lp_locked_pct",
+        ):
+            self.assertIn(name, enr.unknown)
+            self.assertEqual(normalize(Features(), enr.unknown)[name], 0.0)
+
+    def test_evm_lp_lock_skipped_chain_is_unknown_not_unlocked(self):
+        from alphahound.signals import Enricher, Enrichment
+
+        e = Enricher.__new__(Enricher)
+        e.evm_rpcs = {}
+        e._evm_cache = {}
+        c = Candidate(chain=Chain.BASE, address="0x" + "ab" * 20, symbol="X")
+        enr = Enrichment(candidate=c, features=Features())
+        out = asyncio.run(e._evm_lp_lock(c, enr))
+        self.assertEqual(out, {})
+        self.assertIn("lp_locked_pct", enr.unknown)
+
+    def test_evm_cluster_unmeasured_when_transfer_path_cannot_run(self):
+        from alphahound.signals import Enricher, Enrichment
+
+        e = Enricher.__new__(Enricher)
+        e.evm_rpcs = {}
+        e._evm_cache = {}
+        c = Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0x" + "ab" * 20, symbol="X")
+        enr = Enrichment(candidate=c, features=Features())
+        out = asyncio.run(e._evm_launch_distribution(c, enr))
+        self.assertEqual(out, {})
+        self.assertIn("cluster_pct", enr.unknown)
 
 
 class TestChart(unittest.TestCase):
@@ -392,6 +434,7 @@ class TestGates(unittest.TestCase):
             bot_share=0.10,
             retail_share=0.15,
             round_trip_cost=0.02,
+            lp_locked_pct=1.0,
         )
         for name, value in overrides.items():
             setattr(features, name, value)
@@ -450,8 +493,36 @@ class TestGates(unittest.TestCase):
             watch_call(vetoed=True, ok=False, reasons=["chase: rip", "vamp: clone"]),
             "skip",
         )
+        self.assertEqual(
+            watch_call(vetoed=True, ok=False, reasons=["mcap: 80000 below 100000 floor"]),
+            "wait",
+        )
         self.assertEqual(watch_call(vetoed=False, ok=False, reasons=[]), "wait")
         self.assertEqual(watch_call(vetoed=False, ok=True, reasons=[]), "trade")
+
+    def test_volatility_volume_is_a_prior_not_a_gate(self):
+        from alphahound.models import Features
+        from alphahound.scoring import PRIOR_WEIGHTS, normalize
+        from alphahound.signals.chart import volatility_volume_score
+
+        self.assertIn("volatility_volume_score", Features.names())
+        self.assertGreater(PRIOR_WEIGHTS["volatility_volume_score"], 0.0)
+        self.assertLess(PRIOR_WEIGHTS["volatility_volume_score"], abs(PRIOR_WEIGHTS["parabolic"]))
+        self.assertEqual(PRIOR_WEIGHTS["parabolic"], -1.20)
+        dip = volatility_volume_score(40_000, 100_000, 0.0)
+        ripped = volatility_volume_score(40_000, 100_000, 0.30)
+        quiet = volatility_volume_score(5_000, 100_000, 0.0)
+        self.assertGreater(dip, quiet)
+        self.assertGreater(ripped, dip)
+        self.assertLess(dip / ripped, 1.15)
+        raw = normalize(Features(volatility_volume_score=0.5), unknown=set())
+        missing = normalize(Features(volatility_volume_score=0.5), unknown={"volatility_volume_score"})
+        self.assertAlmostEqual(raw["volatility_volume_score"], 0.5)
+        self.assertEqual(missing["volatility_volume_score"], 0.0)
+        src = Path(__file__).resolve().parents[1] / "src" / "alphahound" / "scoring.py"
+        gates = src.read_text(encoding="utf-8")
+        gate_fn = gates[gates.index("def evaluate_gates") : gates.index("def patience_only")]
+        self.assertNotIn("volatility_volume_score", gate_fn)
 
     def test_hood_official_x_is_not_required(self):
         enr = self.enrichment(twitter_mentions=5.0)
@@ -679,6 +750,28 @@ class TestGates(unittest.TestCase):
         enr.mint = _FakeMint(None, None)
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=False)
         self.assertTrue(any(v.startswith("bundle:") for v in vetoes), vetoes)
+
+    def test_hood_free_lp_nft_is_a_hard_veto(self):
+        enr = self.enrichment(lp_locked_pct=0.0)
+        enr.mint = _FakeMint(None, None)
+        enr.candidate.chain = Chain.ROBINHOOD_CHAIN
+        enr.candidate.dex_id = "uniswap"
+        enr.candidate.address = "0xabc"
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=False)
+        self.assertTrue(any(v.startswith("lp_unlocked:") for v in vetoes), vetoes)
+        locked = self.enrichment(lp_locked_pct=1.0)
+        locked.mint = _FakeMint(None, None)
+        locked.candidate.chain = Chain.ROBINHOOD_CHAIN
+        locked.candidate.dex_id = "uniswap"
+        locked.candidate.address = "0xabc"
+        vetoes, _ = evaluate_gates(locked, STRATEGY, self.store, live=False)
+        self.assertFalse(any(v.startswith("lp_unlocked:") for v in vetoes), vetoes)
+
+    def test_solana_does_not_use_the_lp_nft_gate(self):
+        enr = self.enrichment(lp_locked_pct=0.0)
+        enr.mint = _FakeMint(None, None)
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=False)
+        self.assertFalse(any(v.startswith("lp_unlocked:") for v in vetoes), vetoes)
 
     def test_robinhood_age_is_not_an_entry_veto(self):
         enr = self.enrichment()
@@ -990,6 +1083,31 @@ class TestExits(unittest.TestCase):
         self.assertIs(orders[0].reason, ExitReason.THESIS_CUT)
         self.assertIn("tape", orders[0].note)
 
+    def test_hot_tape_waits_past_twelve_percent(self):
+        position = self.position()
+        position.opened_at_ms = now_ms() - 26 * 60_000
+        position.candidate.mcap_usd = 100_000
+        position.candidate.volume_5m_usd = 80_000
+        position.entry_vol_score = 1.0
+        position.candidate.ret_5m = -0.15
+        self.assertEqual(self.manager.evaluate(position, 1.12, 100_000.0), [])
+        position.candidate.ret_5m = -0.20
+        orders = self.manager.evaluate(position, 1.12, 100_000.0)
+        self.assertEqual(len(orders), 1)
+        self.assertIs(orders[0].reason, ExitReason.THESIS_CUT)
+
+    def test_hot_trail_uses_token_regime_not_a_new_base(self):
+        armed = self.position()
+        armed.candidate.mcap_usd = 100_000
+        armed.candidate.volume_5m_usd = 80_000
+        armed.entry_vol_score = 1.0
+        self.manager.evaluate(armed, 1.50, 100_000.0)
+        self.assertTrue(armed.trailing_active)
+        # 25% off 1.50 is inside a hot 22% * 1.5 trail, outside the raw 22%.
+        self.assertEqual(self.manager.evaluate(armed, 1.50 * 0.75, 100_000.0), [])
+        orders = self.manager.evaluate(armed, 1.50 * 0.65, 100_000.0)
+        self.assertIs(orders[0].reason, ExitReason.TRAILING_STOP)
+
     def test_excursions(self):
         position = self.position()
         self.manager.observe(position, 3.0, 100_000.0)
@@ -1252,6 +1370,39 @@ class TestProviderCache(unittest.TestCase):
         self.assertIn("OTHER", http.calls[1])
         self.assertNotIn("MINT", http.calls[1].rsplit("/", 1)[-1])
 
+    def test_stamp_uses_pair_birth_not_visor_arrival(self):
+        from alphahound.providers import PairSnapshot, pair_created_ms
+
+        self.assertEqual(pair_created_ms(1_700_000_000), 1_700_000_000_000)
+        self.assertEqual(pair_created_ms(1_700_000_000_000), 1_700_000_000_000)
+        birth = now_ms() - 90 * 60_000
+        seen = now_ms() - 60_000
+        snap = PairSnapshot(
+            chain=Chain.ROBINHOOD_CHAIN,
+            pair_address="0xpool",
+            token_address="0xtoken",
+            symbol="AD",
+            name="AD",
+            price_usd=1.0,
+            liquidity_usd=1.0,
+            mcap_usd=1.0,
+            volume_m5=1.0,
+            volume_h1=1.0,
+            buys_m5=1,
+            sells_m5=1,
+            price_change_m5=0.0,
+            price_change_h1=0.0,
+            created_at_ms=birth,
+        )
+        c = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xtoken",
+            created_at_ms=seen,
+            source="hood_stream",
+        )
+        snap.stamp(c)
+        self.assertEqual(c.created_at_ms, birth)
+
 
 class TestStore(unittest.TestCase):
     def setUp(self):
@@ -1260,6 +1411,86 @@ class TestStore(unittest.TestCase):
     def tearDown(self):
         self.store.close()
         self._tmp.cleanup()
+
+    def test_same_reject_bumps_ticks_one_shadow(self):
+        cand = Candidate(chain=Chain.SOLANA, address="mint", price_usd=1.0)
+
+        def rej(reason: str = "liquidity: thin") -> Decision:
+            return Decision(
+                candidate=cand,
+                features=Features(),
+                score=Score(probability=0.3, expected_value=0.0),
+                action=Action.REJECT_GATE,
+                reason=reason,
+            )
+
+        first = self.store.record_decision(rej())
+        again = self.store.record_decision(rej())
+        self.assertEqual(first, again)
+        row = self.store.conn.execute(
+            "SELECT COUNT(*) AS n, ticks FROM decisions WHERE id = ?", (first,)
+        ).fetchone()
+        self.assertEqual(row["n"], 1)
+        self.assertEqual(row["ticks"], 2)
+        self.assertEqual(
+            self.store.conn.execute("SELECT COUNT(*) FROM shadow").fetchone()[0], 1
+        )
+        other = self.store.record_decision(rej("cluster: 30%"))
+        self.assertNotEqual(other, first)
+        same_p = self.store.record_decision(
+            Decision(
+                candidate=cand,
+                features=Features(),
+                score=Score(probability=0.3, expected_value=0.0),
+                action=Action.REJECT_SCORE,
+                reason="probability 0.389 < 0.420",
+            )
+        )
+        same_p2 = self.store.record_decision(
+            Decision(
+                candidate=cand,
+                features=Features(),
+                score=Score(probability=0.31, expected_value=0.0),
+                action=Action.REJECT_SCORE,
+                reason="probability 0.396 < 0.420",
+            )
+        )
+        self.assertEqual(same_p, same_p2)
+        self.assertEqual(
+            self.store.conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0], 3
+        )
+        self.assertEqual(
+            self.store.conn.execute("SELECT COUNT(*) FROM shadow").fetchone()[0], 3
+        )
+
+    def test_reject_after_gap_without_open_shadow_is_a_new_episode(self):
+        cand = Candidate(chain=Chain.SOLANA, address="mint", price_usd=1.0)
+        d = Decision(
+            candidate=cand,
+            features=Features(),
+            score=Score(probability=0.3, expected_value=0.0),
+            action=Action.REJECT_GATE,
+            reason="liquidity: thin",
+        )
+        first = self.store.record_decision(d)
+        self.store.resolve_shadow(first, 0.1)
+        self.store.conn.execute(
+            "UPDATE decisions SET last_ts_ms = ? WHERE id = ?",
+            (now_ms() - Store.EPISODE_GAP_MS - 1, first),
+        )
+        second = self.store.record_decision(
+            Decision(
+                candidate=cand,
+                features=Features(),
+                score=Score(probability=0.3, expected_value=0.0),
+                action=Action.REJECT_GATE,
+                reason="liquidity: thin",
+            )
+        )
+        self.assertNotEqual(second, first)
+        self.assertEqual(
+            self.store.conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0], 2
+        )
 
     def test_trade_round_trip_preserves_features(self):
         features = Features(retail_share=0.33, bundle_pct=0.11, axiom_share=0.22)
@@ -1293,6 +1524,21 @@ class TestStore(unittest.TestCase):
         loaded = self.store.trades()[0]
         self.assertEqual(loaded.notes, "5m flipped, selling with tape")
         self.assertEqual(loaded.exit_legs[0]["note"], "5m flipped, selling with tape")
+
+    def test_exit_legs_keep_vol5m_at_the_sell_tick(self):
+        trade = _trade()
+        trade.exit_legs = [
+            {
+                "ts_ms": trade.closed_at_ms,
+                "reason": "trailing_stop",
+                "vol5m": 12345.6,
+                "holder_growth_5m": 2.5,
+            }
+        ]
+        self.store.record_trade(trade)
+        shown = legs_for_display(self.store.trades()[0])
+        self.assertAlmostEqual(shown[0]["vol5m"], 12345.6)
+        self.assertAlmostEqual(shown[0]["holder_growth_5m"], 2.5)
 
     def test_unmeasured_features_survive_a_round_trip_to_the_learner(self):
         # A 0.0 that was never measured must not train the model as if it were
@@ -1576,6 +1822,7 @@ class TestPlaybook(unittest.TestCase):
         d.strategy = STRATEGY
         d.stats = DiscoveryStats()
         d._seen = {}
+        d._seen_addr = {}
         old = Candidate(
             chain=Chain.SOLANA,
             address="CTPoyCwkjMvoJwU4xvZZqoD8tiYk6yDchySiN5gGpump",
@@ -1590,6 +1837,9 @@ class TestPlaybook(unittest.TestCase):
             source="dexscreener",
         )
         self.assertFalse(d._accept(stale))
+        d._seen_addr["mint"] = now_ms()
+        self.assertFalse(d._pair_unknown("MINT"))
+        self.assertTrue(d._pair_unknown("fresh"))
 
     def test_hood_factory_log_emits_the_non_weth_token(self):
         from alphahound.discovery import (
@@ -1654,6 +1904,20 @@ class TestPlaybook(unittest.TestCase):
         )
         self.assertEqual(early_observe_floors(ripe, STRATEGY), [])
 
+    def test_buy_floors_and_chase_still_get_a_visor_card(self):
+        from alphahound.engine import Engine
+        from alphahound.scoring import hide_from_visor, wait_on_visor
+
+        self.assertTrue(wait_on_visor(["chase: 5m ripped, wait dip"]))
+        self.assertTrue(wait_on_visor(["mcap: 80000 below 100000 floor"]))
+        self.assertTrue(wait_on_visor(["volume: 2000 < 5000 (5m)", "chase: 5m ripped, wait dip"]))
+        self.assertFalse(wait_on_visor(["lp_unlocked: 100% da liquidez livre"]))
+        self.assertFalse(wait_on_visor(["cluster: 37% linked supply"]))
+        self.assertFalse(hide_from_visor(["chase: 5m ripped, wait dip"]))
+        self.assertFalse(hide_from_visor(["mcap: 90000 below 100000 floor"]))
+        self.assertTrue(hide_from_visor(["lp_unlocked: 100% da liquidez livre"]))
+        Engine._assert_loop_helpers(Engine)
+
     def test_public_hood_rpc_has_no_jsonrpc_websocket(self):
         from alphahound.discovery import _hood_jsonrpc_ws
 
@@ -1680,6 +1944,15 @@ class TestPlaybook(unittest.TestCase):
             weth=weth,
         )
         self.assertEqual(found[0].created_at_ms, 1_700_000_000_000)
+
+    def test_erc20_string_decode(self):
+        from alphahound.execution.evm import decode_erc20_string
+
+        # dynamic ABI string "PEPE"
+        raw = "0x" + "0" * 62 + "20" + "0" * 62 + "04" + "50455045" + "0" * 56
+        self.assertEqual(decode_erc20_string(raw), "PEPE")
+        self.assertEqual(decode_erc20_string("0x" + "57455448".ljust(64, "0")), "WETH")
+        self.assertEqual(decode_erc20_string("0x"), "")
 
     def test_pnl_curve_sums_per_chain(self):
         from alphahound.preview import pnl_curves
@@ -2170,6 +2443,114 @@ class TestDeadMcap(unittest.TestCase):
         self.assertTrue(mcap_is_dead(39_999, 40_000))
         self.assertFalse(mcap_is_dead(40_000, 40_000))
         self.assertFalse(mcap_is_dead(0, 40_000))
+
+    def test_scan_floor_drops_unquoted_and_sub_50k(self):
+        from alphahound.engine import below_scan_mcap, drop_for_scan_mcap
+
+        self.assertTrue(below_scan_mcap(0, 50_000))
+        self.assertTrue(below_scan_mcap(3_000, 50_000))
+        self.assertFalse(below_scan_mcap(50_000, 50_000))
+        self.assertFalse(below_scan_mcap(80_000, 50_000))
+        baby = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            mcap_usd=0.0,
+        )
+        self.assertFalse(drop_for_scan_mcap(baby, 50_000))
+        baby.mcap_usd = 3_000
+        self.assertTrue(drop_for_scan_mcap(baby, 50_000))
+        ds = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xdef",
+            source="dexscreener_profiles",
+            mcap_usd=0.0,
+        )
+        self.assertTrue(drop_for_scan_mcap(ds, 50_000))
+
+    def test_unpaid_dex_stays_off_the_visor(self):
+        from alphahound.engine import on_scan_visor, unpaid_for_scan
+
+        raw = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            mcap_usd=80_000,
+        )
+        self.assertTrue(unpaid_for_scan(raw))
+        self.assertFalse(on_scan_visor(raw, 50_000))
+        raw.dex_paid = True
+        self.assertFalse(unpaid_for_scan(raw))
+        self.assertTrue(on_scan_visor(raw, 50_000))
+        inspect = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xdef",
+            source="inspect",
+            mcap_usd=80_000,
+        )
+        self.assertFalse(unpaid_for_scan(inspect))
+        self.assertTrue(on_scan_visor(inspect, 50_000))
+
+    def test_live_floors_replace_stale_mcap_why(self):
+        from alphahound.engine import best_setup_p, stamp_live_floors
+
+        stale = {
+            "call": "wait",
+            "why": "mcap: 80000 below 100000 floor",
+            "vetoes": ["mcap: 80000 below 100000 floor", "cluster: 37% linked supply"],
+            "p": 0.0,
+        }
+        live = stamp_live_floors(stale, ["mcap: 92000 below 100000 floor"])
+        self.assertEqual(live["why"], "mcap: 92000 below 100000 floor")
+        self.assertTrue(any(v.startswith("mcap: 92000") for v in live["vetoes"]))
+        self.assertTrue(any(v.startswith("cluster:") for v in live["vetoes"]))
+        recovered = stamp_live_floors(live, [])
+        self.assertTrue(recovered["why"].startswith("cluster:"))
+        self.assertEqual(
+            best_setup_p(
+                {
+                    "a": {"call": "skip", "p": 0.9},
+                    "b": {"call": "trade", "p": 0.48},
+                },
+                ["a", "b"],
+            ),
+            0.48,
+        )
+
+
+class TestLpLock(unittest.TestCase):
+    def test_burn_and_locker_are_not_free(self):
+        from alphahound.signals.lp_lock import nft_ids_from_npm_logs, owner_kind, unlocked_fraction
+
+        lockers = {"0x1111111111111111111111111111111111111111"}
+        self.assertEqual(owner_kind("0x000000000000000000000000000000000000dead", lockers), "burn")
+        self.assertEqual(owner_kind("0x1111111111111111111111111111111111111111", lockers), "locker")
+        self.assertEqual(owner_kind("0x2222222222222222222222222222222222222222", lockers), "free")
+        self.assertEqual(unlocked_fraction([]), 1.0)
+        self.assertAlmostEqual(unlocked_fraction([(100, "free")]), 1.0)
+        self.assertAlmostEqual(unlocked_fraction([(100, "burn")]), 0.0)
+        self.assertAlmostEqual(unlocked_fraction([(40, "locker"), (60, "free")]), 0.6)
+        ids = nft_ids_from_npm_logs(
+            [
+                {
+                    "address": "0x73991a25c818bf1f1128deaab1492d45638de0d3",
+                    "topics": [
+                        "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+                        "0x" + "0" * 64,
+                        "0x" + "1" * 64,
+                        "0x" + "a".rjust(64, "0"),
+                    ],
+                }
+            ],
+            "0x73991a25c818bf1f1128deaab1492d45638de0d3",
+        )
+        self.assertEqual(ids, [10])
+        from alphahound.signals.lp_lock import _token_ids_from_v4_modify
+
+        salts = _token_ids_from_v4_modify(
+            [{"data": "0x" + ("0" * 192) + f"{7:064x}"}]
+        )
+        self.assertEqual(salts, [7])
 
 
 class TestManualSellQueue(unittest.TestCase):

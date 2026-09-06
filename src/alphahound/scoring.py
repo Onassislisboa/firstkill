@@ -79,6 +79,7 @@ NORMALIZERS: dict[str, object] = {
     "volume_z": lambda x: _clip(x / 3.0),
     "body_ratio": lambda x: _clip(x),
     "parabolic": lambda x: _clip(x, 0.0, 1.0),
+    "volatility_volume_score": lambda x: _clip(x, 0.0, 1.0),
     # distribution
     "holder_count": _log_center(2.0, 1.5),
     "holder_growth_5m": _tanh(0.1),
@@ -150,6 +151,7 @@ PRIOR_WEIGHTS: dict[str, float] = {
     "volume_z": 0.60,
     "body_ratio": 0.40,
     "parabolic": -1.20,
+    "volatility_volume_score": 0.45,
     "holder_count": 0.30,
     "holder_growth_5m": 0.90,
     "top10_pct": -0.90,
@@ -440,6 +442,16 @@ def evaluate_gates(
         f.bundle_pct > p("max_bundle_pct", 0.25),
         f"launch bundle {f.bundle_pct:.0%}",
     )
+    # Hood V4/V3 NFT / BNB V2 LP. 0 disables. Not a lock-duration oracle — see lp_lock.py.
+    max_free_lp = p("max_lp_unlocked_pct", 0.0)
+    if max_free_lp > 0 and chain.value in ("robinhood_chain", "bnb"):
+        free_lp = 1.0 - f.lp_locked_pct
+        check(
+            "lp_unlocked",
+            ("lp_locked_pct",),
+            free_lp > max_free_lp,
+            f"{free_lp:.0%} da liquidez livre (não burn/locker)",
+        )
     check(
         "fresh_wallets",
         ("fresh_wallet_pct",),
@@ -508,6 +520,8 @@ def evaluate_gates(
 # Chase/priced = don't buy the rip. Round-trip = don't pay a fat spread.
 # Stay on the visor and re-score until the print is actually buyable.
 PATIENCE_PREFIXES = ("chase:", "priced:", "round_trip_cost:", "twitter:")
+# Buy floors on a visor card: detect, don't hide. Scan mcap is dead_mcap_usd.
+VISOR_WAIT_PREFIXES = PATIENCE_PREFIXES + ("mcap:", "volume:", "liquidity:")
 
 
 def patience_only(reasons: list[str]) -> bool:
@@ -516,10 +530,21 @@ def patience_only(reasons: list[str]) -> bool:
     )
 
 
+def wait_on_visor(reasons: list[str]) -> bool:
+    return bool(reasons) and all(
+        any(r.startswith(p) for p in VISOR_WAIT_PREFIXES) for r in reasons
+    )
+
+
+def hide_from_visor(reasons: list[str]) -> bool:
+    """Ingest must not `continue` when this is false. Chase/floors stay on the card."""
+    return bool(reasons) and not wait_on_visor(reasons)
+
+
 def watch_call(*, vetoed: bool, ok: bool, reasons: list[str]) -> str:
     if ok:
         return "trade"
-    if vetoed and not patience_only(reasons):
+    if vetoed and hide_from_visor(reasons):
         return "skip"
     return "wait"
 
@@ -556,6 +581,7 @@ _HOLD_IGNORE = (
     "liquidity:",
     "rubric:",
     "sponsor:",
+    "lp_unlocked:",
 )
 
 

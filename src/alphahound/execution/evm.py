@@ -36,6 +36,8 @@ NATIVE_SENTINEL = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
 SEL_DECIMALS = "0x313ce567"
 SEL_BALANCE_OF = "0x70a08231"
 SEL_TOTAL_SUPPLY = "0x18160ddd"
+SEL_NAME = "0x06fdde03"
+SEL_SYMBOL = "0x95d89b41"
 SEL_APPROVE = "0x095ea7b3"
 SEL_ALLOWANCE = "0xdd62ed3e"
 MAX_UINT256 = (1 << 256) - 1
@@ -51,6 +53,23 @@ def _pad_address(address: str) -> str:
 
 def _pad_uint(value: int) -> str:
     return f"{value:064x}"
+
+
+def decode_erc20_string(raw: str) -> str:
+    """ABI string or bytes32 from eth_call. Empty on junk."""
+    h = (raw or "").removeprefix("0x")
+    if len(h) < 2 or set(h) <= {"0"}:
+        return ""
+    try:
+        if len(h) <= 64:
+            return bytes.fromhex(h.ljust(64, "0")).split(b"\x00", 1)[0].decode("utf-8", "replace").strip()
+        n = int(h[64:128], 16) if len(h) >= 128 else 0
+        if n <= 0 or n > 128:
+            return bytes.fromhex(h[:64]).split(b"\x00", 1)[0].decode("utf-8", "replace").strip()
+        data = bytes.fromhex(h[128 : 128 + n * 2])
+        return data.decode("utf-8", "replace").strip("\x00").strip()
+    except (ValueError, IndexError):
+        return ""
 
 
 class EvmRpc:
@@ -80,6 +99,19 @@ class EvmRpc:
 
     async def eth_call(self, to: str, data: str) -> str:
         return await self.call("eth_call", [{"to": to, "data": data}, "latest"])
+
+    async def erc20_labels(self, token: str) -> tuple[str, str]:
+        """Ticker then name. Visor title before Dexscreener has indexed the pair."""
+        import asyncio
+
+        try:
+            sym_raw, name_raw = await asyncio.gather(
+                self.eth_call(token, SEL_SYMBOL),
+                self.eth_call(token, SEL_NAME),
+            )
+        except Exception:  # noqa: BLE001
+            return "", ""
+        return decode_erc20_string(str(sym_raw or "")), decode_erc20_string(str(name_raw or ""))
 
     async def decimals(self, token: str) -> int:
         raw = await self.eth_call(token, SEL_DECIMALS)

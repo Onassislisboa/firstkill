@@ -52,7 +52,7 @@ from .preview import write_preview
 from .providers import Birdeye, Bubblemaps, Dexscreener, FomoGraph, Helius, Twitter, twitter_handle
 from .risk import RiskEngine
 from .rubric import grade
-from .scoring import Model, Scorer, hold_cut, patience_only, watch_call
+from .scoring import Model, Scorer, hide_from_visor, hold_cut, wait_on_visor, watch_call
 from .settings import (
     PUBLIC_SOLANA_RPC,
     Config,
@@ -97,9 +97,69 @@ def mcap_is_dead(mcap_usd: float, floor: float) -> bool:
     return floor > 0 and 0 < mcap_usd < floor
 
 
+def below_scan_mcap(mcap_usd: float, floor: float) -> bool:
+    """No visor/enrich under the scan floor, including unquoted mcap=0."""
+    return floor > 0 and mcap_usd < floor
+
+
+def drop_for_scan_mcap(candidate: Candidate, floor: float) -> bool:
+    """Dead-mcap prune. hood_stream at mcap 0 waits on Dexscreener off-visor; 4k is dead."""
+    if candidate.source == "inspect":
+        return False
+    if observe_early(candidate.source) and candidate.mcap_usd <= 0:
+        return False
+    return below_scan_mcap(candidate.mcap_usd, floor)
+
+
+def unpaid_for_scan(candidate: Candidate) -> bool:
+    """No visor/enrich/watch without a paid Dexscreener listing. Inspect still goes through."""
+    return candidate.source != "inspect" and not candidate.dex_paid
+
+
+def on_scan_visor(candidate: Candidate, floor: float) -> bool:
+    if candidate.source == "inspect":
+        return True
+    if unpaid_for_scan(candidate):
+        return False
+    return not below_scan_mcap(candidate.mcap_usd, floor)
+
+
 def observe_early(source: str) -> bool:
     """On the visor before buy floors. Must still fail prefilter on enter."""
     return source == "hood_stream"
+
+
+_FLOOR_KINDS = frozenset({"mcap", "volume", "liquidity"})
+
+
+def stamp_live_floors(read: dict, floors: list[str]) -> dict:
+    """Keep cluster/etc vetoes; rewrite mcap/vol/liq from the live quote."""
+    kept = [
+        v
+        for v in (read.get("vetoes") or [])
+        if str(v).split(":", 1)[0] not in _FLOOR_KINDS
+    ]
+    out = {**read, "vetoes": floors + kept}
+    kind = str(out.get("why") or "").split(":", 1)[0]
+    if floors and kind in _FLOOR_KINDS | {"", "ok"}:
+        out["why"] = floors[0]
+        if not out.get("p"):
+            out["explain"] = floors[0]
+    elif kind in _FLOOR_KINDS:
+        out["why"] = kept[0] if kept else "ok"
+        if not out.get("p"):
+            out["explain"] = out["why"]
+    return out
+
+
+def best_setup_p(reads: dict[str, dict], keys: list[str]) -> float:
+    best = 0.0
+    for key in keys:
+        rec = reads.get(key) or {}
+        if rec.get("call") == "skip":
+            continue
+        best = max(best, float(rec.get("p") or 0))
+    return best
 
 
 def early_observe_floors(candidate: Candidate, strategy: Config) -> list[str]:
@@ -227,13 +287,13 @@ class Engine:
         self._closed_since_learn = 0
         self._lock: IO[bytes] | None = None
         self._tick_counts: Counter[str] = Counter()
-        self._best_probability = 0.0
         self._last_heartbeat_ms = now_ms()
         self._watch_in = 0
         self._watch_out = 0
         self._reads: dict[str, dict] = {}
         self._inflight: set[str] = set()
         self._manual_sell: set[str] = set()
+        self._label_fail: set[str] = set()
         self._stop = asyncio.Event()
         self._loop_faults: dict[str, str] = {}
         self._loop_dead: set[str] = set()
@@ -277,7 +337,10 @@ class Engine:
                 ),
             },
         )
-        if not self.registry.attributable_labels:
+        if (
+            not self.registry.attributable_labels
+            and Chain.SOLANA in self.settings.enabled_chains
+        ):
             log.warning(
                 "no terminal fee accounts labeled: attribution features are inert. "
                 "Run `alphahound discover-terminals` to populate them."
@@ -295,6 +358,15 @@ class Engine:
             raise RuntimeError("mcap_is_dead helper is broken")
         if not enrich_due(0, 1, 15_000):
             raise RuntimeError("enrich_due helper is broken")
+        # Boot fails if ingest would hide a wait-class coin again.
+        if hide_from_visor(["chase: 5m ripped, wait dip"]):
+            raise RuntimeError("chase must stay on the visor")
+        if hide_from_visor(["mcap: 80000 below 100000 floor"]):
+            raise RuntimeError("buy-floor mcap must stay on the visor")
+        if hide_from_visor(["volume: 2000 < 5000 (5m)"]):
+            raise RuntimeError("buy-floor volume must stay on the visor")
+        if not hide_from_visor(["lp_unlocked: 100% da liquidez livre"]):
+            raise RuntimeError("hard skip must still hide at ingest")
 
     async def _every(self, seconds: float, body, label: str) -> None:
         while not self._stop.is_set():
@@ -349,8 +421,20 @@ class Engine:
             self._drain_inspect()
             found = await self.discovery.poll()
             before = set(self.watching)
-            dead_floor = float(self.strategy.get("loop.dead_mcap_usd", 40_000))
+            dead_floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
+            probed = 0
             for candidate in found:
+                if unpaid_for_scan(candidate):
+                    if probed >= 8:  # ponytail: 8 orders/v1 per scan; unpaid never sit on visor
+                        continue
+                    probed += 1
+                    try:
+                        if await self.dex.token_is_paid(candidate.chain, candidate.address):
+                            candidate.dex_paid = True
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if unpaid_for_scan(candidate):
+                        continue
                 prev = self.watching.get(candidate.key)
                 if prev is not None:
                     candidate.last_scored_ms = prev.last_scored_ms
@@ -358,9 +442,7 @@ class Engine:
                         candidate.source = prev.source
                 if candidate.pack_role == "vamp":
                     continue
-                if mcap_is_dead(candidate.mcap_usd, dead_floor) and not observe_early(
-                    candidate.source
-                ):
+                if candidate.source != "inspect" and mcap_is_dead(candidate.mcap_usd, dead_floor):
                     continue
                 if candidate.source != "inspect" and not observe_early(candidate.source):
                     cheap = self.enricher.free_enrichment(candidate)
@@ -370,14 +452,17 @@ class Engine:
                         if not v.startswith("age:") and not v.startswith("priced:")
                     ]
                     if vetoes:
-                        self._tick_counts[f"free_veto:{vetoes[0].split(':')[0]}"] += 1
-                        continue
+                        if hide_from_visor(vetoes):
+                            self._tick_counts[f"free_veto:{vetoes[0].split(':')[0]}"] += 1
+                            continue
                 self.watching[candidate.key] = candidate
-                self._reads.setdefault(candidate.key, {"call": "scan"})
+                self._reads.setdefault(
+                    candidate.key,
+                    {"call": "wait" if observe_early(candidate.source) else "scan"},
+                )
             self.discovery.prune()
-            await self._refresh_watch_quotes()
-            # First card/decision before overflow prune so a factory log is not
-            # dropped unseen when the visor is already at max_watching.
+            self._drop_below_scan_mcap()
+            self._drop_unpaid()
             await self.score_and_enter()
             self._prune_watching()
             self._watch_in = sum(1 for k in self.watching if k not in before)
@@ -434,6 +519,9 @@ class Engine:
                     "mcap_entry": round(position.entry_mcap_usd),
                 }
             )
+        scan_floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
+        visor = [c for c in self.watching.values() if on_scan_visor(c, scan_floor)]
+        visor_keys = [c.key for c in visor]
         write_preview(
             self.settings.state_dir,
             {
@@ -442,7 +530,7 @@ class Engine:
                 "halted": halted,
                 "halt_reason": reason,
                 "equity_usd": round(self.risk.equity(), 2),
-                "watching": len(self.watching),
+                "watching": len(visor),
                 "watch_in": self._watch_in,
                 "watch_out": self._watch_out,
                 "watch": [
@@ -451,7 +539,7 @@ class Engine:
                         "name": c.name or "",
                         "chain": c.chain.value,
                         "address": c.address,
-                        "age_min": int(round(c.age_minutes)),
+                        "age_min": round(c.age_minutes, 1),
                         "mcap": round(c.mcap_usd),
                         "vol5m": round(c.volume_5m_usd),
                         "ret_5m": round(c.ret_5m, 4),
@@ -464,10 +552,13 @@ class Engine:
                         "dex_photo": c.dex_photo,
                         "dex_aligned": c.dex_aligned,
                         "liq": round(c.liquidity_usd),
-                        **(self._reads.get(c.key) or {"call": "scan"}),
+                        **stamp_live_floors(
+                            dict(self._reads.get(c.key) or {"call": "scan"}),
+                            early_observe_floors(c, self.strategy),
+                        ),
                     }
                     for c in sorted(
-                        self.watching.values(),
+                        visor,
                         key=lambda x: (
                             {"scan": 0, "trade": 1, "wait": 2, "skip": 3}.get(
                                 (self._reads.get(x.key) or {}).get("call") or "scan", 4
@@ -478,7 +569,7 @@ class Engine:
                         ),
                     )
                 ],
-                "best_probability": round(self._best_probability, 3),
+                "best_probability": round(best_setup_p(self._reads, visor_keys), 3),
                 "tick": dict(self._tick_counts),
                 "holds": holds,
                 "faults": dict(self._loop_faults),
@@ -498,21 +589,22 @@ class Engine:
         if interval <= 0 or now_ms() - self._last_heartbeat_ms < interval * 1000:
             return
         self._last_heartbeat_ms = now_ms()
+        scan_floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
+        visor = [c for c in self.watching.values() if on_scan_visor(c, scan_floor)]
         log.info(
             "heartbeat",
             extra={
-                "watching": len(self.watching),
+                "watching": len(visor),
                 "watch_in": self._watch_in,
                 "watch_out": self._watch_out,
                 "open": len(self.positions),
                 "equity_usd": round(self.risk.equity(), 2),
                 "since_last": dict(self._tick_counts),
-                "best_probability": round(self._best_probability, 3),
+                "best_probability": round(best_setup_p(self._reads, [c.key for c in visor]), 3),
                 "dead_loops": sorted(self._loop_dead),
             },
         )
         self._tick_counts.clear()
-        self._best_probability = 0.0
 
     # -- positions ---------------------------------------------------------
     async def manage_positions(self) -> None:
@@ -624,6 +716,7 @@ class Engine:
                 "why": describe_exit(reason),
                 "note": note,
                 "tokens": tokens,
+                **self.enricher.exit_tape(position.candidate),
             }
         )
 
@@ -715,6 +808,11 @@ class Engine:
             "note": trade.notes,
             "venue": trade.venue.value,
         }
+        last = (trade.exit_legs or [{}])[-1] if trade.exit_legs else {}
+        if "vol5m" in last:
+            rec["vol5m"] = last["vol5m"]
+        if "holder_growth_5m" in last:
+            rec["holder_growth_5m"] = last["holder_growth_5m"]
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec) + "\n")
@@ -803,6 +901,7 @@ class Engine:
 
         # Every visor card gets a note. Halt only blocks the fill, not the grade.
         ttl_ms = int(float(self.strategy.get("loop.rescore_seconds", 15)) * 1000)
+        scan_floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
         ranked = [
             c
             for c in sorted(self.watching.values(), key=_attention)
@@ -810,6 +909,7 @@ class Engine:
             and c.key not in self._inflight
             and self.router.has_venue(c.chain)
             and (c.source == "inspect" or enrich_due(c.last_scored_ms, now, ttl_ms))
+            and on_scan_visor(c, scan_floor)
         ]
 
         probe_size = max(
@@ -862,16 +962,20 @@ class Engine:
         mint = None if enrichment is None else enrichment.mint
         crowd = {} if enrichment is None else (enrichment.crowd or {})
         tw = {} if enrichment is None else (enrichment.twitter or {})
-        holders = 0
+        holders = None
         rt = None
         if enrichment is not None:
-            holders = int(enrichment.features.holder_count or 0)
+            if "holder_count" not in enrichment.unknown:
+                holders = int(enrichment.features.holder_count or 0)
             rt = round(float(enrichment.features.round_trip_cost or 0.0), 4)
         crowd_ui = {
             k: crowd[k]
             for k in ("kols", "fomo", "whale_n", "whale_pct", "whale_usd")
             if k in crowd
         }
+        explain = why if score.veto_reasons else (
+            self.scorer.explain(score) if score.probability else why
+        )
         return {
             **(score.dist or {}),
             **crowd_ui,
@@ -883,7 +987,7 @@ class Engine:
             "holders": holders,
             "rt": rt,
             "vetoes": list(score.veto_reasons),
-            "explain": self.scorer.explain(score) if score.probability else why,
+            "explain": explain,
             "cert": security_cert(
                 (score.dist or {}).get("label") or "",
                 score.veto_reasons,
@@ -899,10 +1003,13 @@ class Engine:
         self._inflight.add(candidate.key)
         painted = False
         try:
-            if mcap_is_dead(
-                candidate.mcap_usd, float(self.strategy.get("loop.dead_mcap_usd", 40_000))
-            ) and not observe_early(candidate.source):
-                self._drop_watch(candidate, "dead_mcap")
+            if candidate.source != "inspect" and below_scan_mcap(
+                candidate.mcap_usd, float(self.strategy.get("loop.dead_mcap_usd", 50_000))
+            ):
+                if drop_for_scan_mcap(
+                    candidate, float(self.strategy.get("loop.dead_mcap_usd", 50_000))
+                ):
+                    self._drop_watch(candidate, "dead_mcap")
                 return None
             if candidate.pack_role == "vamp":
                 self._drop_watch(candidate, "vamp")
@@ -941,15 +1048,7 @@ class Engine:
                         free_vetoes[0],
                         cheap.unknown,
                     )
-                floor = any(
-                    v.startswith(("mcap:", "volume:", "liquidity:")) for v in free_vetoes
-                )
-                call = (
-                    "wait"
-                    if patience_only(free_vetoes)
-                    or (observe_early(candidate.source) and floor)
-                    else "skip"
-                )
+                call = "wait" if wait_on_visor(free_vetoes) else "skip"
                 self._reads[candidate.key] = self._score_read(
                     candidate, cheap_score, call, free_vetoes[0], cheap
                 )
@@ -966,7 +1065,6 @@ class Engine:
 
             self._tick_counts["enriched"] += 1
             score = self.scorer.score(enrichment)
-            self._best_probability = max(self._best_probability, score.probability)
             ok, why = self.scorer.passes(score)
             call = watch_call(vetoed=score.vetoed, ok=ok, reasons=score.veto_reasons)
             self._reads[candidate.key] = self._score_read(
@@ -1109,6 +1207,7 @@ class Engine:
             entry_sponsors=list(sponsors or []),
             entry_rubric=float((decision.score.rubric or {}).get("total") or 0.0),
             entry_mcap_usd=candidate.mcap_usd,
+            entry_vol_score=float(decision.features.volatility_volume_score or 0.0),
         )
         self.positions[candidate.key] = position
         self._save_positions()
@@ -1170,10 +1269,12 @@ class Engine:
                 snaps = await self.dex.token_pairs(addrs[i : i + 30])
             except Exception:  # noqa: BLE001
                 continue
-            by.update({s.token_address: s for s in snaps})
+            by.update({s.token_address.lower(): s for s in snaps})
         unpaid = []
+        unlabeled = []
         for candidate in self.watching.values():
-            snap = by.get(candidate.address)
+            was_mcap = candidate.mcap_usd
+            snap = by.get(candidate.address.lower())
             was_paid = candidate.dex_paid
             if snap is not None:
                 candidate.price_usd = snap.price_usd or candidate.price_usd
@@ -1182,6 +1283,15 @@ class Engine:
                 candidate.liquidity_usd = snap.liquidity_usd
                 candidate.ret_5m = snap.price_change_m5
                 snap.stamp(candidate)
+                if observe_early(candidate.source) and was_mcap <= 0 and candidate.mcap_usd > 0:
+                    log.info(
+                        "hood indexed",
+                        extra={
+                            "symbol": candidate.symbol or candidate.address[:10],
+                            "wait_s": round((now_ms() - candidate.discovered_at_ms) / 1000.0, 1),
+                            "mcap": round(candidate.mcap_usd),
+                        },
+                    )
                 if snap.twitter:
                     rec = self._reads.setdefault(candidate.key, {"call": "scan"})
                     tw = dict(rec.get("tw") or {})
@@ -1195,6 +1305,8 @@ class Engine:
                 read = self._reads.get(candidate.key)
                 if read is not None:
                     read["call"] = "scan"
+            if not candidate.symbol and not candidate.name and candidate.key not in self._label_fail:
+                unlabeled.append(candidate)
         if probe_paid:
             for candidate in unpaid[:8]:
                 try:
@@ -1208,6 +1320,18 @@ class Engine:
                 read = self._reads.get(candidate.key)
                 if read is not None:
                     read["call"] = "scan"
+        for candidate in unlabeled[:8]:
+            rpc = self.enricher.evm_rpcs.get(candidate.chain)
+            if rpc is None:
+                continue
+            try:
+                symbol, name = await rpc.erc20_labels(candidate.address)
+            except Exception:  # noqa: BLE001
+                continue
+            candidate.symbol = candidate.symbol or symbol
+            candidate.name = candidate.name or name
+            if not candidate.symbol and not candidate.name:
+                self._label_fail.add(candidate.key)
 
     def _retag(self) -> dict:
         by_key = {c.key: c for c in self.watching.values()}
@@ -1225,6 +1349,21 @@ class Engine:
             position.candidate.main_ret_5m = tag.main_ret_5m
             position.candidate.pack_size = tag.pack_size
         return tags
+
+    def _drop_below_scan_mcap(self) -> None:
+        floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
+        for candidate in list(self.watching.values()):
+            if candidate.key in self.positions or candidate.source == "inspect":
+                continue
+            if drop_for_scan_mcap(candidate, floor):
+                self._drop_watch(candidate, "dead_mcap")
+
+    def _drop_unpaid(self) -> None:
+        for candidate in list(self.watching.values()):
+            if candidate.key in self.positions or candidate.source == "inspect":
+                continue
+            if unpaid_for_scan(candidate):
+                self._drop_watch(candidate, "unpaid")
 
     def _drop_watch(self, candidate: Candidate, tag: str) -> None:
         if candidate.key in self.positions:
@@ -1251,10 +1390,13 @@ class Engine:
             if ignore_mcap > 0 and candidate.mcap_usd > ignore_mcap:
                 self._drop_watch(candidate, "fat_mcap")
                 continue
-            if mcap_is_dead(
-                candidate.mcap_usd, float(self.strategy.get("loop.dead_mcap_usd", 40_000))
-            ) and not observe_early(candidate.source):
+            if drop_for_scan_mcap(
+                candidate, float(self.strategy.get("loop.dead_mcap_usd", 50_000))
+            ):
                 self._drop_watch(candidate, "dead_mcap")
+                continue
+            if unpaid_for_scan(candidate):
+                self._drop_watch(candidate, "unpaid")
                 continue
             if candidate.pack_role == "vamp":
                 del self.watching[key]

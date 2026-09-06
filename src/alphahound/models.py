@@ -153,6 +153,8 @@ def legs_for_display(trade: TradeRecord) -> list[dict]:
                 "reason": reason,
                 "why": str(leg.get("why") or describe_exit(reason)),
                 "note": str(leg.get("note") or trade.notes or ""),
+                "vol5m": _opt_num(leg.get("vol5m")),
+                "holder_growth_5m": _opt_num(leg.get("holder_growth_5m")),
             }
         )
     return out
@@ -272,6 +274,8 @@ class Features:
     volume_z: float = 0.0
     body_ratio: float = 0.0
     parabolic: float = 0.0
+    # 5m turnover × unsigned swing. Score prior only — never a gate.
+    volatility_volume_score: float = 0.0
 
     # --- holders / distribution -------------------------------------------
     holder_count: float = 0.0
@@ -475,6 +479,7 @@ class Position:
     last_hold_rubric: float = 0.0
     last_hold_why: str = ""
     entry_mcap_usd: float = 0.0
+    entry_vol_score: float = 0.0
     exit_legs: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
