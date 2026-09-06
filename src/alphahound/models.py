@@ -153,6 +153,8 @@ def legs_for_display(trade: TradeRecord) -> list[dict]:
                 "reason": reason,
                 "why": str(leg.get("why") or describe_exit(reason)),
                 "note": str(leg.get("note") or trade.notes or ""),
+                "vol5m": _opt_num(leg.get("vol5m")),
+                "holder_growth_5m": _opt_num(leg.get("holder_growth_5m")),
             }
         )
     return out

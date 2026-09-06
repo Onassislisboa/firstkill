@@ -102,6 +102,15 @@ def below_scan_mcap(mcap_usd: float, floor: float) -> bool:
     return floor > 0 and mcap_usd < floor
 
 
+def drop_for_scan_mcap(candidate: Candidate, floor: float) -> bool:
+    """Dead-mcap prune. hood_stream at mcap 0 waits on Dexscreener off-visor; 4k is dead."""
+    if candidate.source == "inspect":
+        return False
+    if observe_early(candidate.source) and candidate.mcap_usd <= 0:
+        return False
+    return below_scan_mcap(candidate.mcap_usd, floor)
+
+
 def observe_early(source: str) -> bool:
     """On the visor before buy floors. Must still fail prefilter on enter."""
     return source == "hood_stream"
@@ -377,7 +386,10 @@ class Engine:
                         self._tick_counts[f"free_veto:{vetoes[0].split(':')[0]}"] += 1
                         continue
                 self.watching[candidate.key] = candidate
-                self._reads.setdefault(candidate.key, {"call": "scan"})
+                self._reads.setdefault(
+                    candidate.key,
+                    {"call": "wait" if observe_early(candidate.source) else "scan"},
+                )
             self.discovery.prune()
             await self._refresh_watch_quotes()
             self._drop_below_scan_mcap()
@@ -437,6 +449,12 @@ class Engine:
                     "mcap_entry": round(position.entry_mcap_usd),
                 }
             )
+        scan_floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
+        visor = [
+            c
+            for c in self.watching.values()
+            if c.source == "inspect" or not below_scan_mcap(c.mcap_usd, scan_floor)
+        ]
         write_preview(
             self.settings.state_dir,
             {
@@ -445,7 +463,7 @@ class Engine:
                 "halted": halted,
                 "halt_reason": reason,
                 "equity_usd": round(self.risk.equity(), 2),
-                "watching": len(self.watching),
+                "watching": len(visor),
                 "watch_in": self._watch_in,
                 "watch_out": self._watch_out,
                 "watch": [
@@ -470,7 +488,7 @@ class Engine:
                         **(self._reads.get(c.key) or {"call": "scan"}),
                     }
                     for c in sorted(
-                        self.watching.values(),
+                        visor,
                         key=lambda x: (
                             {"scan": 0, "trade": 1, "wait": 2, "skip": 3}.get(
                                 (self._reads.get(x.key) or {}).get("call") or "scan", 4
@@ -627,6 +645,7 @@ class Engine:
                 "why": describe_exit(reason),
                 "note": note,
                 "tokens": tokens,
+                **self.enricher.exit_tape(position.candidate),
             }
         )
 
@@ -718,6 +737,11 @@ class Engine:
             "note": trade.notes,
             "venue": trade.venue.value,
         }
+        last = (trade.exit_legs or [{}])[-1] if trade.exit_legs else {}
+        if "vol5m" in last:
+            rec["vol5m"] = last["vol5m"]
+        if "holder_growth_5m" in last:
+            rec["holder_growth_5m"] = last["holder_growth_5m"]
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec) + "\n")
@@ -806,6 +830,7 @@ class Engine:
 
         # Every visor card gets a note. Halt only blocks the fill, not the grade.
         ttl_ms = int(float(self.strategy.get("loop.rescore_seconds", 15)) * 1000)
+        scan_floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
         ranked = [
             c
             for c in sorted(self.watching.values(), key=_attention)
@@ -813,6 +838,10 @@ class Engine:
             and c.key not in self._inflight
             and self.router.has_venue(c.chain)
             and (c.source == "inspect" or enrich_due(c.last_scored_ms, now, ttl_ms))
+            and (
+                c.source == "inspect"
+                or not below_scan_mcap(c.mcap_usd, scan_floor)
+            )
         ]
 
         probe_size = max(
@@ -905,7 +934,10 @@ class Engine:
             if candidate.source != "inspect" and below_scan_mcap(
                 candidate.mcap_usd, float(self.strategy.get("loop.dead_mcap_usd", 50_000))
             ):
-                self._drop_watch(candidate, "dead_mcap")
+                if drop_for_scan_mcap(
+                    candidate, float(self.strategy.get("loop.dead_mcap_usd", 50_000))
+                ):
+                    self._drop_watch(candidate, "dead_mcap")
                 return None
             if candidate.pack_role == "vamp":
                 self._drop_watch(candidate, "vamp")
@@ -1177,6 +1209,7 @@ class Engine:
         unpaid = []
         unlabeled = []
         for candidate in self.watching.values():
+            was_mcap = candidate.mcap_usd
             snap = by.get(candidate.address.lower())
             was_paid = candidate.dex_paid
             if snap is not None:
@@ -1186,6 +1219,15 @@ class Engine:
                 candidate.liquidity_usd = snap.liquidity_usd
                 candidate.ret_5m = snap.price_change_m5
                 snap.stamp(candidate)
+                if observe_early(candidate.source) and was_mcap <= 0 and candidate.mcap_usd > 0:
+                    log.info(
+                        "hood indexed",
+                        extra={
+                            "symbol": candidate.symbol or candidate.address[:10],
+                            "wait_s": round((now_ms() - candidate.discovered_at_ms) / 1000.0, 1),
+                            "mcap": round(candidate.mcap_usd),
+                        },
+                    )
                 if snap.twitter:
                     rec = self._reads.setdefault(candidate.key, {"call": "scan"})
                     tw = dict(rec.get("tw") or {})
@@ -1249,7 +1291,7 @@ class Engine:
         for candidate in list(self.watching.values()):
             if candidate.key in self.positions or candidate.source == "inspect":
                 continue
-            if below_scan_mcap(candidate.mcap_usd, floor):
+            if drop_for_scan_mcap(candidate, floor):
                 self._drop_watch(candidate, "dead_mcap")
 
     def _drop_watch(self, candidate: Candidate, tag: str) -> None:
@@ -1277,8 +1319,8 @@ class Engine:
             if ignore_mcap > 0 and candidate.mcap_usd > ignore_mcap:
                 self._drop_watch(candidate, "fat_mcap")
                 continue
-            if below_scan_mcap(
-                candidate.mcap_usd, float(self.strategy.get("loop.dead_mcap_usd", 50_000))
+            if drop_for_scan_mcap(
+                candidate, float(self.strategy.get("loop.dead_mcap_usd", 50_000))
             ):
                 self._drop_watch(candidate, "dead_mcap")
                 continue

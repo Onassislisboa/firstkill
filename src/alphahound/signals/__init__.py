@@ -264,6 +264,7 @@ class Enricher:
     async def _evm_lp_lock(self, candidate: Candidate, result: Enrichment) -> dict[str, float]:
         """Fill lp_locked_pct from V4/V3 NFTs (Hood) or V2 LP token (BNB)."""
         if candidate.chain not in (Chain.ROBINHOOD_CHAIN, Chain.BNB):
+            result.unknown.add("lp_locked_pct")
             return {}
         cached = self._evm_cached(f"lp:{candidate.key}")
         if cached is not None:
@@ -322,6 +323,7 @@ class Enricher:
         """Launch bundle + token-source cluster from ERC-20 Transfer logs."""
         rpc = self.evm_rpcs.get(candidate.chain)
         if rpc is None or not candidate.address:
+            result.unknown.add("cluster_pct")
             return {}
         cached = self._evm_cached(f"dist:{candidate.key}")
         if cached is not None:
@@ -367,16 +369,19 @@ class Enricher:
             )
         except Exception as exc:  # noqa: BLE001
             result.notes.append(f"transfer logs failed: {exc}")
+            result.unknown.add("cluster_pct")
             return {}
         moves = [m for m in (decode_transfer_log(x) for x in raw) if m]
         if not moves:
             result.notes.append("transfer logs empty in lookback")
+            result.unknown.add("cluster_pct")
             return {}
         pools = {candidate.pool_address.lower()} if candidate.pool_address else set()
         holders, launch = holders_from_moves(
             moves, pools=pools, deployer=candidate.deployer, first_n=first_n
         )
         if not holders:
+            result.unknown.add("cluster_pct")
             return {}
         stats = analyze(holders, now_ms=now_ms(), launch_slot=launch, bundle_slot_window=window)
         token_cluster = stats.largest_funding_cluster_pct
@@ -787,6 +792,7 @@ class Enricher:
                 holders_ok = True
         if holders_ok:
             out["cluster_pct"] = cluster
+            result.unknown.discard("cluster_pct")
         else:
             result.unknown.add("cluster_pct")
 
@@ -852,6 +858,7 @@ class Enricher:
         result.unknown.update(
             {
                 "holder_count",
+                "holder_growth_5m",
                 "top10_pct",
                 "gini",
                 "fresh_wallet_pct",
@@ -861,6 +868,8 @@ class Enricher:
                 "retail_share_delta_5m",
                 "bot_share",
                 "axiom_share",
+                "axiom_share_delta_5m",
+                "unknown_share",
                 "known_holder_pct",
                 "top1_pct",
                 "mint_authority",
@@ -869,6 +878,9 @@ class Enricher:
                 "fomo_net_flow",
                 "whale_hold_pct",
                 "whale_net_flow",
+                "smart_money_buys",
+                "cluster_pct",
+                "lp_locked_pct",
             }
         )
         result.notes.append(f"{candidate.chain.value}: aggregate-only enrichment")
@@ -993,3 +1005,11 @@ class Enricher:
         self._holder_history.pop(key, None)
         self._evm_cache.pop(f"dist:{key}", None)
         self._evm_cache.pop(f"crowd:{key}", None)
+
+    def exit_tape(self, candidate: Candidate) -> dict[str, float]:
+        """Volume/holder slope at this tick. Entry features are stale by exit."""
+        out = {"vol5m": round(float(candidate.volume_5m_usd or 0.0), 2)}
+        hist = self._holder_history.get(candidate.key) or []
+        if len(hist) >= 2:
+            out["holder_growth_5m"] = round(holder_growth(hist, 300_000), 4)
+        return out

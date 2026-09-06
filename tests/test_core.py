@@ -37,6 +37,7 @@ from alphahound.models import (  # noqa: E402
     Side,
     TradeRecord,
     VenueId,
+    legs_for_display,
     now_ms,
 )
 from alphahound.engine import enrich_due, loop_bug  # noqa: E402
@@ -204,6 +205,47 @@ class TestDistribution(unittest.TestCase):
         self.assertNotIn("fresh_wallet_pct", honest)
         self.assertGreater(lied.get("bundle_pct", 0.0), 0.3)
         self.assertNotIn("bundle_pct", honest)
+
+    def test_evm_aggregate_marks_unmeasured_features_unknown(self):
+        from alphahound.signals import Enricher, Enrichment
+
+        c = Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0x" + "ab" * 20, symbol="X")
+        enr = Enrichment(candidate=c, features=Features())
+        Enricher.__new__(Enricher)._aggregate_only_features(c, enr)
+        for name in (
+            "holder_growth_5m",
+            "axiom_share_delta_5m",
+            "unknown_share",
+            "smart_money_buys",
+            "cluster_pct",
+            "lp_locked_pct",
+        ):
+            self.assertIn(name, enr.unknown)
+            self.assertEqual(normalize(Features(), enr.unknown)[name], 0.0)
+
+    def test_evm_lp_lock_skipped_chain_is_unknown_not_unlocked(self):
+        from alphahound.signals import Enricher, Enrichment
+
+        e = Enricher.__new__(Enricher)
+        e.evm_rpcs = {}
+        e._evm_cache = {}
+        c = Candidate(chain=Chain.BASE, address="0x" + "ab" * 20, symbol="X")
+        enr = Enrichment(candidate=c, features=Features())
+        out = asyncio.run(e._evm_lp_lock(c, enr))
+        self.assertEqual(out, {})
+        self.assertIn("lp_locked_pct", enr.unknown)
+
+    def test_evm_cluster_unmeasured_when_transfer_path_cannot_run(self):
+        from alphahound.signals import Enricher, Enrichment
+
+        e = Enricher.__new__(Enricher)
+        e.evm_rpcs = {}
+        e._evm_cache = {}
+        c = Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0x" + "ab" * 20, symbol="X")
+        enr = Enrichment(candidate=c, features=Features())
+        out = asyncio.run(e._evm_launch_distribution(c, enr))
+        self.assertEqual(out, {})
+        self.assertIn("cluster_pct", enr.unknown)
 
 
 class TestChart(unittest.TestCase):
@@ -1430,6 +1472,21 @@ class TestStore(unittest.TestCase):
         self.assertEqual(loaded.notes, "5m flipped, selling with tape")
         self.assertEqual(loaded.exit_legs[0]["note"], "5m flipped, selling with tape")
 
+    def test_exit_legs_keep_vol5m_at_the_sell_tick(self):
+        trade = _trade()
+        trade.exit_legs = [
+            {
+                "ts_ms": trade.closed_at_ms,
+                "reason": "trailing_stop",
+                "vol5m": 12345.6,
+                "holder_growth_5m": 2.5,
+            }
+        ]
+        self.store.record_trade(trade)
+        shown = legs_for_display(self.store.trades()[0])
+        self.assertAlmostEqual(shown[0]["vol5m"], 12345.6)
+        self.assertAlmostEqual(shown[0]["holder_growth_5m"], 2.5)
+
     def test_unmeasured_features_survive_a_round_trip_to_the_learner(self):
         # A 0.0 that was never measured must not train the model as if it were
         # observed: for most normalizers 0.0 is a real, non-neutral value.
@@ -2317,12 +2374,28 @@ class TestDeadMcap(unittest.TestCase):
         self.assertFalse(mcap_is_dead(0, 40_000))
 
     def test_scan_floor_drops_unquoted_and_sub_50k(self):
-        from alphahound.engine import below_scan_mcap
+        from alphahound.engine import below_scan_mcap, drop_for_scan_mcap
 
         self.assertTrue(below_scan_mcap(0, 50_000))
         self.assertTrue(below_scan_mcap(3_000, 50_000))
         self.assertFalse(below_scan_mcap(50_000, 50_000))
         self.assertFalse(below_scan_mcap(80_000, 50_000))
+        baby = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            mcap_usd=0.0,
+        )
+        self.assertFalse(drop_for_scan_mcap(baby, 50_000))
+        baby.mcap_usd = 3_000
+        self.assertTrue(drop_for_scan_mcap(baby, 50_000))
+        ds = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xdef",
+            source="dexscreener_profiles",
+            mcap_usd=0.0,
+        )
+        self.assertTrue(drop_for_scan_mcap(ds, 50_000))
 
 
 class TestLpLock(unittest.TestCase):

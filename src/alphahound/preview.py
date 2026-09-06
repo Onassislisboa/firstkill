@@ -1108,7 +1108,9 @@ function exitLegsHtml(legs) {
     const amt = l.usd_out != null ? usd(l.usd_out) : (l.size_usd != null ? usd(l.size_usd) : '—');
     const mcap = l.mcap != null ? mcapTxt(l.mcap) : '—';
     const pnl = l.pnl_usd != null ? (' · pnl '+usd(l.pnl_usd)) : '';
-    return '<li>'+clock(l.ts_ms)+' · vendeu '+amt+pnl+' · mcap '+mcap+(l.reason ? ' · '+esc(l.reason) : '')+(l.note ? ' · '+esc(l.note) : '')+'</li>';
+    const tape = (l.vol5m != null ? ' · vol5m '+usd(l.vol5m) : '')
+      +(l.holder_growth_5m != null ? ' · hg5m '+Number(l.holder_growth_5m).toFixed(2) : '');
+    return '<li>'+clock(l.ts_ms)+' · vendeu '+amt+pnl+' · mcap '+mcap+tape+(l.reason ? ' · '+esc(l.reason) : '')+(l.note ? ' · '+esc(l.note) : '')+'</li>';
   }).join('')+'</ul>';
 }
 let lastPnlSig = '';
