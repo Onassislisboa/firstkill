@@ -493,6 +493,10 @@ class TestGates(unittest.TestCase):
             watch_call(vetoed=True, ok=False, reasons=["chase: rip", "vamp: clone"]),
             "skip",
         )
+        self.assertEqual(
+            watch_call(vetoed=True, ok=False, reasons=["mcap: 80000 below 100000 floor"]),
+            "wait",
+        )
         self.assertEqual(watch_call(vetoed=False, ok=False, reasons=[]), "wait")
         self.assertEqual(watch_call(vetoed=False, ok=True, reasons=[]), "trade")
 
@@ -1850,6 +1854,20 @@ class TestPlaybook(unittest.TestCase):
             liquidity_usd=20_000,
         )
         self.assertEqual(early_observe_floors(ripe, STRATEGY), [])
+
+    def test_buy_floors_and_chase_still_get_a_visor_card(self):
+        from alphahound.engine import Engine
+        from alphahound.scoring import hide_from_visor, wait_on_visor
+
+        self.assertTrue(wait_on_visor(["chase: 5m ripped, wait dip"]))
+        self.assertTrue(wait_on_visor(["mcap: 80000 below 100000 floor"]))
+        self.assertTrue(wait_on_visor(["volume: 2000 < 5000 (5m)", "chase: 5m ripped, wait dip"]))
+        self.assertFalse(wait_on_visor(["lp_unlocked: 100% da liquidez livre"]))
+        self.assertFalse(wait_on_visor(["cluster: 37% linked supply"]))
+        self.assertFalse(hide_from_visor(["chase: 5m ripped, wait dip"]))
+        self.assertFalse(hide_from_visor(["mcap: 90000 below 100000 floor"]))
+        self.assertTrue(hide_from_visor(["lp_unlocked: 100% da liquidez livre"]))
+        Engine._assert_loop_helpers(Engine)
 
     def test_public_hood_rpc_has_no_jsonrpc_websocket(self):
         from alphahound.discovery import _hood_jsonrpc_ws

@@ -52,7 +52,7 @@ from .preview import write_preview
 from .providers import Birdeye, Bubblemaps, Dexscreener, FomoGraph, Helius, Twitter, twitter_handle
 from .risk import RiskEngine
 from .rubric import grade
-from .scoring import Model, Scorer, hold_cut, patience_only, watch_call
+from .scoring import Model, Scorer, hide_from_visor, hold_cut, wait_on_visor, watch_call
 from .settings import (
     PUBLIC_SOLANA_RPC,
     Config,
@@ -358,6 +358,15 @@ class Engine:
             raise RuntimeError("mcap_is_dead helper is broken")
         if not enrich_due(0, 1, 15_000):
             raise RuntimeError("enrich_due helper is broken")
+        # Boot fails if ingest would hide a wait-class coin again.
+        if hide_from_visor(["chase: 5m ripped, wait dip"]):
+            raise RuntimeError("chase must stay on the visor")
+        if hide_from_visor(["mcap: 80000 below 100000 floor"]):
+            raise RuntimeError("buy-floor mcap must stay on the visor")
+        if hide_from_visor(["volume: 2000 < 5000 (5m)"]):
+            raise RuntimeError("buy-floor volume must stay on the visor")
+        if not hide_from_visor(["lp_unlocked: 100% da liquidez livre"]):
+            raise RuntimeError("hard skip must still hide at ingest")
 
     async def _every(self, seconds: float, body, label: str) -> None:
         while not self._stop.is_set():
@@ -443,8 +452,9 @@ class Engine:
                         if not v.startswith("age:") and not v.startswith("priced:")
                     ]
                     if vetoes:
-                        self._tick_counts[f"free_veto:{vetoes[0].split(':')[0]}"] += 1
-                        continue
+                        if hide_from_visor(vetoes):
+                            self._tick_counts[f"free_veto:{vetoes[0].split(':')[0]}"] += 1
+                            continue
                 self.watching[candidate.key] = candidate
                 self._reads.setdefault(
                     candidate.key,
@@ -1038,15 +1048,7 @@ class Engine:
                         free_vetoes[0],
                         cheap.unknown,
                     )
-                floor = any(
-                    v.startswith(("mcap:", "volume:", "liquidity:")) for v in free_vetoes
-                )
-                call = (
-                    "wait"
-                    if patience_only(free_vetoes)
-                    or (observe_early(candidate.source) and floor)
-                    else "skip"
-                )
+                call = "wait" if wait_on_visor(free_vetoes) else "skip"
                 self._reads[candidate.key] = self._score_read(
                     candidate, cheap_score, call, free_vetoes[0], cheap
                 )
