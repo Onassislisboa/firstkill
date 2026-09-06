@@ -2397,6 +2397,29 @@ class TestDeadMcap(unittest.TestCase):
         )
         self.assertTrue(drop_for_scan_mcap(ds, 50_000))
 
+    def test_unpaid_dex_stays_off_the_visor(self):
+        from alphahound.engine import on_scan_visor, unpaid_for_scan
+
+        raw = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            mcap_usd=80_000,
+        )
+        self.assertTrue(unpaid_for_scan(raw))
+        self.assertFalse(on_scan_visor(raw, 50_000))
+        raw.dex_paid = True
+        self.assertFalse(unpaid_for_scan(raw))
+        self.assertTrue(on_scan_visor(raw, 50_000))
+        inspect = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xdef",
+            source="inspect",
+            mcap_usd=80_000,
+        )
+        self.assertFalse(unpaid_for_scan(inspect))
+        self.assertTrue(on_scan_visor(inspect, 50_000))
+
 
 class TestLpLock(unittest.TestCase):
     def test_burn_and_locker_are_not_free(self):

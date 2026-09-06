@@ -111,6 +111,19 @@ def drop_for_scan_mcap(candidate: Candidate, floor: float) -> bool:
     return below_scan_mcap(candidate.mcap_usd, floor)
 
 
+def unpaid_for_scan(candidate: Candidate) -> bool:
+    """No visor/enrich/watch without a paid Dexscreener listing. Inspect still goes through."""
+    return candidate.source != "inspect" and not candidate.dex_paid
+
+
+def on_scan_visor(candidate: Candidate, floor: float) -> bool:
+    if candidate.source == "inspect":
+        return True
+    if unpaid_for_scan(candidate):
+        return False
+    return not below_scan_mcap(candidate.mcap_usd, floor)
+
+
 def observe_early(source: str) -> bool:
     """On the visor before buy floors. Must still fail prefilter on enter."""
     return source == "hood_stream"
@@ -365,7 +378,19 @@ class Engine:
             found = await self.discovery.poll()
             before = set(self.watching)
             dead_floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
+            probed = 0
             for candidate in found:
+                if unpaid_for_scan(candidate):
+                    if probed >= 8:  # ponytail: 8 orders/v1 per scan; unpaid never sit on visor
+                        continue
+                    probed += 1
+                    try:
+                        if await self.dex.token_is_paid(candidate.chain, candidate.address):
+                            candidate.dex_paid = True
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if unpaid_for_scan(candidate):
+                        continue
                 prev = self.watching.get(candidate.key)
                 if prev is not None:
                     candidate.last_scored_ms = prev.last_scored_ms
@@ -393,6 +418,7 @@ class Engine:
             self.discovery.prune()
             await self._refresh_watch_quotes()
             self._drop_below_scan_mcap()
+            self._drop_unpaid()
             await self.score_and_enter()
             self._prune_watching()
             self._watch_in = sum(1 for k in self.watching if k not in before)
@@ -450,11 +476,7 @@ class Engine:
                 }
             )
         scan_floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
-        visor = [
-            c
-            for c in self.watching.values()
-            if c.source == "inspect" or not below_scan_mcap(c.mcap_usd, scan_floor)
-        ]
+        visor = [c for c in self.watching.values() if on_scan_visor(c, scan_floor)]
         write_preview(
             self.settings.state_dir,
             {
@@ -838,10 +860,7 @@ class Engine:
             and c.key not in self._inflight
             and self.router.has_venue(c.chain)
             and (c.source == "inspect" or enrich_due(c.last_scored_ms, now, ttl_ms))
-            and (
-                c.source == "inspect"
-                or not below_scan_mcap(c.mcap_usd, scan_floor)
-            )
+            and on_scan_visor(c, scan_floor)
         ]
 
         probe_size = max(
@@ -1294,6 +1313,13 @@ class Engine:
             if drop_for_scan_mcap(candidate, floor):
                 self._drop_watch(candidate, "dead_mcap")
 
+    def _drop_unpaid(self) -> None:
+        for candidate in list(self.watching.values()):
+            if candidate.key in self.positions or candidate.source == "inspect":
+                continue
+            if unpaid_for_scan(candidate):
+                self._drop_watch(candidate, "unpaid")
+
     def _drop_watch(self, candidate: Candidate, tag: str) -> None:
         if candidate.key in self.positions:
             return
@@ -1323,6 +1349,9 @@ class Engine:
                 candidate, float(self.strategy.get("loop.dead_mcap_usd", 50_000))
             ):
                 self._drop_watch(candidate, "dead_mcap")
+                continue
+            if unpaid_for_scan(candidate):
+                self._drop_watch(candidate, "unpaid")
                 continue
             if candidate.pack_role == "vamp":
                 del self.watching[key]
