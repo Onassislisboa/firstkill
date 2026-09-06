@@ -389,6 +389,16 @@ HTML = """<!doctype html>
   .watch-bar button { font: inherit; background: #1a1a1a; color: #fff; border: 1px solid #333;
                       padding: 6px 12px; cursor: pointer; border-radius: 6px; }
   .watch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; }
+  .lane { margin: 0 0 16px; padding: 10px 12px 12px; border: 1px solid var(--line); border-radius: 8px; }
+  .lane > h1 { margin: 0 0 8px; }
+  .lane-hold { border-color: #5a4a18; background: #0c0a04; }
+  .lane-hold > h1 { color: #ffd24a; }
+  .lane-scan { border-color: #1a3a4a; background: #040a10; }
+  .lane-scan > h1 { color: #3ad6ff; }
+  .lane-wait { border-color: #4a3a10; background: #100c04; }
+  .lane-wait > h1 { color: #ffb020; }
+  .lane-skip { border-color: #3a1518; background: #0c0406; }
+  .lane-skip > h1 { color: #ff6b7a; }
   .wcard { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #050505;
            cursor: pointer; min-height: 186px; contain: layout; }
   .wcard.on { border-color: #555; background: #0c0c0c; }
@@ -492,19 +502,33 @@ HTML = """<!doctype html>
 <main>
   <section>
     <div class="watch-bar">
-      <h1>scanning</h1>
+      <h1>inspect</h1>
       <input id="ca-in" placeholder="colar CA" autocomplete="off" spellcheck="false"/>
       <button type="button" id="paste-ca">colar</button>
     </div>
     <div id="coin" class="coin-panel" hidden></div>
-    <div id="watch" class="watch-grid"></div>
+    <div class="lane lane-hold">
+      <h1>hold</h1>
+      <div id="watch-hold" class="watch-grid"></div>
+      <table id="holds" class="book"><thead><tr>
+        <th>token</th><th>held</th><th>pnl</th><th>left</th><th>age</th><th>mcap</th><th>stage 3</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+    <div class="lane lane-scan">
+      <h1>scanning</h1>
+      <div id="watch-scan" class="watch-grid"></div>
+    </div>
+    <div class="lane lane-wait">
+      <h1>wait</h1>
+      <div id="watch-wait" class="watch-grid"></div>
+    </div>
+    <div class="lane lane-skip">
+      <h1>skip</h1>
+      <div id="watch-skip" class="watch-grid"></div>
+    </div>
   </section>
   <section>
-    <h1>holds</h1>
-    <table id="holds" class="book"><thead><tr>
-      <th>token</th><th>held</th><th>pnl</th><th>left</th><th>age</th><th>mcap</th><th>stage 3</th>
-    </tr></thead><tbody></tbody></table>
-    <h1 style="margin-top:22px">sold</h1>
+    <h1>sold</h1>
     <table id="sold" class="book"><thead><tr>
       <th>token</th><th>size</th><th>pnl</th><th>mcap</th><th>hold</th><th>exit</th>
     </tr></thead><tbody></tbody></table>
@@ -712,6 +736,11 @@ function setNode(n, t) {
   }
   if (n.textContent !== t) n.textContent = t;
 }
+function cardFp(w) {
+  const r = w.rubric || {};
+  return [w.call, w.label, w.symbol, w.mcap, w.age_min, w.vol5m, w.ret_5m, w.p, w.ev, r.total,
+    w.why, w.cert, w.dex_paid, (w.kols||[]).join(), (w.fomo||[]).join(), w.whale_n].join('|');
+}
 function fillLive(el, w) {
   const set = (f, t) => setNode(el.querySelector('[data-f="'+f+'"]'), t);
   set('mcap', mcapTxt(w.mcap));
@@ -779,31 +808,60 @@ function fillLive(el, w) {
   }
 }
 
+function laneOf(w) {
+  const c = w.call || 'scan';
+  return (c === 'hold' || c === 'wait' || c === 'skip') ? c : 'scan';
+}
 function paintWatch(list, running) {
-  const box = $('watch');
-  if (!box) return;
-  if (!list.length) {
-    const msg = running ? 'scanning…' : 'start the bot';
-    box.innerHTML = '<div class="muted">'+msg+'</div>';
-    return;
-  }
-  if (box.querySelector('.muted') && !box.querySelector('.wcard')) box.innerHTML = '';
-  const have = new Map([...box.querySelectorAll('.wcard')].map(el => [el.dataset.pick, el]));
-  const keep = new Set();
-  list.forEach(w => {
-    const key = watchKey(w);
-    keep.add(key);
-    let el = have.get(key);
-    if (!el) {
-      el = document.createElement('div');
-      el.className = 'wcard pick';
-      el.dataset.pick = key;
-      el.innerHTML = watchBody(w);
-      box.appendChild(el);
+  const groups = {hold:[], scan:[], wait:[], skip:[]};
+  list.forEach(w => groups[laneOf(w)].push(w));
+  const keep = new Set(list.map(watchKey));
+  const emptyMsg = {
+    hold: 'nenhum hold nestes cards',
+    scan: running ? 'scanning…' : 'start the bot',
+    wait: 'nenhum wait',
+    skip: 'nenhum skip',
+  };
+  ['hold','scan','wait','skip'].forEach(lane => {
+    const box = $('watch-'+lane);
+    if (!box) return;
+    const items = groups[lane];
+    if (!items.length) return;
+    if (box.dataset.empty) {
+      box.dataset.empty = '';
+      const muted = box.querySelector(':scope > .muted');
+      if (muted) muted.remove();
     }
-    fillLive(el, w);
+    items.forEach(w => {
+      const key = watchKey(w);
+      let el = document.querySelector('#tab-watch .wcard[data-pick="'+key.replace(/"/g,'')+'"]');
+      const fp = cardFp(w);
+      if (!el) {
+        el = document.createElement('div');
+        el.className = 'wcard pick';
+        el.dataset.pick = key;
+        el.innerHTML = watchBody(w);
+        el.dataset.fp = fp;
+        box.appendChild(el);
+      } else {
+        if (el.parentNode !== box) box.appendChild(el);
+        if (el.dataset.fp !== fp) { fillLive(el, w); el.dataset.fp = fp; }
+      }
+    });
   });
-  have.forEach((el, key) => { if (!keep.has(key)) el.remove(); });
+  document.querySelectorAll('#tab-watch .wcard').forEach(el => {
+    if (!keep.has(el.dataset.pick)) el.remove();
+  });
+  ['hold','scan','wait','skip'].forEach(lane => {
+    const box = $('watch-'+lane);
+    if (!box) return;
+    if (box.querySelector('.wcard')) return;
+    const empty = emptyMsg[lane];
+    if (box.dataset.empty !== empty) {
+      box.dataset.empty = empty;
+      box.innerHTML = '<div class="muted">'+empty+'</div>';
+    }
+  });
 }
 
 function fillCoin(el, w) {
@@ -857,7 +915,7 @@ function paintCoin(opts) {
   const box = $('coin');
   if (!box) return;
   const w = lastWatch.find(x => watchKey(x) === picked);
-  document.querySelectorAll('#watch .pick').forEach(r => r.classList.toggle('on', r.dataset.pick === picked));
+  document.querySelectorAll('#tab-watch .pick').forEach(r => r.classList.toggle('on', r.dataset.pick === picked));
   if (!w) { box.hidden = true; box.innerHTML = ''; box.dataset.pick = ''; return; }
   box.hidden = false;
   const struct = [picked, w.call, w.cert, w.label, w.address, (w.vetoes||[]).join(), w.explain||'', String(w.dex_paid), String(w.holders)].join('|');
@@ -945,6 +1003,65 @@ function mcapPath(a, b) {
   return '$'+(a?kM(a):'—')+' → $'+(b?kM(b):'—');
 }
 
+function holdRowHtml(h) {
+  const addr = h.address || (h.key||'').split(':')[1];
+  return '<td><div class="sym" data-f="sym">'+esc(h.symbol || caHead(addr))+' '+role(h.role)+'</div>'
+    + '<div class="ca">'+chainShort(h.chain||'')+' · '+caHead(addr)+' '+copyBtn(addr)+' '+sellBtn(h.key, h.symbol)+'</div></td>'
+    + '<td class="gold" data-f="held"></td>'
+    + '<td class="pnl" data-f="pnl"></td>'
+    + '<td data-f="left"></td>'
+    + '<td data-f="age"></td>'
+    + '<td class="mcap-path" data-f="mcap"></td>'
+    + '<td data-f="stage"></td>';
+}
+function fillHoldRow(tr, h) {
+  const set = (f, t) => setNode(tr.querySelector('[data-f="'+f+'"]'), t);
+  const pnl = tr.querySelector('[data-f="pnl"]');
+  const u = h.unrealized_usd != null ? h.unrealized_usd : h.unrealized_pct;
+  if (pnl) {
+    const want = 'pnl '+cls(u);
+    if (pnl.className !== want) pnl.className = want;
+    if (pnl.innerHTML !== (usd(h.unrealized_usd||0)+' <span class="muted">'+pct(h.unrealized_pct)+'</span>'))
+      pnl.innerHTML = usd(h.unrealized_usd||0)+' <span class="muted">'+pct(h.unrealized_pct)+'</span>';
+  }
+  set('held', usd(h.held_usd != null ? h.held_usd : h.size_usd));
+  set('left', Math.round((h.remaining_pct||0)*100)+'%');
+  set('age', mins(h.age_min));
+  set('mcap', mcapPath(h.mcap_entry, h.mcap));
+  const st = tr.querySelector('[data-f="stage"]');
+  if (st) {
+    const why = (h.hold_why||'')+(h.hold_strikes?(' · '+h.hold_strikes+' strike'):'');
+    const next = (h.entry_rubric ? (h.entry_rubric+' → '+(h.hold_rubric||'—')) : '—')
+      + (why ? '<div class="meta">'+esc(why)+'</div>' : '');
+    if (st.innerHTML !== next) st.innerHTML = next;
+  }
+}
+function paintHoldTable(items) {
+  const body = $('holds').querySelector('tbody');
+  if (!body) return;
+  if (!items.length) {
+    const empty = '<tr class="empty"><td class="muted" colspan="7">none open</td></tr>';
+    if (body.innerHTML !== empty) body.innerHTML = empty;
+    return;
+  }
+  const z = body.querySelector('tr.empty');
+  if (z) z.remove();
+  const have = new Map([...body.querySelectorAll('tr[data-k]')].map(el => [el.dataset.k, el]));
+  const keep = new Set();
+  items.forEach(h => {
+    const k = String(h.key || '');
+    keep.add(k);
+    let tr = have.get(k);
+    if (!tr) {
+      tr = document.createElement('tr');
+      tr.dataset.k = k;
+      tr.innerHTML = holdRowHtml(h);
+      body.appendChild(tr);
+    }
+    fillHoldRow(tr, h);
+  });
+  have.forEach((el, k) => { if (!keep.has(k)) el.remove(); });
+}
 function rows(el, items, html, empty, cols) {
   const body = el.querySelector('tbody');
   const next = items.length ? items.map(html).join('')
@@ -1129,6 +1246,9 @@ function paintPnlWindows(w) {
   const el = $('pnl-windows');
   if (!el) return;
   const wins = (w && w.windows) || [];
+  const sig = wins.map(x => x.label+':'+(x.pnl_usd||0)+':'+(x.partial?'1':'0')).join('|');
+  if (el.dataset.sig === sig) return;
+  el.dataset.sig = sig;
   el.innerHTML = wins.map(x => {
     const lab = x.partial
       ? x.label+' (parcial, '+x.history_days+' dias de histórico)'
@@ -1208,21 +1328,14 @@ async function tick() {
   setText('holding', (d.holding||0) + (d.holding ? '  '+usd(d.holding_usd) : ''), 'n gold');
   setText('watching', String(d.watching||0), 'n cyan');
   paintVerdict(d);
-  $('universe').innerHTML = (d.universe.chains||[]).map(chainCard).join('');
-  lastWatch = d.watch || [];
+  const uni = $('universe');
+  const uniHtml = (d.universe.chains||[]).map(chainCard).join('');
+  if (uni.innerHTML !== uniHtml) uni.innerHTML = uniHtml;
+  const incoming = d.watch || [];
+  if (incoming.length || !lastWatch.length || !d.running || !(d.watching > 0)) lastWatch = incoming;
   paintWatch(lastWatch, d.running);
   paintCoin();
-  rows($('holds'), d.holds||[], h => `<tr>
-    <td>
-      <div class="sym">${h.symbol || caHead(h.address||h.key)} ${role(h.role)}</div>
-      <div class="ca">${chainShort(h.chain||'')} · ${caHead(h.address || (h.key||'').split(':')[1])} ${copyBtn(h.address || (h.key||'').split(':')[1])} ${sellBtn(h.key, h.symbol)}</div>
-    </td>
-    <td class="gold">${usd(h.held_usd != null ? h.held_usd : h.size_usd)}</td>
-    <td class="pnl ${cls(h.unrealized_usd != null ? h.unrealized_usd : h.unrealized_pct)}">${usd(h.unrealized_usd||0)} <span class="muted">${pct(h.unrealized_pct)}</span></td>
-    <td>${Math.round((h.remaining_pct||0)*100)}%</td>
-    <td>${mins(h.age_min)}</td>
-    <td class="mcap-path">${mcapPath(h.mcap_entry, h.mcap)}</td>
-    <td>${h.entry_rubric ? (h.entry_rubric+' → '+(h.hold_rubric||'—')) : '—'}<div class="meta">${h.hold_why||''}${h.hold_strikes?(' · '+h.hold_strikes+' strike'):''}</div></td></tr>`, 'none open', 7);
+  paintHoldTable(d.holds||[]);
   rows($('sold'), d.sold||[], t => `<tr>
     <td>
       <div class="sym">${t.symbol || caHead((t.key||'').split(':')[1])}</div>
