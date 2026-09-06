@@ -26,6 +26,10 @@ def launchpad_origin(candidate: Candidate, strategy: Config) -> tuple[bool, str]
         if candidate.chain is Chain.SOLANA:
             return True, "pump.fun stream"
         return False, "pump.fun stream on a non-solana chain"
+    if candidate.source == "hood_stream":
+        if candidate.chain is Chain.ROBINHOOD_CHAIN:
+            return True, "hood factory stream"
+        return False, "hood stream on a non-hood chain"
 
     cfg = strategy.section(f"launchpads.{candidate.chain.value}")
     if not cfg:

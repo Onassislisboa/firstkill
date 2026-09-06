@@ -30,6 +30,56 @@ from .settings import (
 from .store import Store
 
 PREVIEW_NAME = "preview.json"
+SELL_QUEUE = "sell.json"
+POSITIONS_FILE = "positions.json"
+
+
+def match_open_position(rows: list[Any], needle: str) -> dict[str, str] | None:
+    needle = (needle or "").strip()
+    if not needle:
+        return None
+    nl = needle.lower()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cand = row.get("candidate") if isinstance(row.get("candidate"), dict) else {}
+        chain = str(cand.get("chain") or "")
+        addr = str(cand.get("address") or "")
+        key = f"{chain}:{addr}" if chain and addr else str(row.get("key") or "")
+        if needle == key or nl == key.lower() or (addr and nl == addr.lower()):
+            return {"key": key, "symbol": str(cand.get("symbol") or "")}
+    return None
+
+
+def enqueue_manual_sell(state_dir: Path, needle: str) -> dict[str, Any]:
+    """Queue a single-bag flatten for the engine risk loop. Preview process
+    cannot sell itself — the engine holds the router and the position lock."""
+    path = state_dir / POSITIONS_FILE
+    rows: list[Any] = []
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            loaded = []
+        if isinstance(loaded, list):
+            rows = loaded
+    hit = match_open_position(rows, needle)
+    if hit is None:
+        return {"ok": False, "error": "posição já fechada"}
+    qpath = state_dir / SELL_QUEUE
+    pending: list[Any] = []
+    if qpath.exists():
+        try:
+            pending = json.loads(qpath.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            pending = []
+        if not isinstance(pending, list):
+            pending = [pending]
+    key = hit["key"]
+    if key not in pending:
+        pending.append(key)
+    qpath.write_text(json.dumps(pending), encoding="utf-8")
+    return {"ok": True, "queued": True, "key": key, "symbol": hit["symbol"]}
 
 
 def write_preview(state_dir: Path, payload: dict[str, Any]) -> None:
@@ -323,9 +373,11 @@ HTML = """<!doctype html>
   .cat-list { display: grid; gap: 6px; margin: 8px 0; }
   .cat-list > div { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
   .coin-panel .wrap { white-space: normal; overflow: visible; }
-  button.copy { font: inherit; font-size: 10px; background: #111; color: #c8c8c8; border: 1px solid #333;
+  button.copy, button.sell { font: inherit; font-size: 10px; background: #111; color: #c8c8c8; border: 1px solid #333;
                 padding: 2px 8px; border-radius: 4px; cursor: pointer; letter-spacing: .04em; }
   button.copy:hover { color: #fff; border-color: #555; }
+  button.sell { color: #ff6b7a; border-color: #5a1520; margin-left: 4px; }
+  button.sell:hover { color: #fff; border-color: #ff3b4e; background: #2a0008; }
   .watch-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
   .watch-bar h1 { margin: 0; }
   .watch-bar input { font: inherit; background: #0a0a0a; color: #fff; border: 1px solid #333;
@@ -600,6 +652,9 @@ const caHead = a => {
 };
 const role = r => r && r !== 'solo' ? '<span class="pill r-'+r+'">'+r+'</span>' : '';
 const copyBtn = a => a ? '<button class="copy" type="button" data-copy="'+a+'" title="copiar CA" aria-label="copiar CA">copiar</button>' : '';
+const sellBtn = (key, sym) => key
+  ? '<button class="sell" type="button" data-sell="'+esc(key)+'" data-sym="'+esc(sym||'')+'" title="vender" aria-label="vender">vender</button>'
+  : '';
 let picked = '';
 let lastWatch = [];
 let uniReady = false;
@@ -943,6 +998,18 @@ document.addEventListener('click', e => {
       body: JSON.stringify({action:'remove', address: rm.dataset.remove})}).then(tick);
     return;
   }
+  const sell = e.target.closest('[data-sell]');
+  if (sell) {
+    const key = sell.dataset.sell || '';
+    const sym = sell.dataset.sym || 'essa moeda';
+    if (!confirm('Vender '+sym+' agora?')) return;
+    fetch('/api/sell', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({key})})
+      .then(r => r.json()).then(j => {
+        $('status').textContent = j.ok ? ('venda enviada' + (j.symbol ? ' · '+j.symbol : '')) : (j.error || 'falhou vender');
+      }).catch(() => { $('status').textContent = 'falhou vender'; });
+    return;
+  }
   const b = e.target.closest('[data-copy]');
   if (!b) return;
   const s = b.dataset.copy;
@@ -1112,7 +1179,7 @@ async function tick() {
   rows($('holds'), d.holds||[], h => `<tr>
     <td>
       <div class="sym">${h.symbol || caHead(h.address||h.key)} ${role(h.role)}</div>
-      <div class="ca">${chainShort(h.chain||'')} · ${caHead(h.address || (h.key||'').split(':')[1])} ${copyBtn(h.address || (h.key||'').split(':')[1])}</div>
+      <div class="ca">${chainShort(h.chain||'')} · ${caHead(h.address || (h.key||'').split(':')[1])} ${copyBtn(h.address || (h.key||'').split(':')[1])} ${sellBtn(h.key, h.symbol)}</div>
     </td>
     <td class="gold">${usd(h.held_usd != null ? h.held_usd : h.size_usd)}</td>
     <td class="pnl ${cls(h.unrealized_usd != null ? h.unrealized_usd : h.unrealized_pct)}">${usd(h.unrealized_usd||0)} <span class="muted">${pct(h.unrealized_pct)}</span></td>
@@ -1255,6 +1322,16 @@ def serve(
                 body = json.loads(self.rfile.read(n).decode() if n else "{}")
             except ValueError:
                 body = {}
+            if path == "/api/sell":
+                key = str(body.get("key") or body.get("address") or "").strip()
+                result = enqueue_manual_sell(state_dir, key)
+                code = 200 if result.get("ok") else 409
+                out = json.dumps(result).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(out)
+                return
             if path == "/api/flatten":
                 if strategy is None:
                     out = json.dumps({"ok": False, "error": "no strategy"}).encode()

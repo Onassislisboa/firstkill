@@ -13,6 +13,7 @@ Stdlib only, no fixtures, no plugins:
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import tempfile
 import unittest
@@ -559,6 +560,29 @@ class TestGates(unittest.TestCase):
 
         pons = Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0xabc", dex_id="uniswap")
         self.assertTrue(launchpad_origin(pons, STRATEGY)[0])
+        stream = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN, address="0xabc", source="hood_stream", dex_id=""
+        )
+        self.assertTrue(launchpad_origin(stream, STRATEGY)[0])
+        baby = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            dex_id="uniswap",
+            mcap_usd=12_000,
+            volume_5m_usd=100,
+            liquidity_usd=4_000,
+            created_at_ms=now_ms(),
+        )
+        enr = Enrichment(candidate=baby, features=Features(liquidity_usd=4_000))
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=False)
+        self.assertTrue(
+            any(
+                v.startswith("mcap:") or v.startswith("liquidity:") or v.startswith("volume:")
+                for v in vetoes
+            ),
+            vetoes,
+        )
 
         broker = Candidate(chain=Chain.ROBINHOOD_BROKER, address="BTC")
         self.assertFalse(launchpad_origin(broker, STRATEGY)[0])
@@ -1567,6 +1591,96 @@ class TestPlaybook(unittest.TestCase):
         )
         self.assertFalse(d._accept(stale))
 
+    def test_hood_factory_log_emits_the_non_weth_token(self):
+        from alphahound.discovery import (
+            PONS_FACTORY,
+            TOPIC_POOL_CREATED,
+            TOPIC_TOKEN_LAUNCHED,
+            UNI_V3_FACTORY,
+            candidates_from_hood_log,
+        )
+
+        weth = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD97"
+        meme = "0xa3602804e096cb73bd8344afc1ff3f3390b899c5"
+        pad = lambda a: "0x" + a[2:].lower().rjust(64, "0")
+        found = candidates_from_hood_log(
+            {
+                "address": UNI_V3_FACTORY,
+                "topics": [TOPIC_POOL_CREATED, pad(weth), pad(meme), "0x" + "0" * 62 + "0bb8"],
+                "data": "0x" + "0" * 64 + "0" * 24 + "b" * 40,
+            },
+            weth=weth,
+        )
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].address.lower(), meme)
+        self.assertEqual(found[0].source, "hood_stream")
+        self.assertEqual(found[0].dex_id, "uniswap")
+
+        pons = candidates_from_hood_log(
+            {
+                "address": PONS_FACTORY,
+                "topics": [TOPIC_TOKEN_LAUNCHED, pad(meme), pad("0x" + "1" * 40), pad(UNI_V3_FACTORY)],
+                "data": "0x",
+            },
+            weth=weth,
+        )
+        self.assertEqual(pons[0].address.lower(), meme)
+        self.assertEqual(pons[0].dex_id, "pons")
+
+    def test_hood_stream_is_observe_not_a_buy_bypass(self):
+        from alphahound.engine import early_observe_floors, observe_early
+
+        self.assertTrue(observe_early("hood_stream"))
+        self.assertFalse(observe_early("dexscreener_profiles"))
+        baby = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0x" + "ab" * 20,
+            source="hood_stream",
+            mcap_usd=0.0,
+            volume_5m_usd=0.0,
+            liquidity_usd=0.0,
+        )
+        floors = early_observe_floors(baby, STRATEGY)
+        self.assertTrue(any(v.startswith("mcap:") for v in floors), floors)
+        self.assertTrue(any(v.startswith("volume:") for v in floors), floors)
+        self.assertTrue(any(v.startswith("liquidity:") for v in floors), floors)
+        ripe = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0x" + "cd" * 20,
+            source="hood_stream",
+            mcap_usd=150_000,
+            volume_5m_usd=8_000,
+            liquidity_usd=20_000,
+        )
+        self.assertEqual(early_observe_floors(ripe, STRATEGY), [])
+
+    def test_public_hood_rpc_has_no_jsonrpc_websocket(self):
+        from alphahound.discovery import _hood_jsonrpc_ws
+
+        self.assertIsNone(_hood_jsonrpc_ws("https://rpc.mainnet.chain.robinhood.com"))
+        self.assertTrue(
+            (_hood_jsonrpc_ws("https://robinhood-mainnet.g.alchemy.com/v2/x") or "").startswith(
+                "wss://"
+            )
+        )
+
+    def test_hood_factory_log_uses_block_timestamp_when_present(self):
+        from alphahound.discovery import TOPIC_POOL_CREATED, UNI_V3_FACTORY, candidates_from_hood_log
+
+        weth = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD97"
+        meme = "0xa3602804e096cb73bd8344afc1ff3f3390b899c5"
+        pad = lambda a: "0x" + a[2:].lower().rjust(64, "0")
+        found = candidates_from_hood_log(
+            {
+                "address": UNI_V3_FACTORY,
+                "topics": [TOPIC_POOL_CREATED, pad(weth), pad(meme), "0x" + "0" * 62 + "0bb8"],
+                "data": "0x" + "0" * 64 + "0" * 24 + "b" * 40,
+                "blockTimestamp": hex(1_700_000_000),
+            },
+            weth=weth,
+        )
+        self.assertEqual(found[0].created_at_ms, 1_700_000_000_000)
+
     def test_pnl_curve_sums_per_chain(self):
         from alphahound.preview import pnl_curves
 
@@ -2056,6 +2170,45 @@ class TestDeadMcap(unittest.TestCase):
         self.assertTrue(mcap_is_dead(39_999, 40_000))
         self.assertFalse(mcap_is_dead(40_000, 40_000))
         self.assertFalse(mcap_is_dead(0, 40_000))
+
+
+class TestManualSellQueue(unittest.TestCase):
+    def test_match_and_refuse_closed(self):
+        from alphahound.engine import sell_queued_for
+        from alphahound.preview import enqueue_manual_sell
+
+        key = "robinhood_chain:0xabc"
+        queued = {key}
+        self.assertTrue(sell_queued_for(queued, key, "0xabc"))
+        self.assertTrue(sell_queued_for({"0xABC"}, key, "0xabc"))
+        self.assertFalse(sell_queued_for({"other:0xdef"}, key, "0xabc"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            (state / "positions.json").write_text("[]", encoding="utf-8")
+            miss = enqueue_manual_sell(state, key)
+            self.assertFalse(miss["ok"])
+            (state / "positions.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "candidate": {
+                                "chain": "robinhood_chain",
+                                "address": "0xabc",
+                                "symbol": "PUNCH",
+                            }
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            hit = enqueue_manual_sell(state, "0xABC")
+            self.assertTrue(hit["ok"])
+            self.assertEqual(hit["key"], key)
+            self.assertEqual(hit["symbol"], "PUNCH")
+            again = enqueue_manual_sell(state, key)
+            self.assertTrue(again["ok"])
+            self.assertEqual(json.loads((state / "sell.json").read_text(encoding="utf-8")), [key])
 
 
 if __name__ == "__main__":
