@@ -2301,6 +2301,19 @@ class TestRubric(unittest.TestCase):
         r = grade(enr, self.store)
         self.assertGreaterEqual(r.total, 7.0, r.as_visor())
 
+    def test_unmeasured_grade_stays_neutral_five_inside_the_model(self):
+        from alphahound.models import Score
+        from alphahound.rubric import grade
+        from alphahound.signals import Enricher
+
+        cheap = Enricher.free_enrichment(
+            Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0xabc")
+        )
+        r = grade(cheap, self.store)
+        self.assertGreater(r.total, 3.5)
+        self.assertLess(r.total, 6.5)
+        self.assertEqual(Score(probability=0.0, expected_value=0.0).rubric, {})
+
     def test_scorer_vetoes_below_rubric_floor(self):
         from alphahound.scoring import Scorer
         from alphahound.signals import Enrichment

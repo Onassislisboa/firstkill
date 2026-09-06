@@ -408,6 +408,8 @@ HTML = """<!doctype html>
              font-variant-numeric: tabular-nums; min-width: 2.2ch; }
   .score-hi .score-n { color: #3dff9a; } .score-mid .score-n { color: #ffd24a; }
   .score-lo .score-n { color: #ff3b4e; }
+  .score-q .score-n { color: #6a6a6a; font-size: 13px; font-weight: 600; letter-spacing: 0; min-width: 0; }
+  .score-q .score-bars { display: none; }
   .score-bars { flex: 1; display: grid; gap: 2px; }
   .score-bars b { display: flex; align-items: center; gap: 4px; font-size: 9px; color: #6a6a6a;
                   font-weight: 600; letter-spacing: .04em; }
@@ -638,12 +640,21 @@ function dexLine(w) {
     : '<div class="meta"><span class="dex-no" data-f="dex">NOT DEX</span></div>';
 }
 function rubricLine(r) {
-  r = r || {};
-  const total = r.total == null ? '—' : r.total;
-  const tone = (r.total||0) >= 7 ? 'hi' : (r.total||0) >= 5.5 ? 'mid' : 'lo';
+  if (r == null || r.total == null) {
+    return '<div class="score score-q" data-f="score">'
+      + '<span class="score-n" data-f="score-n">—</span>'
+      + '<div class="score-bars">'
+      + '<b>D<em><i data-k="D" style="width:0%"></i></em></b>'
+      + '<b>C<em><i data-k="C" style="width:0%"></i></em></b>'
+      + '<b>F<em><i data-k="F" style="width:0%"></i></em></b>'
+      + '<b>G<em><i data-k="G" style="width:0%"></i></em></b>'
+      + '<b>N<em><i data-k="N" style="width:0%"></i></em></b>'
+      + '</div></div>';
+  }
+  const tone = r.total >= 7 ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo';
   const row = (k, v) => '<b>'+k+'<em><i data-k="'+k+'" style="width:'+Math.max(0,Math.min(100,Math.round(((v||0)/10)*100)))+'%"></i></em></b>';
   return '<div class="score score-'+tone+'" data-f="score">'
-    + '<span class="score-n" data-f="score-n">'+total+'</span>'
+    + '<span class="score-n" data-f="score-n">'+r.total+'</span>'
     + '<div class="score-bars">'
     + row('D', r.dist)+row('C', r.crowd)+row('F', r.flow)+row('G', r.chart)+row('N', r.narrative)
     + '</div></div>';
@@ -739,15 +750,23 @@ function fillLive(el, w) {
   }
   const r = w.rubric || {};
   const score = el.querySelector('[data-f="score"]');
-  if (r.total != null && score) {
-    const tone = 'score score-' + (r.total >= 7 ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo');
-    if (score.className !== tone) score.className = tone;
-    set('score-n', String(r.total));
-    const wmap = {D:r.dist, C:r.crowd, F:r.flow, G:r.chart, N:r.narrative};
-    score.querySelectorAll('i[data-k]').forEach(i => {
-      const pctw = Math.max(0, Math.min(100, Math.round(((wmap[i.dataset.k]||0)/10)*100)));
-      if (i.style.width !== pctw+'%') i.style.width = pctw+'%';
-    });
+  if (score) {
+    if (r.total == null) {
+      if (score.className !== 'score score-q') score.className = 'score score-q';
+      set('score-n', '—');
+      score.querySelectorAll('i[data-k]').forEach(i => {
+        if (i.style.width !== '0%') i.style.width = '0%';
+      });
+    } else {
+      const tone = 'score score-' + (r.total >= 7 ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo');
+      if (score.className !== tone) score.className = tone;
+      set('score-n', String(r.total));
+      const wmap = {D:r.dist, C:r.crowd, F:r.flow, G:r.chart, N:r.narrative};
+      score.querySelectorAll('i[data-k]').forEach(i => {
+        const pctw = Math.max(0, Math.min(100, Math.round(((wmap[i.dataset.k]||0)/10)*100)));
+        if (i.style.width !== pctw+'%') i.style.width = pctw+'%';
+      });
+    }
   }
   const ret = el.querySelector('[data-f="ret"]');
   if (ret) {
@@ -797,12 +816,20 @@ function fillCoin(el, w) {
   set('age', ageTxt(w.age_min));
   set('holders', w.holders==null?'—':numFull(w.holders));
   set('rt', w.rt==null?'—':pctFull(w.rt));
-  set('c-score', r.total==null?'—':String(r.total));
-  set('cat-dist', (r.dist==null?'—':r.dist)+' / 10');
-  set('cat-crowd', (r.crowd==null?'—':r.crowd)+' / 10');
-  set('cat-flow', (r.flow==null?'—':r.flow)+' / 10');
-  set('cat-chart', (r.chart==null?'—':r.chart)+' / 10');
-  set('cat-narr', (r.narrative==null?'—':r.narrative)+' / 10');
+  const pending = r.total == null;
+  set('c-score', pending ? '—' : String(r.total));
+  set('cat-dist', pending ? '—' : r.dist+' / 10');
+  set('cat-crowd', pending ? '—' : r.crowd+' / 10');
+  set('cat-flow', pending ? '—' : r.flow+' / 10');
+  set('cat-chart', pending ? '—' : r.chart+' / 10');
+  set('cat-narr', pending ? '—' : r.narrative+' / 10');
+  const buy = el.querySelector('.buy-box');
+  if (buy) {
+    const tone = pending ? 'q' : (r.total >= (w.min_rubric||7) ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo');
+    const want = 'buy-box score-'+tone;
+    if (buy.className !== want) buy.className = want;
+  }
+  set('r-cap', pending ? 'sem avaliação ainda' : ('rubric / '+(w.min_rubric==null?'—':w.min_rubric)+' pra passar o piso'));
   const minP = w.min_p == null ? '—' : Number(w.min_p).toFixed(4);
   const minEv = w.min_ev == null ? '—' : Number(w.min_ev).toFixed(4);
   set('pwin', (w.p == null ? '—' : Number(w.p).toFixed(4))+'  (piso '+minP+')');
@@ -847,8 +874,8 @@ function paintCoin(opts) {
   const evTxt = w.ev == null ? '—' : ((Number(w.ev)>=0?'+':'')+Number(w.ev).toFixed(4));
   const minP = w.min_p == null ? '—' : Number(w.min_p).toFixed(4);
   const minEv = w.min_ev == null ? '—' : Number(w.min_ev).toFixed(4);
-  const minR = w.min_rubric == null ? '—' : String(w.min_rubric);
-  const tone = r.total >= (w.min_rubric||7) ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo';
+  const pending = r.total == null;
+  const tone = pending ? 'q' : (r.total >= (w.min_rubric||7) ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo');
   const wallets = (w.wallets||[]).join(', ') || '—';
   const kols = (w.kols&&w.kols.length) ? w.kols.join(', ') : '—';
   const fomo = (w.fomo&&w.fomo.length) ? w.fomo.join(', ') : '—';
@@ -878,14 +905,14 @@ function paintCoin(opts) {
     + '<div class="buy-box score-'+tone+'">'
     + '<h2>nota desta moeda</h2>'
     + '<p>Régua igual pra todas; os inputs (chart, crowd, chain, narrativa) são desta CA. WAITING no topo é PnL da conta, não nota.</p>'
-    + '<div class="coin-h"><span class="score-n" data-f="c-score">'+(r.total==null?'—':r.total)+'</span>'
-    + '<span class="muted">rubric / '+minR+' pra passar o piso</span></div>'
+    + '<div class="coin-h"><span class="score-n" data-f="c-score">'+(pending?'—':r.total)+'</span>'
+    + '<span class="muted" data-f="r-cap">'+(pending?'sem avaliação ainda':('rubric / '+(w.min_rubric==null?'—':w.min_rubric)+' pra passar o piso'))+'</span></div>'
     + '<div class="cat-list">'
-    + '<div><span>distribution</span><span data-f="cat-dist">'+(r.dist==null?'—':r.dist)+' / 10</span></div>'
-    + '<div><span>crowd</span><span data-f="cat-crowd">'+(r.crowd==null?'—':r.crowd)+' / 10</span></div>'
-    + '<div><span>flow</span><span data-f="cat-flow">'+(r.flow==null?'—':r.flow)+' / 10</span></div>'
-    + '<div><span>chart</span><span data-f="cat-chart">'+(r.chart==null?'—':r.chart)+' / 10</span></div>'
-    + '<div><span>narrative</span><span data-f="cat-narr">'+(r.narrative==null?'—':r.narrative)+' / 10</span></div>'
+    + '<div><span>distribution (D)</span><span data-f="cat-dist">'+(pending?'—':r.dist+' / 10')+'</span></div>'
+    + '<div><span>crowd (C)</span><span data-f="cat-crowd">'+(pending?'—':r.crowd+' / 10')+'</span></div>'
+    + '<div><span>flow (F)</span><span data-f="cat-flow">'+(pending?'—':r.flow+' / 10')+'</span></div>'
+    + '<div><span>chart (G)</span><span data-f="cat-chart">'+(pending?'—':r.chart+' / 10')+'</span></div>'
+    + '<div><span>narrative (N)</span><span data-f="cat-narr">'+(pending?'—':r.narrative+' / 10')+'</span></div>'
     + '</div>'
     + '<div class="coin-stats">'
     + stat('p (win)', 'pwin', pTxt+'  (piso '+minP+')')

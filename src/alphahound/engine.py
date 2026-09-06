@@ -51,7 +51,6 @@ from .playbook import section as pb_section
 from .preview import write_preview
 from .providers import Birdeye, Bubblemaps, Dexscreener, FomoGraph, Helius, Twitter, twitter_handle
 from .risk import RiskEngine
-from .rubric import grade
 from .scoring import Model, Scorer, hide_from_visor, hold_cut, wait_on_visor, watch_call
 from .settings import (
     PUBLIC_SOLANA_RPC,
@@ -1034,7 +1033,6 @@ class Engine:
                     probability=0.0,
                     expected_value=0.0,
                     veto_reasons=free_vetoes,
-                    rubric=grade(cheap, self.store, self.strategy).as_visor(),
                 )
                 # First sqlite row is the observation. Later floor waits stay on
                 # the visor without flooding Review every rescore_seconds.
