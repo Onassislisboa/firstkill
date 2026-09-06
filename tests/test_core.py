@@ -13,6 +13,7 @@ Stdlib only, no fixtures, no plugins:
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import tempfile
 import unittest
@@ -38,6 +39,7 @@ from alphahound.models import (  # noqa: E402
     VenueId,
     now_ms,
 )
+from alphahound.engine import enrich_due, loop_bug  # noqa: E402
 from alphahound.portfolio import PositionManager, banked_from_peak  # noqa: E402
 from alphahound.risk import RiskEngine, kelly_fraction, mcap_position_pct  # noqa: E402
 from alphahound.scoring import (  # noqa: E402
@@ -49,7 +51,7 @@ from alphahound.scoring import (  # noqa: E402
     payoff_from_config,
     watch_call,
 )
-from alphahound.settings import Config, load_strategy  # noqa: E402
+from alphahound.settings import Config, apply_aggressive_learning, load_strategy, score_floors  # noqa: E402
 from alphahound.signals import Enrichment  # noqa: E402
 from alphahound.signals import chart, flow  # noqa: E402
 from alphahound.signals.distribution import Holder, analyze, gini  # noqa: E402
@@ -63,6 +65,23 @@ from alphahound.signals.terminals import (  # noqa: E402
 from alphahound.store import Store, lock_state_dir  # noqa: E402
 
 STRATEGY = load_strategy()
+
+
+class TestEnrichDue(unittest.TestCase):
+    def test_first_look_always_runs(self):
+        self.assertTrue(enrich_due(0, 10_000, 15_000))
+
+    def test_skips_until_ttl(self):
+        self.assertFalse(enrich_due(1_000, 10_000, 15_000))
+        self.assertTrue(enrich_due(1_000, 20_000, 15_000))
+
+
+class TestLoopBug(unittest.TestCase):
+    def test_name_error_is_fatal_timeout_is_not(self):
+        self.assertTrue(loop_bug(NameError("mcap_is_dead")))
+        self.assertTrue(loop_bug(AttributeError("x")))
+        self.assertFalse(loop_bug(RuntimeError("rpc 429")))
+        self.assertFalse(loop_bug(TimeoutError()))
 
 
 def make_store() -> tuple[Store, tempfile.TemporaryDirectory]:
@@ -119,11 +138,72 @@ class TestDistribution(unittest.TestCase):
         stats = analyze(holders, now_ms=now_ms())
         self.assertGreater(stats.largest_funding_cluster_pct, 0.85)
 
+    def test_token_hops_from_one_sender_are_a_funding_cluster(self):
+        from alphahound.signals.distribution import TokenMove, holders_from_moves
+
+        pool = "0x" + "p" * 40
+        src = "0x" + "a" * 40
+        moves = [
+            TokenMove(1, src, f"0x{i:040x}", 10.0) for i in range(1, 9)
+        ] + [TokenMove(2, pool, "0x" + "b" * 40, 5.0)]
+        holders, launch = holders_from_moves(moves, pools={pool}, first_n=40)
+        self.assertEqual(launch, 1)
+        stats = analyze(holders, now_ms=now_ms(), launch_slot=launch)
+        self.assertGreater(stats.largest_funding_cluster_pct, 0.70)
+        self.assertGreater(stats.bundle_pct, 0.70)
+
+    def test_quote_cluster_is_complementary_to_token_hops(self):
+        from alphahound.signals.distribution import (
+            TokenMove,
+            cluster_share_by_root,
+            first_pool_buyers,
+        )
+
+        pool = "0x" + "p" * 40
+        moves = [TokenMove(i, pool, f"0x{i:040x}", 10.0) for i in range(1, 6)]
+        buyers = first_pool_buyers(moves, {pool}, 40, {f"0x{i:040x}": 10.0 for i in range(1, 6)})
+        self.assertEqual(len(buyers), 5)
+        roots = {f"0x{i:040x}": "0x" + "f" * 40 for i in range(1, 5)}
+        holders = [Holder(f"0x{i:040x}", 10.0) for i in range(1, 6)]
+        # 4 of 5 bags share a quote root → 80%, which the token-hop path would miss.
+        self.assertAlmostEqual(cluster_share_by_root(holders, roots, 50.0), 0.8)
+
     def test_bundle_pct_not_reported_without_a_launch_slot(self):
         holders = [Holder("a", 100.0, acquired_slot=10)]
         stats = analyze(holders, now_ms=now_ms(), launch_slot=0)
         self.assertEqual(stats.bundle_pct, 0.0)
         self.assertTrue(any("launch slot" in note for note in stats.notes))
+        from alphahound.signals.distribution import unmeasured_from_stats
+
+        self.assertIn("bundle_pct", unmeasured_from_stats(stats))
+        self.assertIn("fresh_wallet_pct", unmeasured_from_stats(stats))
+
+    def test_wallet_ages_present_are_measured(self):
+        from alphahound.signals.distribution import unmeasured_from_stats
+
+        t = now_ms()
+        stats = analyze(
+            [Holder("a", 100.0, first_seen_ms=t, acquired_slot=1)],
+            now_ms=t,
+            launch_slot=1,
+        )
+        self.assertEqual(unmeasured_from_stats(stats), set())
+        self.assertAlmostEqual(stats.fresh_wallet_pct, 1.0)
+
+    def test_missing_fresh_wallet_age_is_score_neutral_not_a_bonus(self):
+        from alphahound.models import Features
+        from alphahound.scoring import Model, normalize
+
+        feat = Features(fresh_wallet_pct=0.0, bundle_pct=0.0)
+        model = Model()
+        _, lied = model.probability(normalize(feat, unknown=set()))
+        _, honest = model.probability(
+            normalize(feat, unknown={"fresh_wallet_pct", "bundle_pct"})
+        )
+        self.assertGreater(lied.get("fresh_wallet_pct", 0.0), 0.5)
+        self.assertNotIn("fresh_wallet_pct", honest)
+        self.assertGreater(lied.get("bundle_pct", 0.0), 0.3)
+        self.assertNotIn("bundle_pct", honest)
 
 
 class TestChart(unittest.TestCase):
@@ -480,6 +560,29 @@ class TestGates(unittest.TestCase):
 
         pons = Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0xabc", dex_id="uniswap")
         self.assertTrue(launchpad_origin(pons, STRATEGY)[0])
+        stream = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN, address="0xabc", source="hood_stream", dex_id=""
+        )
+        self.assertTrue(launchpad_origin(stream, STRATEGY)[0])
+        baby = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            dex_id="uniswap",
+            mcap_usd=12_000,
+            volume_5m_usd=100,
+            liquidity_usd=4_000,
+            created_at_ms=now_ms(),
+        )
+        enr = Enrichment(candidate=baby, features=Features(liquidity_usd=4_000))
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=False)
+        self.assertTrue(
+            any(
+                v.startswith("mcap:") or v.startswith("liquidity:") or v.startswith("volume:")
+                for v in vetoes
+            ),
+            vetoes,
+        )
 
         broker = Candidate(chain=Chain.ROBINHOOD_BROKER, address="BTC")
         self.assertFalse(launchpad_origin(broker, STRATEGY)[0])
@@ -554,7 +657,7 @@ class TestGates(unittest.TestCase):
         enr.candidate.dex_id = "pons"
         enr.candidate.address = "0xabc"
         hood, _ = evaluate_gates(enr, STRATEGY, self.store, live=False)
-        self.assertFalse(any("rug_filter" in v for v in hood), hood)
+        self.assertTrue(any("rug_filter" in v for v in hood), hood)
 
     def test_paid_listing_skips_unmeasured_cluster(self):
         enr = self.enrichment()
@@ -570,6 +673,12 @@ class TestGates(unittest.TestCase):
         enr.mint = _FakeMint(None, None)
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
         self.assertTrue(any("cluster:" in v for v in vetoes), vetoes)
+
+    def test_measured_bundle_is_a_hard_veto(self):
+        enr = self.enrichment(bundle_pct=0.45)
+        enr.mint = _FakeMint(None, None)
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=False)
+        self.assertTrue(any(v.startswith("bundle:") for v in vetoes), vetoes)
 
     def test_robinhood_age_is_not_an_entry_veto(self):
         enr = self.enrichment()
@@ -730,9 +839,10 @@ class TestRisk(unittest.TestCase):
         self.assertFalse(halted, reason)
 
     def test_daily_entry_cap(self):
+        self.store.set_param("risk.max_entries_per_day", 5, "test")
         score = Score(probability=0.90, expected_value=0.5)
         payoff = Payoff(avg_win=1.0, avg_loss=0.25, samples=50, from_history=True)
-        for i in range(int(STRATEGY.get("risk.max_entries_per_day", 5))):
+        for i in range(5):
             self.store.record_decision(
                 Decision(
                     candidate=Candidate(
@@ -752,6 +862,39 @@ class TestRisk(unittest.TestCase):
         )
         self.assertFalse(sizing.allowed)
         self.assertIn("daily cap", sizing.reason)
+
+
+class TestAggressiveLearning(unittest.TestCase):
+    def setUp(self):
+        self.store, self._tmp = make_store()
+
+    def tearDown(self):
+        self.store.close()
+        self._tmp.cleanup()
+
+    def test_overlay_more_slots_same_total_cap(self):
+        cfg = apply_aggressive_learning(STRATEGY, self.store)
+        self.assertTrue(cfg.get("aggressive_learning._active"))
+        self.assertEqual(int(cfg.get("risk.max_concurrent_positions")), 4)
+        self.assertAlmostEqual(float(cfg.get("risk.max_position_pct")), 0.08, places=4)
+        self.assertGreaterEqual(float(cfg.get("risk.min_position_pct")), 0.05 - 1e-9)
+        self.store.set_param("scoring.min_expected_value", 0.048, "test")
+        p, ev = score_floors(cfg, self.store)
+        self.assertAlmostEqual(p, 0.38, places=4)
+        self.assertAlmostEqual(ev, 0.03, places=4)
+
+    def test_graduates_back_to_production(self):
+        for _ in range(40):
+            self.store.record_trade(_trade(pnl=-1.0))
+        cfg = apply_aggressive_learning(STRATEGY, self.store)
+        self.assertFalse(cfg.get("aggressive_learning._active"))
+        self.assertEqual(int(cfg.get("risk.max_concurrent_positions")), 2)
+        self.assertEqual(self.store.get_kv("aggressive_graduated"), "1")
+
+    def test_tiny_bankroll_keeps_two_slots(self):
+        thin = STRATEGY.overlay({"risk": {"equity_usd": 40.0}})
+        cfg = apply_aggressive_learning(thin, self.store)
+        self.assertEqual(int(cfg.get("risk.max_concurrent_positions")), 2)
 
 
 class TestExits(unittest.TestCase):
@@ -889,9 +1032,15 @@ def _trade(
 
 
 class TestPostmortem(unittest.TestCase):
-    def test_liquidity_drain_is_a_rug(self):
-        trade = _trade(exit_reason=ExitReason.LIQUIDITY_DRAIN)
+    def test_liquidity_drain_is_a_rug_when_it_costs_money(self):
+        trade = _trade(pnl=-20.0, exit_reason=ExitReason.LIQUIDITY_DRAIN)
         self.assertIs(learning.classify(trade, STRATEGY), ErrorClass.RUG)
+
+    def test_winning_liquidity_drain_is_not_a_rug(self):
+        trade = _trade(pnl=+65.0, exit_reason=ExitReason.LIQUIDITY_DRAIN, mfe=0.70)
+        self.assertIs(learning.classify(trade, STRATEGY), ErrorClass.WIN)
+        gave_back = _trade(pnl=+10.0, exit_reason=ExitReason.LIQUIDITY_DRAIN, mfe=2.5)
+        self.assertIs(learning.classify(gave_back, STRATEGY), ErrorClass.EXIT_TOO_FAST)
 
     def test_late_entry_detected_from_the_signal_price_gap(self):
         trade = _trade(entry_price=1.20, signal_price=1.0)
@@ -990,6 +1139,57 @@ class TestSelfTuning(unittest.TestCase):
         )
 
 
+class TestReviewHistory(unittest.TestCase):
+    def setUp(self):
+        self.store, self._tmp = make_store()
+
+    def tearDown(self):
+        self.store.close()
+        self._tmp.cleanup()
+
+    def test_review_splits_fumble_from_correct_reject_and_entries(self):
+        from alphahound.models import Score
+
+        miss = Decision(
+            candidate=Candidate(chain=Chain.SOLANA, address="dead", price_usd=1.0, symbol="DEAD"),
+            features=Features(),
+            score=Score(probability=0.3, expected_value=0.0, contributions={"retail_share": -0.5}),
+            action=Action.REJECT_GATE,
+            reason="liquidity: thin",
+        )
+        win_rej = Decision(
+            candidate=Candidate(chain=Chain.SOLANA, address="run", price_usd=1.0, symbol="RUN"),
+            features=Features(),
+            score=Score(probability=0.4, expected_value=0.01, contributions={"copy_signal": 0.9}),
+            action=Action.REJECT_SCORE,
+            reason="score: p 0.40 < 0.42",
+        )
+        self.store.resolve_shadow(self.store.record_decision(miss), 0.05)
+        self.store.resolve_shadow(self.store.record_decision(win_rej), 0.80)
+        self.store.record_trade(_trade(pnl=12.0, error_class=ErrorClass.WIN))
+        self.store.record_trade(_trade(pnl=-8.0, error_class=ErrorClass.NO_EDGE))
+
+        all_rows = {r["outcome"] for r in self.store.review_history()["rows"]}
+        self.assertEqual(
+            all_rows,
+            {"rejeicao_correta", "fumble", "entrada_correta", "entrada_errada"},
+        )
+        fumbles = self.store.review_history(outcome="fumble")["rows"]
+        self.assertEqual(len(fumbles), 1)
+        self.assertEqual(fumbles[0]["symbol"], "RUN")
+        self.assertEqual(fumbles[0]["contrib"][0][0], "copy_signal")
+
+
+class TestExitCopy(unittest.TestCase):
+    def test_exit_and_gate_copy_match_known_codes(self):
+        from alphahound.models import describe_code, describe_exit
+
+        self.assertIn("stop duro", describe_exit("stop_loss"))
+        self.assertIn("funding", describe_code("cluster: 44% linked supply"))
+        self.assertIn("esfriou", describe_code("no_edge"))
+
+
+
 class TestBacktest(unittest.TestCase):
     def test_simulated_exit_never_credits_perfect_timing(self):
         peak = 3.0
@@ -1078,6 +1278,21 @@ class TestStore(unittest.TestCase):
         self.assertEqual(loaded.symbol, "ODD")
         self.assertAlmostEqual(loaded.mcap_entry_usd, 80_000)
         self.assertAlmostEqual(loaded.mcap_exit_usd, 120_000)
+
+    def test_trade_round_trip_preserves_exit_note(self):
+        trade = _trade()
+        trade.notes = "5m flipped, selling with tape"
+        trade.exit_legs = [
+            {
+                "ts_ms": trade.closed_at_ms,
+                "reason": "thesis_cut",
+                "note": "5m flipped, selling with tape",
+            }
+        ]
+        self.store.record_trade(trade)
+        loaded = self.store.trades()[0]
+        self.assertEqual(loaded.notes, "5m flipped, selling with tape")
+        self.assertEqual(loaded.exit_legs[0]["note"], "5m flipped, selling with tape")
 
     def test_unmeasured_features_survive_a_round_trip_to_the_learner(self):
         # A 0.0 that was never measured must not train the model as if it were
@@ -1183,6 +1398,22 @@ class TestCrowd(unittest.TestCase):
         sized = crowd_read(holders, [], set(), size_pct=0.15)
         self.assertEqual(sized.inside, 2)
         self.assertAlmostEqual(sized.hold_pct, 0.90)
+
+    def test_fomo_supply_pct_is_a_score_prior_not_a_gate(self):
+        from alphahound.models import Features
+        from alphahound.scoring import PRIOR_WEIGHTS, normalize
+
+        self.assertIn("fomo_supply_pct", Features.names())
+        self.assertGreater(PRIOR_WEIGHTS["fomo_supply_pct"], PRIOR_WEIGHTS["fomo_inside"])
+        raw = normalize(Features(fomo_supply_pct=0.25), unknown=set())
+        missing = normalize(Features(fomo_supply_pct=0.25), unknown={"fomo_supply_pct"})
+        self.assertAlmostEqual(raw["fomo_supply_pct"], 0.25)
+        self.assertEqual(missing["fomo_supply_pct"], 0.0)
+        src = Path(__file__).resolve().parents[1] / "src" / "alphahound" / "scoring.py"
+        gates = src.read_text(encoding="utf-8")
+        # evaluate_gates lives in this file; the new feature must not be named there.
+        gate_fn = gates[gates.index("def evaluate_gates") : gates.index("def patience_only")]
+        self.assertNotIn("fomo_supply_pct", gate_fn)
 
     def test_who_inside_names_labeled_kols(self):
         from alphahound.signals.distribution import Holder
@@ -1360,6 +1591,96 @@ class TestPlaybook(unittest.TestCase):
         )
         self.assertFalse(d._accept(stale))
 
+    def test_hood_factory_log_emits_the_non_weth_token(self):
+        from alphahound.discovery import (
+            PONS_FACTORY,
+            TOPIC_POOL_CREATED,
+            TOPIC_TOKEN_LAUNCHED,
+            UNI_V3_FACTORY,
+            candidates_from_hood_log,
+        )
+
+        weth = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD97"
+        meme = "0xa3602804e096cb73bd8344afc1ff3f3390b899c5"
+        pad = lambda a: "0x" + a[2:].lower().rjust(64, "0")
+        found = candidates_from_hood_log(
+            {
+                "address": UNI_V3_FACTORY,
+                "topics": [TOPIC_POOL_CREATED, pad(weth), pad(meme), "0x" + "0" * 62 + "0bb8"],
+                "data": "0x" + "0" * 64 + "0" * 24 + "b" * 40,
+            },
+            weth=weth,
+        )
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].address.lower(), meme)
+        self.assertEqual(found[0].source, "hood_stream")
+        self.assertEqual(found[0].dex_id, "uniswap")
+
+        pons = candidates_from_hood_log(
+            {
+                "address": PONS_FACTORY,
+                "topics": [TOPIC_TOKEN_LAUNCHED, pad(meme), pad("0x" + "1" * 40), pad(UNI_V3_FACTORY)],
+                "data": "0x",
+            },
+            weth=weth,
+        )
+        self.assertEqual(pons[0].address.lower(), meme)
+        self.assertEqual(pons[0].dex_id, "pons")
+
+    def test_hood_stream_is_observe_not_a_buy_bypass(self):
+        from alphahound.engine import early_observe_floors, observe_early
+
+        self.assertTrue(observe_early("hood_stream"))
+        self.assertFalse(observe_early("dexscreener_profiles"))
+        baby = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0x" + "ab" * 20,
+            source="hood_stream",
+            mcap_usd=0.0,
+            volume_5m_usd=0.0,
+            liquidity_usd=0.0,
+        )
+        floors = early_observe_floors(baby, STRATEGY)
+        self.assertTrue(any(v.startswith("mcap:") for v in floors), floors)
+        self.assertTrue(any(v.startswith("volume:") for v in floors), floors)
+        self.assertTrue(any(v.startswith("liquidity:") for v in floors), floors)
+        ripe = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0x" + "cd" * 20,
+            source="hood_stream",
+            mcap_usd=150_000,
+            volume_5m_usd=8_000,
+            liquidity_usd=20_000,
+        )
+        self.assertEqual(early_observe_floors(ripe, STRATEGY), [])
+
+    def test_public_hood_rpc_has_no_jsonrpc_websocket(self):
+        from alphahound.discovery import _hood_jsonrpc_ws
+
+        self.assertIsNone(_hood_jsonrpc_ws("https://rpc.mainnet.chain.robinhood.com"))
+        self.assertTrue(
+            (_hood_jsonrpc_ws("https://robinhood-mainnet.g.alchemy.com/v2/x") or "").startswith(
+                "wss://"
+            )
+        )
+
+    def test_hood_factory_log_uses_block_timestamp_when_present(self):
+        from alphahound.discovery import TOPIC_POOL_CREATED, UNI_V3_FACTORY, candidates_from_hood_log
+
+        weth = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD97"
+        meme = "0xa3602804e096cb73bd8344afc1ff3f3390b899c5"
+        pad = lambda a: "0x" + a[2:].lower().rjust(64, "0")
+        found = candidates_from_hood_log(
+            {
+                "address": UNI_V3_FACTORY,
+                "topics": [TOPIC_POOL_CREATED, pad(weth), pad(meme), "0x" + "0" * 62 + "0bb8"],
+                "data": "0x" + "0" * 64 + "0" * 24 + "b" * 40,
+                "blockTimestamp": hex(1_700_000_000),
+            },
+            weth=weth,
+        )
+        self.assertEqual(found[0].created_at_ms, 1_700_000_000_000)
+
     def test_pnl_curve_sums_per_chain(self):
         from alphahound.preview import pnl_curves
 
@@ -1404,6 +1725,40 @@ class TestPlaybook(unittest.TestCase):
         self.assertEqual(chart["by_chain"]["bnb"], -3)
         self.assertEqual(chart["series"]["total"][-1]["y"], 1        )
 
+    def test_pnl_windows_marks_partial_history(self):
+        from alphahound.preview import pnl_windows
+        from alphahound.store import Store
+
+        root = Path(tempfile.mkdtemp())
+        store = Store(root)
+        now = now_ms()
+        day = 86_400_000
+        store.record_trade(
+            TradeRecord(
+                key="solana:a",
+                chain=Chain.SOLANA,
+                venue=VenueId.PAPER,
+                opened_at_ms=now - 3 * day,
+                closed_at_ms=now - 3 * day,
+                entry_price=1,
+                exit_price=2,
+                size_usd=10,
+                pnl_usd=5,
+                fees_usd=0,
+                exit_reason=ExitReason.TAKE_PROFIT,
+                error_class=ErrorClass.WIN,
+                features=Features(),
+                weights_version=0,
+            )
+        )
+        w = pnl_windows(store, now=now)
+        by = {x["label"]: x for x in w["windows"]}
+        self.assertEqual(by["hoje"]["pnl_usd"], 0)
+        self.assertEqual(by["7d"]["pnl_usd"], 5)
+        self.assertTrue(by["30d"]["partial"])
+        self.assertEqual(by["30d"]["history_days"], w["history_days"])
+        self.assertLess(w["history_days"], 30)
+
 
 class TestVerdict(unittest.TestCase):
     def test_cluster_over_20_is_bundled_hard(self):
@@ -1438,7 +1793,7 @@ class TestVerdict(unittest.TestCase):
         self.assertEqual(read.label, "cabaled")
         self.assertEqual(read.risk, 0)
         self.assertIsNotNone(bot_veto(read, "solana"))
-        self.assertIsNone(bot_veto(read, "robinhood_chain"))
+        self.assertIsNotNone(bot_veto(read, "robinhood_chain"))
 
     def test_organic_is_not_a_buy(self):
         from alphahound.verdict import bot_veto, classify
@@ -1815,6 +2170,45 @@ class TestDeadMcap(unittest.TestCase):
         self.assertTrue(mcap_is_dead(39_999, 40_000))
         self.assertFalse(mcap_is_dead(40_000, 40_000))
         self.assertFalse(mcap_is_dead(0, 40_000))
+
+
+class TestManualSellQueue(unittest.TestCase):
+    def test_match_and_refuse_closed(self):
+        from alphahound.engine import sell_queued_for
+        from alphahound.preview import enqueue_manual_sell
+
+        key = "robinhood_chain:0xabc"
+        queued = {key}
+        self.assertTrue(sell_queued_for(queued, key, "0xabc"))
+        self.assertTrue(sell_queued_for({"0xABC"}, key, "0xabc"))
+        self.assertFalse(sell_queued_for({"other:0xdef"}, key, "0xabc"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            (state / "positions.json").write_text("[]", encoding="utf-8")
+            miss = enqueue_manual_sell(state, key)
+            self.assertFalse(miss["ok"])
+            (state / "positions.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "candidate": {
+                                "chain": "robinhood_chain",
+                                "address": "0xabc",
+                                "symbol": "PUNCH",
+                            }
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            hit = enqueue_manual_sell(state, "0xABC")
+            self.assertTrue(hit["ok"])
+            self.assertEqual(hit["key"], key)
+            self.assertEqual(hit["symbol"], "PUNCH")
+            again = enqueue_manual_sell(state, key)
+            self.assertTrue(again["ok"])
+            self.assertEqual(json.loads((state / "sell.json").read_text(encoding="utf-8")), [key])
 
 
 if __name__ == "__main__":

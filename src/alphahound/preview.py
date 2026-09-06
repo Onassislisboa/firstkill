@@ -12,13 +12,74 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
-from .models import Chain, now_ms
+from .models import Chain, now_ms, describe_error, describe_exit, legs_for_display
 from .playbook import max_age_minutes
-from .settings import Config, Settings, load_fomo, load_kols, save_fomo, save_kols
+from .risk import RiskEngine, utc_day_start_ms
+from .settings import (
+    Config,
+    Settings,
+    aggressive_closes_since_on,
+    load_fomo,
+    load_kols,
+    save_fomo,
+    save_kols,
+    score_floors,
+)
 from .store import Store
 
 PREVIEW_NAME = "preview.json"
+SELL_QUEUE = "sell.json"
+POSITIONS_FILE = "positions.json"
+
+
+def match_open_position(rows: list[Any], needle: str) -> dict[str, str] | None:
+    needle = (needle or "").strip()
+    if not needle:
+        return None
+    nl = needle.lower()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cand = row.get("candidate") if isinstance(row.get("candidate"), dict) else {}
+        chain = str(cand.get("chain") or "")
+        addr = str(cand.get("address") or "")
+        key = f"{chain}:{addr}" if chain and addr else str(row.get("key") or "")
+        if needle == key or nl == key.lower() or (addr and nl == addr.lower()):
+            return {"key": key, "symbol": str(cand.get("symbol") or "")}
+    return None
+
+
+def enqueue_manual_sell(state_dir: Path, needle: str) -> dict[str, Any]:
+    """Queue a single-bag flatten for the engine risk loop. Preview process
+    cannot sell itself — the engine holds the router and the position lock."""
+    path = state_dir / POSITIONS_FILE
+    rows: list[Any] = []
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            loaded = []
+        if isinstance(loaded, list):
+            rows = loaded
+    hit = match_open_position(rows, needle)
+    if hit is None:
+        return {"ok": False, "error": "posição já fechada"}
+    qpath = state_dir / SELL_QUEUE
+    pending: list[Any] = []
+    if qpath.exists():
+        try:
+            pending = json.loads(qpath.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            pending = []
+        if not isinstance(pending, list):
+            pending = [pending]
+    key = hit["key"]
+    if key not in pending:
+        pending.append(key)
+    qpath.write_text(json.dumps(pending), encoding="utf-8")
+    return {"ok": True, "queued": True, "key": key, "symbol": hit["symbol"]}
 
 
 def write_preview(state_dir: Path, payload: dict[str, Any]) -> None:
@@ -90,6 +151,37 @@ def pnl_curves(trades: list) -> dict[str, Any]:
     }
 
 
+_DAY_MS = 86_400_000
+
+
+def pnl_windows(store: Store, now: int | None = None) -> dict[str, Any]:
+    now = int(now or now_ms())
+    oldest = store.oldest_close_ms()
+    hist_days = 0
+    if oldest:
+        hist_days = max(1, (now - oldest + _DAY_MS - 1) // _DAY_MS)
+
+    def pack(label: str, since_ms: int, span_days: int | None = None) -> dict[str, Any]:
+        partial = bool(span_days and hist_days and hist_days < span_days)
+        return {
+            "label": label,
+            "pnl_usd": round(store.realized_pnl(since_ms=since_ms), 2),
+            "since_ms": since_ms,
+            "partial": partial,
+            "history_days": hist_days if partial else (min(hist_days, span_days) if span_days else hist_days),
+        }
+
+    return {
+        "history_days": hist_days,
+        "windows": [
+            pack("hoje", utc_day_start_ms(now / 1000.0)),
+            pack("7d", now - 7 * _DAY_MS, 7),
+            pack("15d", now - 15 * _DAY_MS, 15),
+            pack("30d", now - 30 * _DAY_MS, 30),
+        ],
+    }
+
+
 _BOOK: tuple[float, dict[str, Any]] | None = None
 
 
@@ -112,13 +204,17 @@ def _closed_book(store: Store) -> dict[str, Any]:
                 "pnl_usd": round(t.pnl_usd, 2),
                 "pnl_pct": round(t.pnl_pct, 4),
                 "exit": t.exit_reason.value,
+                "exit_why": describe_exit(t.exit_reason),
                 "klass": t.error_class.value,
+                "klass_why": describe_error(t.error_class),
                 "mfe": round(t.max_favorable_excursion, 4),
                 "hold_min": int(round((t.closed_at_ms - t.opened_at_ms) / 60_000)),
                 "closed_at_ms": t.closed_at_ms,
                 "symbol": t.symbol or "",
                 "mcap_entry": round(t.mcap_entry_usd),
                 "mcap_exit": round(t.mcap_exit_usd),
+                "exit_legs": legs_for_display(t),
+                "exit_note": t.notes or "",
             }
             for t in reversed(recent)
         ],
@@ -128,6 +224,7 @@ def _closed_book(store: Store) -> dict[str, Any]:
         "realized": round(store.realized_pnl(), 2),
         "closed_n": store.trade_count(),
         "pnl_chart": pnl_curves(sample),
+        "pnl_windows": pnl_windows(store),
         "sample_n": len(sample),
     }
     _BOOK = (now, book)
@@ -187,6 +284,13 @@ def assemble(
         "kols": load_kols(state_dir),
         "fomo": load_fomo(state_dir),
         "pnl_chart": book["pnl_chart"],
+        "pnl_windows": book["pnl_windows"],
+        "aggressive": bool(strategy and strategy.get("aggressive_learning._active")),
+        "aggressive_closes": aggressive_closes_since_on(store) if strategy else 0,
+        "min_p": score_floors(strategy, store)[0] if strategy else None,
+        "min_ev": score_floors(strategy, store)[1] if strategy else None,
+        "faults": live.get("faults") or {},
+        "dead_loops": live.get("dead_loops") or [],
     }
 
 
@@ -230,6 +334,9 @@ HTML = """<!doctype html>
                  color: var(--muted); background: none; border: 0; border-bottom: 2px solid transparent;
                  padding: 8px 12px; cursor: pointer; }
   .tabs button.on { color: #fff; border-bottom-color: #ff3b4e; }
+  #dump-all { font: inherit; font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+              margin: 8px 20px 0 auto; padding: 8px 14px; cursor: pointer;
+              background: #2a0008; color: #ff6b7a; border: 1px solid #ff3b4e; border-radius: 4px; }
   .panel { display: none; }
   .panel.on { display: block; }
   .kol-form { display: flex; gap: 8px; flex-wrap: wrap; padding: 14px 20px; }
@@ -241,6 +348,12 @@ HTML = """<!doctype html>
   #pnl-chart { width: 100%; height: 240px; display: block; }
   .pnl-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
                gap: 10px; padding: 14px 20px; }
+  .pnl-windows { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+                 gap: 8px; margin: 0; padding: 14px 20px 0; }
+  .pnl-windows .pw { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: #050505; }
+  .pnl-windows .pw .n { font-size: 18px; font-weight: 800; }
+  .exit-legs { margin: 6px 0 0; padding-left: 16px; color: var(--muted); font-size: 11px; }
+  .exit-legs li { margin: 2px 0; }
   .v-bundled { color: #ff3b4e; } .v-cabaled { color: #ffb020; }
   .v-organic { color: #5b8cff; } .v-unverified { color: #6a6a6a; }
   tr.pick { cursor: pointer; }
@@ -260,9 +373,11 @@ HTML = """<!doctype html>
   .cat-list { display: grid; gap: 6px; margin: 8px 0; }
   .cat-list > div { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
   .coin-panel .wrap { white-space: normal; overflow: visible; }
-  button.copy { font: inherit; font-size: 10px; background: #111; color: #c8c8c8; border: 1px solid #333;
+  button.copy, button.sell { font: inherit; font-size: 10px; background: #111; color: #c8c8c8; border: 1px solid #333;
                 padding: 2px 8px; border-radius: 4px; cursor: pointer; letter-spacing: .04em; }
   button.copy:hover { color: #fff; border-color: #555; }
+  button.sell { color: #ff6b7a; border-color: #5a1520; margin-left: 4px; }
+  button.sell:hover { color: #fff; border-color: #ff3b4e; background: #2a0008; }
   .watch-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
   .watch-bar h1 { margin: 0; }
   .watch-bar input { font: inherit; background: #0a0a0a; color: #fff; border: 1px solid #333;
@@ -307,6 +422,14 @@ HTML = """<!doctype html>
   table.book .pnl { font-size: 16px; font-weight: 800; }
   table.book .mcap-path { font-size: 13px; color: #fff; font-weight: 600; }
   table.book th { position: sticky; top: 0; background: #000; z-index: 1; }
+  .rev-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 14px 20px 0; }
+  .rev-bar select { font: inherit; background: #111; color: #fff; border: 1px solid #2a2a2a; padding: 6px 8px; }
+  tr.rev-feat td { background: #0a0a0a; color: var(--text); font-size: 12px; }
+  .out-fumble { color: #ffd24a; }
+  .out-rejeicao_correta { color: #6a6a6a; }
+  .out-entrada_correta { color: #3ecf8e; }
+  .out-entrada_errada { color: #ff3b4e; }
+  .out-tracking { color: #5b8cff; }
   main { display: grid; grid-template-columns: 1fr 1fr; }
   main > section:first-child { grid-column: 1 / -1; }
   section { padding: 14px 20px; }
@@ -323,6 +446,9 @@ HTML = """<!doctype html>
   .card h2 { margin: 0 0 6px; font-size: 13px; color: var(--hi); font-weight: 600; }
   .card p { margin: 0 0 5px; font-size: 12px; color: var(--muted); }
   .addr { font-size: 11px; color: var(--text); word-break: break-all; }
+  #fault { display: none; padding: 8px 20px; background: #2a0008; color: #ff6b7a;
+           border-bottom: 1px solid #ff3b4e; font-size: 12px; }
+  #fault.on { display: block; }
   @media (max-width: 900px) {
     main, .grid { grid-template-columns: 1fr; }
     section + section { border-left: 0; border-top: 1px solid var(--line); }
@@ -342,12 +468,15 @@ HTML = """<!doctype html>
   <div><h1>holding</h1><div class="n gold" id="holding">—</div></div>
   <div><h1>scanning</h1><div class="n cyan" id="watching">—</div></div>
 </header>
+<div id="fault"></div>
 <div id="verdict" class="verdict wait"><span class="tag">WAITING</span><span class="muted" id="verdict-h">sem trades ainda</span></div>
 <nav class="tabs">
   <button type="button" class="on" data-tab="tab-watch">scan</button>
   <button type="button" data-tab="tab-kols">kols</button>
   <button type="button" data-tab="tab-fomo">fomo</button>
+  <button type="button" data-tab="tab-review">review</button>
   <button type="button" data-tab="tab-pnl">pnl</button>
+  <button type="button" id="dump-all">vender tudo</button>
 </nav>
 <div id="tab-watch" class="panel on">
 <section class="full" style="padding:14px 20px 6px">
@@ -404,7 +533,27 @@ HTML = """<!doctype html>
     </tr></thead><tbody></tbody></table>
   </section>
 </div>
+<div id="tab-review" class="panel">
+  <div class="rev-bar">
+    <select id="rev-out">
+      <option value="">todos</option>
+      <option value="fumble">fumble</option>
+      <option value="rejeicao_correta">rejeição correta</option>
+      <option value="entrada_correta">entrada correta</option>
+      <option value="entrada_errada">entrada errada</option>
+      <option value="tracking">ainda tracking</option>
+    </select>
+    <span class="muted" id="rev-meta"></span>
+  </div>
+  <p class="muted" style="padding:8px 20px 0">MFE do shadow é o pico na janela, não o close. Dump e flat parecem iguais se não bombou. Clique a linha pras features.</p>
+  <section>
+    <table id="review" class="book"><thead><tr>
+      <th>quando</th><th>token</th><th>decisão</th><th>p / ev</th><th>resultado</th><th>outcome</th>
+    </tr></thead><tbody></tbody></table>
+  </section>
+</div>
 <div id="tab-pnl" class="panel">
+  <div class="pnl-windows" id="pnl-windows"></div>
   <div class="pnl-cards" id="pnl-cards"></div>
   <section>
     <h1>equity curve</h1>
@@ -503,6 +652,9 @@ const caHead = a => {
 };
 const role = r => r && r !== 'solo' ? '<span class="pill r-'+r+'">'+r+'</span>' : '';
 const copyBtn = a => a ? '<button class="copy" type="button" data-copy="'+a+'" title="copiar CA" aria-label="copiar CA">copiar</button>' : '';
+const sellBtn = (key, sym) => key
+  ? '<button class="sell" type="button" data-sell="'+esc(key)+'" data-sym="'+esc(sym||'')+'" title="vender" aria-label="vender">vender</button>'
+  : '';
 let picked = '';
 let lastWatch = [];
 let uniReady = false;
@@ -807,11 +959,25 @@ function paintVerdict(d) {
   hint.textContent = 'zero a zero · '+d.wins+'W / '+losses+'L';
 }
 
+$('dump-all').addEventListener('click', () => {
+  if (!confirm('Vender todas as posições abertas agora?')) return;
+  fetch('/api/flatten', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+    .then(r => r.json()).then(j => {
+      $('status').textContent = j.ok ? 'vendendo tudo…' : (j.error || 'falhou vender');
+    }).catch(() => { $('status').textContent = 'falhou vender'; });
+});
 document.addEventListener('click', e => {
   const tab = e.target.closest('[data-tab]');
   if (tab) {
     document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b === tab));
     document.querySelectorAll('.panel').forEach(p => p.classList.toggle('on', p.id === tab.dataset.tab));
+    if (tab.dataset.tab === 'tab-review') loadReview();
+    return;
+  }
+  const rev = e.target.closest('.rev-row');
+  if (rev && !e.target.closest('[data-copy]')) {
+    const feat = document.querySelector('[data-rev-feat="'+rev.dataset.rev+'"]');
+    if (feat) feat.hidden = !feat.hidden;
     return;
   }
   const pick = e.target.closest('[data-pick]');
@@ -832,10 +998,22 @@ document.addEventListener('click', e => {
       body: JSON.stringify({action:'remove', address: rm.dataset.remove})}).then(tick);
     return;
   }
+  const sell = e.target.closest('[data-sell]');
+  if (sell) {
+    const key = sell.dataset.sell || '';
+    const sym = sell.dataset.sym || 'essa moeda';
+    if (!confirm('Vender '+sym+' agora?')) return;
+    fetch('/api/sell', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({key})})
+      .then(r => r.json()).then(j => {
+        $('status').textContent = j.ok ? ('venda enviada' + (j.symbol ? ' · '+j.symbol : '')) : (j.error || 'falhou vender');
+      }).catch(() => { $('status').textContent = 'falhou vender'; });
+    return;
+  }
   const b = e.target.closest('[data-copy]');
   if (!b) return;
   const s = b.dataset.copy;
-  const done = () => { const old = b.textContent; b.textContent = 'ok'; setTimeout(() => { b.textContent = old; }, 700); };
+  const done = () => { const old = b.textContent; b.textContent = 'copiado'; setTimeout(() => { b.textContent = old; }, 700); };
   const go = (navigator.clipboard && navigator.clipboard.writeText)
     ? navigator.clipboard.writeText(s) : Promise.reject();
   go.then(done).catch(() => {
@@ -912,6 +1090,27 @@ function paintFomo(list) {
   </tr>`, 'nenhum perfil', 4);
 }
 
+function paintPnlWindows(w) {
+  const el = $('pnl-windows');
+  if (!el) return;
+  const wins = (w && w.windows) || [];
+  el.innerHTML = wins.map(x => {
+    const lab = x.partial
+      ? x.label+' (parcial, '+x.history_days+' dias de histórico)'
+      : x.label;
+    return '<div class="pw"><div class="muted">'+esc(lab)+'</div><div class="n '+cls(x.pnl_usd)+'">'+usd(x.pnl_usd||0)+'</div></div>';
+  }).join('');
+}
+const clock = ms => ms ? new Date(ms).toLocaleString(undefined, {year:'numeric', month:'short', day:'numeric', hour:'2-digit', minute:'2-digit', second:'2-digit'}) : '—';
+function exitLegsHtml(legs) {
+  if (!legs || !legs.length) return '';
+  return '<ul class="exit-legs">'+legs.map(l => {
+    const amt = l.usd_out != null ? usd(l.usd_out) : (l.size_usd != null ? usd(l.size_usd) : '—');
+    const mcap = l.mcap != null ? mcapTxt(l.mcap) : '—';
+    const pnl = l.pnl_usd != null ? (' · pnl '+usd(l.pnl_usd)) : '';
+    return '<li>'+clock(l.ts_ms)+' · vendeu '+amt+pnl+' · mcap '+mcap+(l.reason ? ' · '+esc(l.reason) : '')+(l.note ? ' · '+esc(l.note) : '')+'</li>';
+  }).join('')+'</ul>';
+}
 let lastPnlSig = '';
 function paintPnl(chart) {
   const cards = $('pnl-cards');
@@ -954,7 +1153,14 @@ async function tick() {
   catch (err) { $('status').textContent = 'offline'; inflight = false; return; }
   const live = d.running ? (d.mode || 'run') : 'stopped';
   const halt = d.halted ? (' · paused ' + (d.halt_reason || '')) : '';
-  $('status').textContent = live + halt + ' · ' + d.stale_s + 's';
+  const learn = d.aggressive ? (' · aggressive ' + (d.aggressive_closes||0) + ' closes') : '';
+  const dead = (d.dead_loops || []).length ? (' · loop dead ' + d.dead_loops.join(',')) : '';
+  $('status').textContent = live + halt + learn + dead + ' · ' + d.stale_s + 's';
+  $('status').className = (d.dead_loops || []).length ? 'dn' : 'muted';
+  const fault = $('fault');
+  const msgs = Object.entries(d.faults || {}).map(([k,v]) => k + ': ' + v);
+  if (msgs.length) { fault.textContent = msgs.join(' · '); fault.className = 'on'; }
+  else { fault.textContent = ''; fault.className = ''; }
   setText('equity', usd(d.equity_usd), 'n');
   setText('pnl', usd(d.pnl), 'n '+cls(d.pnl));
   setText('winrate', d.win_rate == null ? '—' : Math.round(d.win_rate*100)+'%',
@@ -973,7 +1179,7 @@ async function tick() {
   rows($('holds'), d.holds||[], h => `<tr>
     <td>
       <div class="sym">${h.symbol || caHead(h.address||h.key)} ${role(h.role)}</div>
-      <div class="ca">${chainShort(h.chain||'')} · ${caHead(h.address || (h.key||'').split(':')[1])} ${copyBtn(h.address || (h.key||'').split(':')[1])}</div>
+      <div class="ca">${chainShort(h.chain||'')} · ${caHead(h.address || (h.key||'').split(':')[1])} ${copyBtn(h.address || (h.key||'').split(':')[1])} ${sellBtn(h.key, h.symbol)}</div>
     </td>
     <td class="gold">${usd(h.held_usd != null ? h.held_usd : h.size_usd)}</td>
     <td class="pnl ${cls(h.unrealized_usd != null ? h.unrealized_usd : h.unrealized_pct)}">${usd(h.unrealized_usd||0)} <span class="muted">${pct(h.unrealized_pct)}</span></td>
@@ -990,12 +1196,54 @@ async function tick() {
     <td class="pnl ${cls(t.pnl_usd)}">${usd(t.pnl_usd)} <span class="muted">${pct(t.pnl_pct)}</span></td>
     <td class="mcap-path">${mcapPath(t.mcap_entry, t.mcap_exit)}</td>
     <td>${t.hold_min != null ? mins(t.hold_min) : '—'}</td>
-    <td class="muted">${t.exit}</td></tr>`, 'none closed', 6);
+    <td class="muted" title="${esc(t.exit_why||'')}">${t.exit}
+      <div class="meta">${esc(t.exit_why||'')}</div>
+      ${t.exit_note ? '<div class="meta">'+esc(t.exit_note)+'</div>' : ''}
+      <div class="meta">${clock(t.closed_at_ms)}</div>
+      ${exitLegsHtml(t.exit_legs)}
+    </td></tr>`, 'none closed', 6);
   paintKols(d.kols);
   paintFomo(d.fomo);
   paintPnl(d.pnl_chart);
+  paintPnlWindows(d.pnl_windows);
   inflight = false;
 }
+const OUT_LAB = {fumble:'fumble', rejeicao_correta:'rejeição correta', entrada_correta:'entrada correta',
+  entrada_errada:'entrada errada', tracking:'tracking'};
+const when = ms => new Date(ms).toLocaleString(undefined, {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
+let revBusy = false;
+async function loadReview() {
+  if (revBusy) return;
+  revBusy = true;
+  const out = $('rev-out').value;
+  try {
+    const j = await (await fetch('/api/review?outcome='+encodeURIComponent(out)+'&limit=250', {cache:'no-store'})).json();
+    $('rev-meta').textContent = (j.open_rows||0)+' shadows abertos · '+(j.open_keys||0)+' tokens no lote de 30 · fumble ≥ '+Math.round((j.fumble_pct||0.2)*100)+'% MFE';
+    const body = (j.rows||[]).map((r,i) => {
+      const ca = (r.key||'').split(':')[1]||'';
+      const res = r.action==='enter'
+        ? (usd(r.pnl_usd)+' · '+(r.error_class||''))
+        : (r.mfe==null ? '—' : pct(r.mfe));
+      const feat = (r.contrib||[]).map(kv => kv[0]+' '+(kv[1]>=0?'+':'')+Number(kv[1]).toFixed(2)).join(' · ') || '—';
+      const why = [r.exit_note, r.exit_why, r.error_why, r.reason_why].filter((s,i,a) => s && a.indexOf(s)===i).join(' · ');
+      const soldBits = r.action==='enter'
+        ? ('<div class="meta">'+clock(r.closed_at_ms || r.ts_ms)+'</div>'+exitLegsHtml(r.exit_legs))
+        : '';
+      return `<tr class="rev-row" data-rev="${i}"><td>${when(r.ts_ms)}</td>
+        <td><div class="sym">${esc(r.symbol||caHead(ca))}</div><div class="ca">${chainShort(r.chain||'')} ${esc(caHead(ca))} ${copyBtn(ca)}</div></td>
+        <td>${esc(r.action)}<div class="meta">${esc(r.reason||'')}</div></td>
+        <td>${pct(r.p)} / ${pct(r.ev)}</td>
+        <td>${res}${soldBits}</td>
+        <td class="out-${esc(r.outcome)}">${OUT_LAB[r.outcome]||r.outcome}</td></tr>
+        <tr class="rev-feat" data-rev-feat="${i}" hidden><td colspan="6">${esc(why ? why+' · ' : '')}${esc(feat)}</td></tr>`;
+    }).join('') || '<tr><td colspan="6" class="muted">vazio</td></tr>';
+    $('review').querySelector('tbody').innerHTML = body;
+  } catch (err) {
+    $('rev-meta').textContent = 'falhou o review';
+  }
+  revBusy = false;
+}
+$('rev-out').addEventListener('change', loadReview);
 tick();
 setInterval(tick, 400);
 </script>
@@ -1022,7 +1270,30 @@ def serve(
             return
 
         def do_GET(self) -> None:  # noqa: N802
-            if self.path.split("?", 1)[0] == "/api":
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/review":
+                q = parse_qs(parsed.query)
+                try:
+                    payload = store.review_history(
+                        outcome=(q.get("outcome") or [""])[0],
+                        fumble_pct=float((q.get("fumble") or ["0.20"])[0] or 0.20),
+                        limit=int((q.get("limit") or ["250"])[0] or 250),
+                    )
+                    body = json.dumps(payload).encode()
+                except Exception as exc:  # noqa: BLE001
+                    body = json.dumps({"error": str(exc)}).encode()
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if parsed.path == "/api":
                 try:
                     body = snapshot()
                 except Exception as exc:  # noqa: BLE001
@@ -1051,6 +1322,31 @@ def serve(
                 body = json.loads(self.rfile.read(n).decode() if n else "{}")
             except ValueError:
                 body = {}
+            if path == "/api/sell":
+                key = str(body.get("key") or body.get("address") or "").strip()
+                result = enqueue_manual_sell(state_dir, key)
+                code = 200 if result.get("ok") else 409
+                out = json.dumps(result).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(out)
+                return
+            if path == "/api/flatten":
+                if strategy is None:
+                    out = json.dumps({"ok": False, "error": "no strategy"}).encode()
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(out)
+                    return
+                RiskEngine(strategy, store).engage_kill_switch("vender tudo")
+                out = json.dumps({"ok": True, "halted": True}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(out)
+                return
             if path == "/api/inspect":
                 addr = str(body.get("address") or "").strip()
                 pending: list = []

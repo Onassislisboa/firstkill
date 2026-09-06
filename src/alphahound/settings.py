@@ -7,6 +7,7 @@ buy nothing but an install step.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tomllib
@@ -14,13 +15,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .models import Chain
+from .log import get
+from .models import Chain, now_ms
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Good enough to make the on-chain features exist while paper trading, and
 # rejected outright for live trading by Settings.validate().
 PUBLIC_SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+log = get("settings")
 
 
 def load_dotenv(path: Path | None = None, *, override: bool = False) -> None:
@@ -78,6 +81,19 @@ class Config:
             return self[dotted]
         except KeyError:
             return default
+
+    def overlay(self, nested: dict[str, Any]) -> Config:
+        data = copy.deepcopy(self._data)
+
+        def merge(dst: dict[str, Any], src: dict[str, Any]) -> None:
+            for key, value in src.items():
+                if isinstance(value, dict) and isinstance(dst.get(key), dict):
+                    merge(dst[key], value)
+                else:
+                    dst[key] = value
+
+        merge(data, nested)
+        return Config(data)
 
     def section(self, name: str) -> dict[str, Any]:
         value = self.get(name, {})
@@ -252,6 +268,106 @@ class Settings:
 
 def load_strategy(path: Path | None = None) -> Config:
     return Config.load(path or REPO_ROOT / "config" / "strategy.toml")
+
+
+AGGRESSIVE_STARTED_KEY = "aggressive_started_ms"
+AGGRESSIVE_GRADUATED_KEY = "aggressive_graduated"
+
+
+def _slot_band(
+    equity: float,
+    min_usd: float,
+    prod_n: int,
+    prod_min: float,
+    prod_max: float,
+    want: int,
+) -> tuple[int, float, float]:
+    """Same total cap as prod_n * prod_max, more seats only if min size still fits."""
+    n = max(prod_n, int(want))
+    while n > prod_n:
+        max_pct = prod_max * prod_n / n
+        min_pct = prod_min * prod_n / n
+        if equity > 0:
+            min_pct = max(min_pct, min_usd / equity)
+        if min_pct <= max_pct + 1e-12:
+            return n, min_pct, max_pct
+        n -= 1
+    return prod_n, prod_min, prod_max
+
+
+def apply_aggressive_learning(strategy: Config, store: Any) -> Config:
+    """Overlay the learning profile. Production scoring/gates in toml stay put."""
+    sec = strategy.section("aggressive_learning")
+    if not sec.get("enabled"):
+        return strategy
+
+    need = int(sec.get("graduate_at_closes", 40))
+    closed = int(store.trade_count())
+    if closed >= need:
+        if store.get_kv(AGGRESSIVE_GRADUATED_KEY) != "1":
+            store.set_kv(AGGRESSIVE_GRADUATED_KEY, "1")
+            log.info(
+                "aggressive_learning graduated",
+                extra={"closed": closed, "need": need},
+            )
+        return strategy
+
+    if not store.get_kv(AGGRESSIVE_STARTED_KEY):
+        store.set_kv(AGGRESSIVE_STARTED_KEY, str(now_ms()))
+        log.info("aggressive_learning on", extra={"closed": closed, "need": need})
+
+    prod_n = int(strategy.get("risk.max_concurrent_positions", 2))
+    equity = float(strategy.get("risk.equity_usd", 0)) + float(store.realized_pnl())
+    n, min_pct, max_pct = _slot_band(
+        max(0.0, equity),
+        float(strategy.get("risk.min_position_usd", 10)),
+        prod_n,
+        float(strategy.get("risk.min_position_pct", 0.06)),
+        float(strategy.get("risk.max_position_pct", 0.16)),
+        int(sec.get("max_concurrent_positions", 4)),
+    )
+    return strategy.overlay(
+        {
+            "aggressive_learning": {"_active": True},
+            "risk": {
+                "max_concurrent_positions": n,
+                "max_positions_per_chain": n,
+                "min_position_pct": min_pct,
+                "max_position_pct": max_pct,
+            },
+        }
+    )
+
+
+def score_floors(strategy: Config, store: Any) -> tuple[float, float]:
+    """p/EV used to enter. Aggressive ignores self-tune so learning can actually enter."""
+    prod_p = float(strategy.get("scoring.min_probability", 0.56))
+    prod_ev = float(strategy.get("scoring.min_expected_value", 0.035))
+    if strategy.get("aggressive_learning._active"):
+        sec = strategy.section("aggressive_learning")
+        return (
+            float(sec.get("min_probability", prod_p)),
+            float(sec.get("min_expected_value", prod_ev)),
+        )
+    return (
+        store.param("scoring.min_probability", prod_p),
+        store.param("scoring.min_expected_value", prod_ev),
+    )
+
+
+def aggressive_closes_since_on(store: Any) -> int:
+    started = store.get_kv(AGGRESSIVE_STARTED_KEY)
+    if not started:
+        return 0
+    try:
+        since = int(started)
+    except ValueError:
+        return 0
+    row = store.conn.execute(
+        "SELECT COUNT(*) AS n FROM trades WHERE closed_at_ms >= ?",
+        (since,),
+    ).fetchone()
+    return int(row["n"])
 
 
 def load_terminals(path: Path | None = None) -> Config:

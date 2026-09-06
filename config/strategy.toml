@@ -14,7 +14,9 @@ quote_seconds = 0.4
 # How often discovery runs and new candidates are scored.
 scan_seconds = 2.0
 # A candidate older than this is no longer an early signal, it is a chart.
-max_candidate_age_minutes = 180
+# 240 = 180 + 60: Hood still prints MFE≥20% in the last 30m of the old window
+# (150–180); one extra hour keeps those on the visor without opening 6h charts.
+max_candidate_age_minutes = 240
 # Hard cap on candidates fully enriched per tick, to bound RPC spend. Only
 # candidates that survive the free gates get here, so this is the real budget.
 # Hard cap on candidates fully enriched per tick. 0 = every scan card.
@@ -25,6 +27,8 @@ enrich_concurrency = 4
 # Discovery dumps hundreds of pairs. Cap the visor and skip the rest; vamps
 # drop first, mains stay. Unseen names rotate in next scan.
 max_watching = 40
+# Full enrich this often. Quotes still tick; new coins jump the queue.
+rescore_seconds = 15
 # Below this the coin is dead. Drop from visor, no enrich/score/sqlite.
 dead_mcap_usd = 40000
 # Proof of life, with a breakdown of what rejected everything. 0 disables.
@@ -59,9 +63,20 @@ max_transfer_tax_pct = 0.05
 # Fraction of holders that are wallets less than 24h old. High values mean the
 # holder count is manufactured.
 max_fresh_wallet_pct = 0.70
-# Fraction of supply held by wallets that bought in the launch slot. These are
-# competing bots with a lower cost basis who will exit into your buy.
-max_bundle_pct = 0.25
+# Fraction of supply held by wallets that bought in the launch slot/block
+# window. Hard veto (not a score weight). Competing bots with a lower cost basis.
+max_bundle_pct = 0.20
+# Linked supply (one-hop token funder or Bubblemaps). Same treatment as bundle.
+# 0 disables. Playbooks can tighten per chain.
+max_cluster_pct = 0.20
+# ERC-20 Transfer lookback when measuring EVM bundle/cluster (blocks).
+bundle_log_lookback_blocks = 40000
+# Only stamp token-funder on the first N unique recipients.
+bundle_first_n = 40
+# Same-block/slot window around launch for bundle_pct.
+bundle_slot_window = 3
+# Reuse launch logs / labeled balances this long. Bundle is a launch fact.
+bundle_cache_seconds = 60
 # One UNKNOWN wallet holding this much circulating supply is a rug. A known
 # KOL/whale holding the same share (the $TRUMP *shape* on a fresh launch) is
 # not vetoed — it still scores as concentrated, so size stays small.
@@ -195,6 +210,19 @@ prior_winner_ladder_reach = [[1, 0.60], [2, 0.25], [3, 0.15]]
 
 
 # ---------------------------------------------------------------------------
+# Aggressive learning. One `enabled` flip. Production [scoring]/[risk] above
+# stay the graduate-to values. Does not touch gates (LP, mint, bundle, cluster).
+# Floors from unique reject_score p/EV: 0.38/0.03 ≈ 3× vs 0.42/0.048.
+# ---------------------------------------------------------------------------
+[aggressive_learning]
+enabled = true
+graduate_at_closes = 40
+min_probability = 0.38
+min_expected_value = 0.03
+max_concurrent_positions = 4
+
+
+# ---------------------------------------------------------------------------
 # Risk. The only part of this system that reliably makes money is the part
 # that stops it from losing.
 # ---------------------------------------------------------------------------
@@ -218,8 +246,8 @@ max_positions_per_chain = 2
 max_position_pct_of_liquidity = 0.008
 # After a close, do not bounce the same mint. One entry, one story.
 reentry_cooldown_minutes = 180
-# Few well-selected trades, not a spray.
-max_entries_per_day = 5
+# 0 = off. Paper learning phase — no daily entry budget.
+max_entries_per_day = 0
 # Fractional Kelly. Full Kelly is correct only if your probabilities are
 # correct, and yours are not.
 kelly_fraction = 0.25
@@ -323,8 +351,9 @@ promotion_margin = 0.01
 rollback_window_trades = 20
 # Rejected candidates are shadow-tracked for this long to measure what our
 # filters cost us. Without this the model only ever learns from trades it
-# already agreed with.
-shadow_track_minutes = 60
+# already agreed with. 180 min is when runners tend to confirm; Dexscreener
+# poll is capped at 30 open rows per risk tick so this is not 3x API load.
+shadow_track_minutes = 180
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +366,7 @@ max_age_minutes = 45
 copy_max_age_minutes = 30
 copy_min_mcap_usd = 100000
 copy_max_mcap_usd = 2000000
-max_cluster_pct = 0.28
+max_cluster_pct = 0.20
 max_unknown_top1_pct = 0.28
 max_bundle_pct = 0.18
 # KOL/whale is a boost, not a gate, until the lists are filled.
@@ -351,11 +380,12 @@ max_cluster_pct = 0.45
 
 [playbooks.robinhood_chain]
 # Dip, hold, runner. Don't chase a 5m rip; first take later so the bag can reprice.
-max_age_minutes = 180
+max_age_minutes = 240
 copy_max_age_minutes = 90
 copy_min_mcap_usd = 100000
 copy_max_mcap_usd = 2000000
-max_cluster_pct = 0.40
+max_cluster_pct = 0.20
+max_bundle_pct = 0.20
 min_volume_5m = 5000
 min_twitter_mentions = 2
 max_chase_ret_5m = 0.12

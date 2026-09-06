@@ -41,10 +41,13 @@ from .models import (
     Score,
     TradeRecord,
     VenueId,
+    describe_exit,
     now_ms,
 )
 from .net import Http
 from .portfolio import ExitOrder, PositionManager
+from .playbook import gate as pb_gate
+from .playbook import section as pb_section
 from .preview import write_preview
 from .providers import Birdeye, Bubblemaps, Dexscreener, FomoGraph, Helius, Twitter, twitter_handle
 from .risk import RiskEngine
@@ -54,9 +57,11 @@ from .settings import (
     PUBLIC_SOLANA_RPC,
     Config,
     Settings,
+    apply_aggressive_learning,
     chase_rows,
     load_strategy,
     load_terminals,
+    score_floors,
 )
 from .signals import Enricher, Enrichment
 from .signals.pack import apply_tags, dump_beta_keys
@@ -67,9 +72,66 @@ from .verdict import security_cert
 
 log = get("engine")
 
+# RPC/network may fail a pass. These mean the code itself is wrong — retrying
+# forever looks "alive" on the visor while scan is frozen (NameError mcap_is_dead).
+LOOP_BUGS = (
+    NameError,
+    AttributeError,
+    TypeError,
+    SyntaxError,
+    ImportError,
+    IndentationError,
+)
+
+
+def loop_bug(exc: BaseException) -> bool:
+    return isinstance(exc, LOOP_BUGS)
+
+
+def enrich_due(last_scored_ms: int, now: int, ttl_ms: int) -> bool:
+    """First look always; afterwards wait ttl so RPC isn't spent re-reading the same mint."""
+    return last_scored_ms <= 0 or ttl_ms <= 0 or now - last_scored_ms >= ttl_ms
+
 
 def mcap_is_dead(mcap_usd: float, floor: float) -> bool:
     return floor > 0 and 0 < mcap_usd < floor
+
+
+def observe_early(source: str) -> bool:
+    """On the visor before buy floors. Must still fail prefilter on enter."""
+    return source == "hood_stream"
+
+
+def early_observe_floors(candidate: Candidate, strategy: Config) -> list[str]:
+    """Treat unmeasured mcap/vol as below the buy floor. Detect ≠ eligible.
+
+    evaluate_gates skips mcap when it is 0 and volume when Dexscreener has not
+    stamped a snap yet. A factory log has both at zero, so without this the
+    token could walk into enrich/enter. Same numbers as the playbook, not a
+    lower floor.
+    """
+    pb = pb_section(strategy, candidate.chain)
+    copy_min = float(pb.get("copy_min_mcap_usd", 100_000))
+    min_vol = float(pb.get("min_volume_5m", 0) or 0)
+    min_liq = pb_gate(strategy, candidate.chain, "min_liquidity_usd", 15_000.0)
+    out: list[str] = []
+    if copy_min > 0 and candidate.mcap_usd < copy_min:
+        out.append(f"mcap: {candidate.mcap_usd:.0f} below {copy_min:.0f} floor")
+    if min_vol > 0 and candidate.volume_5m_usd < min_vol:
+        out.append(f"volume: {candidate.volume_5m_usd:.0f} < {min_vol:.0f} (5m)")
+    if min_liq > 0 and candidate.liquidity_usd < min_liq:
+        out.append(f"liquidity: {candidate.liquidity_usd:.0f} < {min_liq:.0f}")
+    return out
+
+
+def sell_queued_for(queued: set[str], key: str, address: str) -> bool:
+    """True if this open bag was asked to flatten from the visor/CLI file."""
+    if not queued:
+        return False
+    if key in queued or address in queued:
+        return True
+    want = {key.lower(), address.lower()}
+    return any(q.lower() in want for q in queued)
 
 
 def _crowd_sponsors(crowd: dict | None) -> list[str]:
@@ -99,6 +161,7 @@ class Engine:
         self.terminals = terminals or load_terminals()
 
         self.store = Store(settings.state_dir)
+        self.strategy = apply_aggressive_learning(self.strategy, self.store)
         self.http = Http()
         self.dex = Dexscreener(
             self.http,
@@ -156,7 +219,7 @@ class Engine:
         self.scorer = Scorer(Model.load(self.store), self.strategy, self.store, live=settings.live)
         self.risk = RiskEngine(self.strategy, self.store)
         self.exits = PositionManager(self.strategy, self.store)
-        self.discovery = Discovery(settings, self.strategy, self.dex)
+        self.discovery = Discovery(settings, self.strategy, self.dex, http=self.http)
 
         self.positions: dict[str, Position] = {}
         self.watching: dict[str, Candidate] = {}
@@ -170,7 +233,10 @@ class Engine:
         self._watch_out = 0
         self._reads: dict[str, dict] = {}
         self._inflight: set[str] = set()
+        self._manual_sell: set[str] = set()
         self._stop = asyncio.Event()
+        self._loop_faults: dict[str, str] = {}
+        self._loop_dead: set[str] = set()
         self._load_positions()
 
     # -- lifecycle ---------------------------------------------------------
@@ -186,6 +252,7 @@ class Engine:
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from exc
 
+        min_p, min_ev = score_floors(self.strategy, self.store)
         log.info(
             "starting",
             extra={
@@ -194,6 +261,20 @@ class Engine:
                 "weights_version": self.scorer.model.version,
                 "equity_usd": self.risk.equity(),
                 "open_positions": len(self.positions),
+                "shadow_track_minutes": int(
+                    float(self.strategy.get("learning.shadow_track_minutes", 60))
+                ),
+                "min_expected_value": min_ev,
+                "min_probability": min_p,
+                "max_concurrent_positions": int(
+                    self.strategy.get("risk.max_concurrent_positions", 1)
+                ),
+                "aggressive_learning": bool(self.strategy.get("aggressive_learning._active")),
+                "quote_cluster_hops": 2,
+                "fresh_unmeasured_neutral": True,
+                "max_candidate_age_minutes": int(
+                    float(self.strategy.get("loop.max_candidate_age_minutes", 180))
+                ),
             },
         )
         if not self.registry.attributable_labels:
@@ -202,19 +283,36 @@ class Engine:
                 "Run `alphahound discover-terminals` to populate them."
             )
 
+        self._assert_loop_helpers()
         await self.discovery.start()
         try:
             await asyncio.gather(self._risk_loop(), self._scan_loop(), self._quote_loop())
         finally:
             await self.shutdown()
 
+    def _assert_loop_helpers(self) -> None:
+        if not mcap_is_dead(1.0, 40_000) or mcap_is_dead(0.0, 40_000):
+            raise RuntimeError("mcap_is_dead helper is broken")
+        if not enrich_due(0, 1, 15_000):
+            raise RuntimeError("enrich_due helper is broken")
+
     async def _every(self, seconds: float, body, label: str) -> None:
         while not self._stop.is_set():
             started = now_ms()
             try:
                 await body()
-            except Exception:  # noqa: BLE001 - a bad pass must not kill the bot
+                self._loop_faults.pop(label, None)
+            except Exception as exc:  # noqa: BLE001
                 log.exception(f"{label} failed")
+                self._loop_faults[label] = f"{type(exc).__name__}: {exc}"[:240]
+                self._write_preview()
+                if loop_bug(exc):
+                    self._loop_dead.add(label)
+                    log.error(
+                        "loop dead",
+                        extra={"loop": label, "error": self._loop_faults[label]},
+                    )
+                    return
             elapsed = (now_ms() - started) / 1000.0
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=max(0.1, seconds - elapsed))
@@ -248,7 +346,6 @@ class Engine:
     async def _scan_loop(self) -> None:
         async def body() -> None:
             self.enricher.whale_rows = chase_rows(self.settings.state_dir)
-            self.enricher._smart_cache.clear()
             self._drain_inspect()
             found = await self.discovery.poll()
             before = set(self.watching)
@@ -257,11 +354,15 @@ class Engine:
                 prev = self.watching.get(candidate.key)
                 if prev is not None:
                     candidate.last_scored_ms = prev.last_scored_ms
+                    if observe_early(prev.source):
+                        candidate.source = prev.source
                 if candidate.pack_role == "vamp":
                     continue
-                if mcap_is_dead(candidate.mcap_usd, dead_floor):
+                if mcap_is_dead(candidate.mcap_usd, dead_floor) and not observe_early(
+                    candidate.source
+                ):
                     continue
-                if candidate.source != "inspect":
+                if candidate.source != "inspect" and not observe_early(candidate.source):
                     cheap = self.enricher.free_enrichment(candidate)
                     vetoes = [
                         v
@@ -275,10 +376,12 @@ class Engine:
                 self._reads.setdefault(candidate.key, {"call": "scan"})
             self.discovery.prune()
             await self._refresh_watch_quotes()
+            # First card/decision before overflow prune so a factory log is not
+            # dropped unseen when the visor is already at max_watching.
+            await self.score_and_enter()
             self._prune_watching()
             self._watch_in = sum(1 for k in self.watching if k not in before)
             self._watch_out = sum(1 for k in before if k not in self.watching)
-            await self.score_and_enter()
             await self.maybe_learn()
             self._write_preview()
 
@@ -378,6 +481,8 @@ class Engine:
                 "best_probability": round(self._best_probability, 3),
                 "tick": dict(self._tick_counts),
                 "holds": holds,
+                "faults": dict(self._loop_faults),
+                "dead_loops": sorted(self._loop_dead),
             },
         )
 
@@ -403,6 +508,7 @@ class Engine:
                 "equity_usd": round(self.risk.equity(), 2),
                 "since_last": dict(self._tick_counts),
                 "best_probability": round(self._best_probability, 3),
+                "dead_loops": sorted(self._loop_dead),
             },
         )
         self._tick_counts.clear()
@@ -410,7 +516,9 @@ class Engine:
 
     # -- positions ---------------------------------------------------------
     async def manage_positions(self) -> None:
+        self._drain_sells()
         if not self.positions:
+            self._manual_sell.clear()
             return
         halted, reason = self.risk.halted()
         self._retag()
@@ -429,11 +537,13 @@ class Engine:
                 orders = [
                     ExitOrder(1.0, ExitReason.THESIS_CUT, "beta: main runner dumping")
                 ]
-            if halted and not orders:
-                # The kill switch closes positions rather than merely stopping
-                # new ones. Halting entries while holding open risk is the
-                # worst of both states.
+            if halted:
+                # Flatten everything. A TP rung in the same tick must not leave a stub.
                 orders = [ExitOrder(1.0, ExitReason.KILL_SWITCH, reason)]
+            elif sell_queued_for(
+                self._manual_sell, position.candidate.key, position.candidate.address
+            ):
+                orders = [ExitOrder(1.0, ExitReason.MANUAL, "sold from preview")]
             full = any(o.fraction >= 1.0 for o in orders)
             if not full:
                 cut = await self._stage3(position)
@@ -443,6 +553,14 @@ class Engine:
                 await self._exit(position, order.fraction, order.reason, order.note)
                 if position.tokens_remaining <= 1e-12:
                     break
+        self._manual_sell = {
+            q
+            for q in self._manual_sell
+            if any(
+                sell_queued_for({q}, p.candidate.key, p.candidate.address)
+                for p in self.positions.values()
+            )
+        }
 
     async def _stage3(self, position: Position) -> ExitOrder | None:
         now = now_ms()
@@ -495,6 +613,19 @@ class Engine:
         position.tokens_remaining = max(0.0, position.tokens_remaining - tokens)
         position.last_exit_price = fill.price
         position.last_exit_reason = reason.value
+        position.exit_legs.append(
+            {
+                "ts_ms": now_ms(),
+                "usd_out": round(fill.amount_out, 2),
+                "size_usd": round(cost_basis, 2),
+                "pnl_usd": round(fill.amount_out - cost_basis, 2),
+                "mcap": round(position.candidate.mcap_usd),
+                "reason": reason.value,
+                "why": describe_exit(reason),
+                "note": note,
+                "tokens": tokens,
+            }
+        )
 
         log.info(
             "exit",
@@ -510,10 +641,10 @@ class Engine:
         )
 
         if position.tokens_remaining <= 1e-12:
-            self._close(position, reason)
+            self._close(position, reason, note)
         self._save_positions()
 
-    def _close(self, position: Position, reason: ExitReason) -> None:
+    def _close(self, position: Position, reason: ExitReason, note: str = "") -> None:
         mfe, mae = PositionManager.excursions(position)
         trade = TradeRecord(
             key=position.candidate.key,
@@ -538,6 +669,8 @@ class Engine:
             symbol=position.candidate.symbol or "",
             mcap_entry_usd=position.entry_mcap_usd or position.candidate.mcap_usd,
             mcap_exit_usd=position.candidate.mcap_usd,
+            exit_legs=list(position.exit_legs),
+            notes=(note or "")[:400],
         )
         trade.error_class = learning.classify(trade, self.strategy)
         self.store.record_trade(trade)
@@ -579,6 +712,7 @@ class Engine:
             "mcap_entry": round(trade.mcap_entry_usd),
             "mcap_exit": round(trade.mcap_exit_usd),
             "exit": trade.exit_reason.value,
+            "note": trade.notes,
             "venue": trade.venue.value,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -635,6 +769,23 @@ class Engine:
             if addr:
                 self.discovery.watch(addr)
 
+    def _drain_sells(self) -> None:
+        # ponytail: same file queue as inspect.json; preview and the engine are
+        # separate processes. Duplicate keys no-op if the bag already closed.
+        path = self.settings.state_dir / "sell.json"
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            data = []
+        path.unlink(missing_ok=True)
+        items = data if isinstance(data, list) else [data]
+        for raw in items:
+            key = str(raw).strip()
+            if key:
+                self._manual_sell.add(key)
+
     # -- scoring and entry -------------------------------------------------
     async def score_and_enter(self) -> None:
         if not self.watching:
@@ -651,12 +802,14 @@ class Engine:
             return (unseen, 0 if c.dex_paid else 1, stale, vol)
 
         # Every visor card gets a note. Halt only blocks the fill, not the grade.
+        ttl_ms = int(float(self.strategy.get("loop.rescore_seconds", 15)) * 1000)
         ranked = [
             c
             for c in sorted(self.watching.values(), key=_attention)
             if c.key not in self.positions
             and c.key not in self._inflight
             and self.router.has_venue(c.chain)
+            and (c.source == "inspect" or enrich_due(c.last_scored_ms, now, ttl_ms))
         ]
 
         probe_size = max(
@@ -691,21 +844,10 @@ class Engine:
         await self._enter(decision, decision_id, buyers=buyers, sponsors=sponsors)
 
     def _buy_floors(self) -> dict[str, float]:
+        min_p, min_ev = score_floors(self.strategy, self.store)
         return {
-            "min_p": round(
-                self.store.param(
-                    "scoring.min_probability",
-                    float(self.strategy.get("scoring.min_probability", 0.56)),
-                ),
-                4,
-            ),
-            "min_ev": round(
-                self.store.param(
-                    "scoring.min_expected_value",
-                    float(self.strategy.get("scoring.min_expected_value", 0.035)),
-                ),
-                4,
-            ),
+            "min_p": round(min_p, 4),
+            "min_ev": round(min_ev, 4),
             "min_rubric": round(float(self.strategy.get("scoring.min_rubric", 7.0)), 1),
         }
 
@@ -759,7 +901,7 @@ class Engine:
         try:
             if mcap_is_dead(
                 candidate.mcap_usd, float(self.strategy.get("loop.dead_mcap_usd", 40_000))
-            ):
+            ) and not observe_early(candidate.source):
                 self._drop_watch(candidate, "dead_mcap")
                 return None
             if candidate.pack_role == "vamp":
@@ -772,6 +914,13 @@ class Engine:
                 for v in self.scorer.prefilter(cheap)
                 if not v.startswith("age:") and not v.startswith("priced:")
             ]
+            if observe_early(candidate.source):
+                seen = {v.split(":", 1)[0] for v in free_vetoes}
+                for veto in early_observe_floors(candidate, self.strategy):
+                    kind = veto.split(":", 1)[0]
+                    if kind not in seen:
+                        free_vetoes.append(veto)
+                        seen.add(kind)
             if free_vetoes and candidate.source != "inspect":
                 self._tick_counts[f"free_veto:{free_vetoes[0].split(':')[0]}"] += 1
                 cheap_score = Score(
@@ -780,16 +929,27 @@ class Engine:
                     veto_reasons=free_vetoes,
                     rubric=grade(cheap, self.store, self.strategy).as_visor(),
                 )
-                self._record(
-                    candidate,
-                    cheap.features,
-                    cheap_score,
-                    Action.REJECT_GATE,
-                    0.0,
-                    free_vetoes[0],
-                    cheap.unknown,
+                # First sqlite row is the observation. Later floor waits stay on
+                # the visor without flooding Review every rescore_seconds.
+                if not candidate.last_scored_ms:
+                    self._record(
+                        candidate,
+                        cheap.features,
+                        cheap_score,
+                        Action.REJECT_GATE,
+                        0.0,
+                        free_vetoes[0],
+                        cheap.unknown,
+                    )
+                floor = any(
+                    v.startswith(("mcap:", "volume:", "liquidity:")) for v in free_vetoes
                 )
-                call = "wait" if patience_only(free_vetoes) else "skip"
+                call = (
+                    "wait"
+                    if patience_only(free_vetoes)
+                    or (observe_early(candidate.source) and floor)
+                    else "skip"
+                )
                 self._reads[candidate.key] = self._score_read(
                     candidate, cheap_score, call, free_vetoes[0], cheap
                 )
@@ -1093,7 +1253,7 @@ class Engine:
                 continue
             if mcap_is_dead(
                 candidate.mcap_usd, float(self.strategy.get("loop.dead_mcap_usd", 40_000))
-            ):
+            ) and not observe_early(candidate.source):
                 self._drop_watch(candidate, "dead_mcap")
                 continue
             if candidate.pack_role == "vamp":
@@ -1115,7 +1275,7 @@ class Engine:
         if len(self.watching) > cap:
             overflow.sort(
                 key=lambda c: (
-                    0 if c.source == "inspect" else 1,
+                    0 if c.source == "inspect" or observe_early(c.source) else 1,
                     0 if c.dex_paid else 1,
                     0 if c.pack_role == "main" else 1 if c.pack_role == "beta" else 2,
                     3 if (self._reads.get(c.key) or {}).get("call") == "skip" else 0,

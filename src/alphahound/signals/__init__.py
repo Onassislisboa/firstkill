@@ -16,9 +16,10 @@ Two rules hold throughout:
 from __future__ import annotations
 
 import asyncio
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from ..log import get
 from ..models import Candidate, Candle, Chain, Features, RoundTrip, now_ms
@@ -27,7 +28,20 @@ from ..playbook import copy_signal as copy_flag
 from ..settings import Config, crowd_addresses, whale_addresses
 from ..store import Store
 from . import chart, flow, terminals, whales
-from .distribution import Holder, HolderStats, analyze, holder_growth
+from .distribution import (
+    TRANSFER_TOPIC0,
+    Holder,
+    HolderStats,
+    analyze,
+    decode_transfer_log,
+    first_pool_buyers,
+    holder_growth,
+    holders_from_moves,
+    unmeasured_from_stats,
+    cluster_share_by_root,
+    log_topic_addr,
+    ZERO_ADDR,
+)
 from .terminals import Attribution, ShareTracker, TerminalRegistry
 from .whales import who_inside
 
@@ -48,6 +62,7 @@ class Enrichment:
     candidate: Candidate
     features: Features
     holders: HolderStats = field(default_factory=HolderStats)
+    chain_probed: bool = False
     mint: MintInfo | None = None
     attribution: Attribution = field(default_factory=Attribution)
     round_trip: RoundTrip = field(default_factory=lambda: RoundTrip(ok=False, note="not probed"))
@@ -102,6 +117,8 @@ class Enricher:
         self._holder_history: dict[str, list[tuple[int, int]]] = defaultdict(list)
         self._launch_slots: dict[str, int] = {}
         self._smart_cache: dict[Chain, set[str]] = {}
+        self._whale_fp: tuple[str, ...] | None = None
+        self._evm_cache: dict[str, tuple[int, dict[str, Any]]] = {}
 
     # -- public ------------------------------------------------------------
     async def refresh(self, candidate: Candidate) -> PairSnapshot | None:
@@ -233,10 +250,225 @@ class Enricher:
         self, candidate: Candidate, result: Enrichment
     ) -> dict[str, float]:
         if candidate.chain is Chain.SOLANA and self.solana is not None:
-            return await self._solana_features(candidate, result)
+            values = await self._solana_features(candidate, result)
+            result.chain_probed = True
+            return values
         values = self._aggregate_only_features(candidate, result)
+        values.update(await self._evm_launch_distribution(candidate, result))
         values.update(await self._evm_labeled_crowd(candidate, result))
+        result.chain_probed = True
         return values
+
+    def _evm_cached(self, key: str) -> dict[str, Any] | None:
+        hit = self._evm_cache.get(key)
+        if hit is None or hit[0] <= now_ms():
+            return None
+        return hit[1]
+
+    def _evm_put(self, key: str, payload: dict[str, Any]) -> None:
+        ttl = int(float(self.strategy.get("gates.bundle_cache_seconds", 60)) * 1000)
+        self._evm_cache[key] = (now_ms() + max(0, ttl), payload)
+
+    async def _evm_launch_distribution(
+        self, candidate: Candidate, result: Enrichment
+    ) -> dict[str, float]:
+        """Launch bundle + token-source cluster from ERC-20 Transfer logs."""
+        rpc = self.evm_rpcs.get(candidate.chain)
+        if rpc is None or not candidate.address:
+            return {}
+        cached = self._evm_cached(f"dist:{candidate.key}")
+        if cached is not None:
+            stats = cached.get("stats")
+            if stats is not None:
+                result.holders = stats
+            missing = set(cached.get("unknown") or [])
+            if stats is not None:
+                missing |= unmeasured_from_stats(stats)
+            for key in (
+                "bundle_pct",
+                "cluster_pct",
+                "top10_pct",
+                "top1_pct",
+                "gini",
+                "dev_holding_pct",
+                "fresh_wallet_pct",
+                "holder_count",
+            ):
+                if key in missing:
+                    result.unknown.add(key)
+                else:
+                    result.unknown.discard(key)
+            if cached.get("note"):
+                result.notes.append(str(cached["note"]))
+            values = dict(cached.get("values") or {})
+            for key in missing:
+                values.pop(key, None)
+            return values
+        lookback = int(self.strategy.get("gates.bundle_log_lookback_blocks", 40_000))
+        first_n = int(self.strategy.get("gates.bundle_first_n", 40))
+        window = int(self.strategy.get("gates.bundle_slot_window", 3))
+        try:
+            latest = int(await rpc.call("eth_blockNumber", []), 16)
+            start = max(0, latest - lookback)
+            raw = await rpc.get_logs(
+                {
+                    "fromBlock": hex(start),
+                    "toBlock": hex(latest),
+                    "address": candidate.address,
+                    "topics": [TRANSFER_TOPIC0],
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            result.notes.append(f"transfer logs failed: {exc}")
+            return {}
+        moves = [m for m in (decode_transfer_log(x) for x in raw) if m]
+        if not moves:
+            result.notes.append("transfer logs empty in lookback")
+            return {}
+        pools = {candidate.pool_address.lower()} if candidate.pool_address else set()
+        holders, launch = holders_from_moves(
+            moves, pools=pools, deployer=candidate.deployer, first_n=first_n
+        )
+        if not holders:
+            return {}
+        stats = analyze(holders, now_ms=now_ms(), launch_slot=launch, bundle_slot_window=window)
+        token_cluster = stats.largest_funding_cluster_pct
+        quote_cluster, quote_note = await self._quote_two_hop_cluster(
+            rpc,
+            candidate,
+            result,
+            holders,
+            moves,
+            pools,
+            first_n,
+            start,
+            latest,
+        )
+        if quote_cluster > token_cluster:
+            stats.largest_funding_cluster_pct = quote_cluster
+            stats.notes.append(quote_note)
+        elif quote_note:
+            stats.notes.append(quote_note)
+        result.holders = stats
+        values = {
+            "holder_count": float(stats.holder_count),
+            "top10_pct": stats.top10_pct,
+            "top1_pct": stats.top1_pct,
+            "gini": stats.gini,
+            "fresh_wallet_pct": stats.fresh_wallet_pct,
+            "bundle_pct": stats.bundle_pct,
+            "dev_holding_pct": stats.dev_holding_pct,
+            "cluster_pct": stats.largest_funding_cluster_pct,
+        }
+        missing = unmeasured_from_stats(stats)
+        for key in (
+            "bundle_pct",
+            "cluster_pct",
+            "top10_pct",
+            "top1_pct",
+            "gini",
+            "dev_holding_pct",
+            "fresh_wallet_pct",
+            "holder_count",
+        ):
+            if key in missing:
+                result.unknown.add(key)
+                values.pop(key, None)
+            else:
+                result.unknown.discard(key)
+        result.notes.append(
+            f"evm dist: bundle {stats.bundle_pct:.0%} cluster {stats.largest_funding_cluster_pct:.0%} "
+            f"(token {token_cluster:.0%} quote {quote_cluster:.0%}) n={stats.holder_count}"
+            + (" ages unknown" if "fresh_wallet_pct" in missing else "")
+        )
+        self._evm_put(
+            f"dist:{candidate.key}",
+            {
+                "values": values,
+                "stats": stats,
+                "note": result.notes[-1],
+                "unknown": sorted(missing),
+            },
+        )
+        return values
+
+    async def _quote_two_hop_cluster(
+        self,
+        rpc,
+        candidate: Candidate,
+        result: Enrichment,
+        holders: list,
+        moves: list,
+        pools: set[str],
+        first_n: int,
+        start: int,
+        latest: int,
+    ) -> tuple[float, str]:
+        """2-hop funding on the quote token (GLD/WETH/…). Complements token 1-hop.
+
+        Pool buyers have no token-hop funder. Same-source quote inbound is the
+        GI pattern. Hop-1: first_n pool buyers. Hop-2: unique hop-1 parents only.
+        """
+        snap = result.snap
+        quote = str(((snap.raw.get("quoteToken") if snap else None) or {}).get("address") or "")
+        if not quote.startswith("0x"):
+            return 0.0, "quote cluster skipped: no quote token"
+        quote = quote.lower()
+        buyers = first_pool_buyers(
+            moves,
+            pools,
+            first_n,
+            {h.address.lower(): h.balance for h in holders},
+        )[:40]
+        if not buyers:
+            return 0.0, "quote cluster: no pool buyers"
+        skip = {
+            quote,
+            candidate.address.lower(),
+            ZERO_ADDR,
+            *(p.lower() for p in pools),
+        }
+        for extra in (os.environ.get("RH_CHAIN_SWAP_ROUTER"), os.environ.get("RH_CHAIN_WETH")):
+            if extra and extra.lower().startswith("0x"):
+                skip.add(extra.lower())
+
+        sem = asyncio.Semaphore(8)
+
+        async def inbound(wallet: str) -> str:
+            async with sem:
+                try:
+                    raw = await rpc.get_logs(
+                        {
+                            "fromBlock": hex(start),
+                            "toBlock": hex(latest),
+                            "address": quote,
+                            "topics": [TRANSFER_TOPIC0, None, log_topic_addr(wallet)],
+                        }
+                    )
+                except Exception:  # noqa: BLE001
+                    return ""
+            decoded = [m for m in (decode_transfer_log(x) for x in raw) if m]
+            if not decoded:
+                return ""
+            frm = min(decoded, key=lambda m: m.block).frm.lower()
+            return "" if frm in skip else frm
+
+        hop1: dict[str, str] = {}
+        found = await asyncio.gather(*(inbound(w) for w in buyers))
+        for wallet, sender in zip(buyers, found):
+            if sender:
+                hop1[wallet] = sender
+        parents = list(dict.fromkeys(hop1.values()))
+        hop2: dict[str, str] = {}
+        if parents:
+            found2 = await asyncio.gather(*(inbound(p) for p in parents))
+            for parent, src in zip(parents, found2):
+                if src:
+                    hop2[parent] = src
+        roots = {wallet: hop2.get(sender, sender) for wallet, sender in hop1.items()}
+        circ = sum(h.balance for h in holders if not (h.is_lp or h.is_burn))
+        share = cluster_share_by_root(holders, roots, circ)
+        return share, f"quote 2-hop cluster {share:.0%} ({len(hop1)}/{len(buyers)} buyers)"
 
     async def _solana_features(
         self, candidate: Candidate, result: Enrichment
@@ -381,17 +613,36 @@ class Enricher:
                 "known_holder_pct": known_holder_share(holders, smart),
             }
         )
+        for key in unmeasured_from_stats(stats):
+            result.unknown.add(key)
+            values.pop(key, None)
         values.setdefault("holder_growth_5m", 0.0)
         values.update(await self._crowd_features(candidate, holders, trades, result))
         if "top10_pct" in result.unknown:
             result.unknown.update(
-                {"fomo_inside", "fomo_net_flow", "whale_hold_pct", "whale_net_flow"}
+                {
+                    "fomo_inside",
+                    "fomo_net_flow",
+                    "fomo_supply_pct",
+                    "whale_hold_pct",
+                    "whale_net_flow",
+                }
             )
-            for key in ("fomo_inside", "fomo_net_flow", "whale_hold_pct", "whale_net_flow"):
+            for key in (
+                "fomo_inside",
+                "fomo_net_flow",
+                "fomo_supply_pct",
+                "whale_hold_pct",
+                "whale_net_flow",
+            ):
                 values.pop(key, None)
         return values
 
     def _known_wallets(self, chain: Chain) -> set[str]:
+        fp = tuple(sorted(str(r.get("address") or "") for r in self.whale_rows))
+        if fp != self._whale_fp:
+            self._smart_cache.clear()
+            self._whale_fp = fp
         cached = self._smart_cache.get(chain)
         if cached is not None:
             return cached
@@ -441,6 +692,7 @@ class Enricher:
         if candidate.mcap_usd > ignore_mcap > 0:
             values["fomo_inside"] = 0.0
             values["fomo_net_flow"] = 0.0
+            values["fomo_supply_pct"] = 0.0
             values["whale_hold_pct"] = 0.0
             values["whale_net_flow"] = 0.0
             result.notes.append("labeled flow ignored: mcap above accumulation floor")
@@ -456,11 +708,12 @@ class Enricher:
             fomo = whales.crowd_read(holders, trades, fomo_set)
             values["fomo_inside"] = float(fomo.inside)
             values["fomo_net_flow"] = fomo.net_flow
+            values["fomo_supply_pct"] = fomo.hold_pct
             result.notes.append(
                 f"fomo: {fomo.inside} inside {fomo.hold_pct:.0%} net {fomo.net_flow:+.2f}"
             )
         else:
-            result.unknown.update({"fomo_inside", "fomo_net_flow"})
+            result.unknown.update({"fomo_inside", "fomo_net_flow", "fomo_supply_pct"})
 
         values["whale_hold_pct"] = whale.hold_pct
         values["whale_net_flow"] = whale.net_flow
@@ -613,6 +866,16 @@ class Enricher:
                 f"{candidate.chain.value}: KOL check skipped ({'no rpc' if rpc is None else 'no labeled evm wallets'})"
             )
             return {}
+        cached = self._evm_cached(f"crowd:{candidate.key}")
+        if cached is not None:
+            if cached.get("crowd"):
+                result.crowd = dict(cached["crowd"])
+            result.unknown.discard("fomo_inside")
+            result.unknown.discard("fomo_supply_pct")
+            result.unknown.update({"whale_hold_pct", "whale_net_flow", "fomo_net_flow"})
+            if cached.get("note"):
+                result.notes.append(str(cached["note"]))
+            return dict(cached.get("values") or {})
 
         async def one(addr: str):
             try:
@@ -624,7 +887,7 @@ class Enricher:
                 return Holder(address=addr, balance=float(bal))
             return None
 
-        found = await asyncio.gather(*(one(a) for a in addrs[:32]))
+        found = await asyncio.gather(*(one(a) for a in addrs))
         holders = [h for h in found if h is not None]
         extra = await self._crowd_features(candidate, holders, [], result, size_pct=0.0)
         result.unknown.discard("fomo_inside")
@@ -633,8 +896,30 @@ class Enricher:
         extra.pop("whale_net_flow", None)
         extra.pop("fomo_net_flow", None)
         result.unknown.update({"whale_hold_pct", "whale_net_flow", "fomo_net_flow"})
+        fomo_set = {a.lower() for a in crowd_addresses(self.whale_rows, "fomo") if a.startswith("0x")}
+        fomo_bal = sum(h.balance for h in holders if h.address.lower() in fomo_set)
+        try:
+            supply = float(await rpc.total_supply(candidate.address))
+        except Exception as exc:  # noqa: BLE001
+            result.notes.append(f"totalSupply: {exc}")
+            supply = 0.0
+        if supply > 0:
+            extra["fomo_supply_pct"] = min(1.0, fomo_bal / supply)
+            result.unknown.discard("fomo_supply_pct")
+        else:
+            extra.pop("fomo_supply_pct", None)
+            result.unknown.add("fomo_supply_pct")
         result.notes.append(
             f"labeled holders: {len(holders)}/{len(addrs)} KOL/fomo wallets have a bag"
+            + (f" fomo_supply {extra.get('fomo_supply_pct', 0):.0%}" if "fomo_supply_pct" in extra else "")
+        )
+        self._evm_put(
+            f"crowd:{candidate.key}",
+            {
+                "values": extra,
+                "crowd": dict(result.crowd or {}),
+                "note": result.notes[-1],
+            },
         )
         return extra
 
@@ -659,3 +944,5 @@ class Enricher:
     def forget(self, key: str) -> None:
         self.shares.forget(key)
         self._holder_history.pop(key, None)
+        self._evm_cache.pop(f"dist:{key}", None)
+        self._evm_cache.pop(f"crowd:{key}", None)

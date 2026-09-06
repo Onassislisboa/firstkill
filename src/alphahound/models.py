@@ -66,6 +66,116 @@ class ExitReason(str, Enum):
     MANUAL = "manual"
 
 
+# Portuguese operator copy. Logic lives in portfolio/engine/learning; this is display only.
+EXIT_WHY: dict[str, str] = {
+    "take_profit": "Vendeu uma fatia porque o preço bateu um degrau da escada de lucro.",
+    "trailing_stop": "Depois do primeiro lucro parcial, o preço caiu longe demais do pico e vendeu o que restava.",
+    "stop_loss": "O preço caiu da entrada além do stop duro — cortou a perda.",
+    "time_stop": "Ficou tempo demais sem andar o suficiente; soltou o capital para outra coisa.",
+    "liquidity_drain": "A liquidez da pool caiu forte em relação ao pico — típico de LP saindo.",
+    "thesis_cut": "A tese da entrada quebrou (pico esfriou, fita de 5m virou, ou o hold reavaliou e vetou) — saiu antes do stop duro.",
+    "kill_switch": "O kill switch fechou a posição aberta, não só bloqueou entradas novas.",
+    "manual": "Saída pedida na mão.",
+}
+
+ERROR_WHY: dict[str, str] = {
+    "win": "Fechou no lucro, sem devolver o pico de um jeito absurdo.",
+    "exit_too_fast": "Ganhou, mas devolveu a maior parte do que chegou a estar positivo.",
+    "exit_too_slow": "Chegou a subir o bastante para ter realizado e mesmo assim fechou perdido.",
+    "no_edge": "O sinal na entrada estava ok; o token simplesmente esfriou.",
+    "rug": "A liquidez evaporou e o trade fechou no prejuízo.",
+    "late_entry": "O fill ficou bem mais caro que o preço do sinal.",
+    "slippage_blowout": "A entrada escorregou demais no fill.",
+    "adverse_selection": "No launch já tinha bundle/bots demais — entrou no float errado.",
+    "execution_fail": "A execução falhou.",
+}
+
+GATE_WHY: dict[str, str] = {
+    "bundle": "Muita supply comprada no bloco de lançamento.",
+    "cluster": "Wallets ligadas na mesma origem (funding) acima do limite.",
+    "rug_filter": "Distribuição não medida; pulou para não comprar às cegas.",
+    "volume": "Volume de 5 minutos abaixo do mínimo do playbook.",
+    "twitter": "Menções/oficial no X não passaram no filtro.",
+    "chase": "O 5 minutos já tinha disparado; esperava o dip.",
+    "priced": "Market cap já passou da janela de copy.",
+    "mcap": "Market cap fora da janela permitida.",
+    "round_trip_cost": "Ida e volta (spread+taxa) comiam o edge.",
+    "launchpad": "Não é launchpad permitido nesta chain.",
+    "liquidity": "Liquidez abaixo do mínimo.",
+    "bundled": "Leitura de distribuição: float fabricado.",
+    "cabaled": "Leitura de distribuição: grupo interno no float.",
+    "sponsor": "KOL/whale que justificava a bag saiu.",
+    "rubric": "A nota de hold caiu abaixo do mínimo por strikes seguidos.",
+    "score": "Probabilidade ou EV abaixo do piso.",
+}
+
+
+def describe_exit(code: str | ExitReason) -> str:
+    key = code.value if isinstance(code, ExitReason) else (code or "")
+    return EXIT_WHY.get(key, "")
+
+
+def _opt_num(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def legs_for_display(trade: TradeRecord) -> list[dict]:
+    """One row per sell fill. Old sqlite rows without legs get a single close."""
+    raw = [leg for leg in (trade.exit_legs or []) if isinstance(leg, dict)]
+    if not raw:
+        raw = [
+            {
+                "ts_ms": trade.closed_at_ms,
+                "usd_out": None,
+                "size_usd": round(trade.size_usd, 2),
+                "pnl_usd": round(trade.pnl_usd, 2),
+                "mcap": round(trade.mcap_exit_usd) if trade.mcap_exit_usd else None,
+                "reason": trade.exit_reason.value,
+                "why": describe_exit(trade.exit_reason),
+                "note": trade.notes or "",
+            }
+        ]
+    out: list[dict] = []
+    for leg in raw:
+        reason = str(leg.get("reason") or trade.exit_reason.value)
+        out.append(
+            {
+                "ts_ms": int(leg.get("ts_ms") or trade.closed_at_ms),
+                "usd_out": _opt_num(leg.get("usd_out")),
+                "size_usd": _opt_num(leg.get("size_usd")),
+                "pnl_usd": _opt_num(leg.get("pnl_usd")),
+                "mcap": _opt_num(leg.get("mcap")),
+                "reason": reason,
+                "why": str(leg.get("why") or describe_exit(reason)),
+                "note": str(leg.get("note") or trade.notes or ""),
+            }
+        )
+    return out
+
+
+def describe_error(code: str | ErrorClass) -> str:
+    key = code.value if isinstance(code, ErrorClass) else (code or "")
+    return ERROR_WHY.get(key, "")
+
+
+def describe_code(code: str) -> str:
+    """Exit, postmortem class, or gate prefix — first match."""
+    raw = (code or "").strip()
+    if not raw:
+        return ""
+    if raw in EXIT_WHY:
+        return EXIT_WHY[raw]
+    if raw in ERROR_WHY:
+        return ERROR_WHY[raw]
+    prefix = raw.split(":", 1)[0].strip()
+    return GATE_WHY.get(prefix, "")
+
+
 class ErrorClass(str, Enum):
     """Loss taxonomy. Each class maps to one specific parameter nudge in
     `learning.postmortem`; a bucket that does not imply an action is a bucket
@@ -200,6 +310,8 @@ class Features:
     # that crowd is still buying. Not an execution venue.
     fomo_inside: float = 0.0
     fomo_net_flow: float = 0.0
+    # Circulating share held by labeled Fomo wallets. Score boost, never a veto.
+    fomo_supply_pct: float = 0.0
     # Moby-style key holders: % of supply and buy-vs-sell of wallets that are
     # either labeled whales or large enough to count as one.
     whale_hold_pct: float = 0.0
@@ -363,6 +475,7 @@ class Position:
     last_hold_rubric: float = 0.0
     last_hold_why: str = ""
     entry_mcap_usd: float = 0.0
+    exit_legs: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.tokens_remaining == 0.0:
@@ -414,6 +527,9 @@ class TradeRecord:
     symbol: str = ""
     mcap_entry_usd: float = 0.0
     mcap_exit_usd: float = 0.0
+    # One dict per fill. Ladder rungs land here; the sqlite row is still the
+    # round-trip total the learner uses.
+    exit_legs: list[dict] = field(default_factory=list)
 
     @property
     def pnl_pct(self) -> float:

@@ -12,6 +12,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+ZERO_ADDR = "0x" + "0" * 40
+TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+
+@dataclass(slots=True)
+class TokenMove:
+    block: int
+    frm: str
+    to: str
+    amount: float
+
 
 @dataclass(slots=True)
 class Holder:
@@ -41,6 +52,131 @@ class HolderStats:
     bundle_pct: float = 0.0
     largest_funding_cluster_pct: float = 0.0
     notes: list[str] = field(default_factory=list)
+
+
+def _topic_addr(topic: str) -> str:
+    t = (topic or "").lower().replace("0x", "")
+    return ("0x" + t[-40:]) if len(t) >= 40 else ""
+
+
+def log_topic_addr(address: str) -> str:
+    return "0x" + address.lower().replace("0x", "").rjust(64, "0")
+
+
+def decode_transfer_log(raw: dict) -> TokenMove | None:
+    topics = raw.get("topics") or []
+    if len(topics) < 3 or str(topics[0]).lower() != TRANSFER_TOPIC0:
+        return None
+    data = raw.get("data") or "0x0"
+    try:
+        amount = float(int(data, 16))
+        block = int(raw.get("blockNumber") or "0x0", 16)
+    except ValueError:
+        return None
+    frm, to = _topic_addr(str(topics[1])), _topic_addr(str(topics[2]))
+    if not frm or not to:
+        return None
+    return TokenMove(block=block, frm=frm, to=to, amount=amount)
+
+
+def holders_from_moves(
+    moves: list[TokenMove],
+    *,
+    pools: set[str] | None = None,
+    deployer: str = "",
+    first_n: int = 40,
+) -> tuple[list[Holder], int]:
+    """Holders + launch block from ERC-20 Transfer logs.
+
+    `funder` is the first non-pool sender into the wallet (token hop). Same-block
+    snipers still show up via acquired_slot even when they bought from the pool.
+    """
+    if not moves:
+        return [], 0
+    ordered = sorted(moves, key=lambda m: m.block)
+    launch = ordered[0].block
+    pools = {p.lower() for p in (pools or set()) if p}
+    deployer = deployer.lower()
+    bal: dict[str, float] = {}
+    first_block: dict[str, int] = {}
+    funder: dict[str, str] = {}
+    early_n = 0
+    for m in ordered:
+        to, frm = m.to.lower(), m.frm.lower()
+        if to not in pools and to != ZERO_ADDR:
+            bal[to] = bal.get(to, 0.0) + m.amount
+            if to not in first_block:
+                first_block[to] = m.block
+                if frm not in pools:
+                    funder[to] = frm if early_n < first_n else funder.get(to, "")
+                    if early_n < first_n:
+                        early_n += 1
+        if frm not in pools and frm != ZERO_ADDR:
+            bal[frm] = bal.get(frm, 0.0) - m.amount
+    holders = []
+    for addr, amount in bal.items():
+        if amount <= 0 or addr in pools:
+            continue
+        holders.append(
+            Holder(
+                address=addr,
+                balance=amount,
+                acquired_slot=first_block.get(addr, 0),
+                funder=funder.get(addr, ""),
+                is_lp=False,
+                is_deployer=bool(deployer) and addr == deployer,
+            )
+        )
+    return holders, launch
+
+
+def first_pool_buyers(
+    moves: list[TokenMove],
+    pools: set[str],
+    n: int,
+    balances: dict[str, float] | None = None,
+) -> list[str]:
+    """Pool buyers to probe for quote-token funding (cap n).
+
+    Time-ordered first inbound from the pool, then the heaviest remaining bags
+    if `balances` is passed — cluster % is a supply share, so dust snipers
+    first would miss the GI pattern.
+    """
+    if n <= 0 or not moves:
+        return []
+    pools = {p.lower() for p in pools if p}
+    ordered = sorted(moves, key=lambda m: m.block)
+    seen: set[str] = set()
+    pool_first: list[str] = []
+    for m in ordered:
+        to = m.to.lower()
+        if to in seen or to in pools or to == ZERO_ADDR:
+            continue
+        seen.add(to)
+        if m.frm.lower() in pools:
+            pool_first.append(to)
+    if balances:
+        pool_first.sort(key=lambda a: -float(balances.get(a, 0.0)))
+    return pool_first[:n]
+
+
+def cluster_share_by_root(
+    holders: list[Holder],
+    roots: dict[str, str],
+    circ_total: float,
+) -> float:
+    """Supply share of the largest group sharing a funding root (quote hops)."""
+    if circ_total <= 0 or not roots:
+        return 0.0
+    by_root: dict[str, float] = {}
+    for h in holders:
+        root = roots.get(h.address.lower())
+        if not root:
+            continue
+        by_root[root] = by_root.get(root, 0.0) + h.balance
+    if not by_root:
+        return 0.0
+    return max(by_root.values()) / circ_total
 
 
 def gini(values: list[float]) -> float:
@@ -122,6 +258,21 @@ def analyze(
 
     stats.largest_funding_cluster_pct = funding_cluster_share(circulating, circ_total)
     return stats
+
+
+def unmeasured_from_stats(stats: HolderStats) -> set[str]:
+    """Keys analyze() left at 0 because the input was missing, not because 0 is true.
+
+    Callers must keep these in Enrichment.unknown so normalize() zeros them
+    instead of treating the default as a clean launch / old wallets.
+    """
+    out: set[str] = set()
+    for note in stats.notes:
+        if "wallet ages unavailable" in note:
+            out.add("fresh_wallet_pct")
+        if "launch slot unknown" in note:
+            out.add("bundle_pct")
+    return out
 
 
 def funding_cluster_share(holders: list[Holder], circ_total: float) -> float:

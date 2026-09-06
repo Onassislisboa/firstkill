@@ -35,6 +35,7 @@ NATIVE_SENTINEL = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
 # keeps a keccak implementation out of the dependency tree.
 SEL_DECIMALS = "0x313ce567"
 SEL_BALANCE_OF = "0x70a08231"
+SEL_TOTAL_SUPPLY = "0x18160ddd"
 SEL_APPROVE = "0x095ea7b3"
 SEL_ALLOWANCE = "0xdd62ed3e"
 MAX_UINT256 = (1 << 256) - 1
@@ -73,6 +74,10 @@ class EvmRpc:
             raise ExecutionError(f"{method}: {data['error']}")
         return data.get("result")
 
+    async def get_logs(self, filt: dict[str, Any]) -> list:
+        data = await self.call("eth_getLogs", [filt])
+        return data if isinstance(data, list) else []
+
     async def eth_call(self, to: str, data: str) -> str:
         return await self.call("eth_call", [{"to": to, "data": data}, "latest"])
 
@@ -82,6 +87,10 @@ class EvmRpc:
 
     async def balance_of(self, token: str, owner: str) -> int:
         raw = await self.eth_call(token, SEL_BALANCE_OF + _pad_address(owner))
+        return int(raw, 16) if raw and raw != "0x" else 0
+
+    async def total_supply(self, token: str) -> int:
+        raw = await self.eth_call(token, SEL_TOTAL_SUPPLY)
         return int(raw, 16) if raw and raw != "0x" else 0
 
     async def nonce(self, address: str) -> int:

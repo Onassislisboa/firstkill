@@ -202,8 +202,8 @@ def bot_veto(read: DistRead, chain: str) -> str | None:
     """What the bot does with a read. Organic is never a buy signal."""
     if read.label == "bundled":
         return "bundled: " + (read.signals[0] if read.signals else "manufactured supply")
+    if read.label == "cabaled":
+        return "cabaled: " + (read.signals[0] if read.signals else "insider float")
     if read.label == "unverified" and chain == "solana":
         return "unverified: skip"
-    if read.label == "cabaled" and chain == "solana":
-        return "cabaled: " + (read.signals[0] if read.signals else "insider float")
     return None
