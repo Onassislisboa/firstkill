@@ -440,6 +440,16 @@ def evaluate_gates(
         f.bundle_pct > p("max_bundle_pct", 0.25),
         f"launch bundle {f.bundle_pct:.0%}",
     )
+    # Hood V4/V3 NFT / BNB V2 LP. 0 disables. Not a lock-duration oracle — see lp_lock.py.
+    max_free_lp = p("max_lp_unlocked_pct", 0.0)
+    if max_free_lp > 0 and chain.value in ("robinhood_chain", "bnb"):
+        free_lp = 1.0 - f.lp_locked_pct
+        check(
+            "lp_unlocked",
+            ("lp_locked_pct",),
+            free_lp > max_free_lp,
+            f"{free_lp:.0%} da liquidez livre (não burn/locker)",
+        )
     check(
         "fresh_wallets",
         ("fresh_wallet_pct",),
@@ -556,6 +566,7 @@ _HOLD_IGNORE = (
     "liquidity:",
     "rubric:",
     "sponsor:",
+    "lp_unlocked:",
 )
 
 

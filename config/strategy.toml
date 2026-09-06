@@ -29,8 +29,8 @@ enrich_concurrency = 4
 max_watching = 40
 # Full enrich this often. Quotes still tick; new coins jump the queue.
 rescore_seconds = 15
-# Below this the coin is dead. Drop from visor, no enrich/score/sqlite.
-dead_mcap_usd = 40000
+# Below this, skip visor/enrich. Buy floor is playbook copy_min (100k), not this.
+dead_mcap_usd = 50000
 # Proof of life, with a breakdown of what rejected everything. 0 disables.
 heartbeat_seconds = 60.0
 # Unused when max_candidates_per_tick is 0 (score the whole visor).
@@ -84,6 +84,13 @@ max_unknown_top1_pct = 0.50
 # Circulating top-10 (LP and burn already excluded) above this, unless known
 # wallets explain most of that share, is a dump waiting to happen.
 max_top10_pct = 0.50
+# Fraction of pool LP that is *not* burned or in a known locker. Near 1.0 means
+# the position NFT (Hood V4/V3) or LP token (BNB V2) sits in a wallet that can drain now.
+# 0 disables. Does not verify lock duration or that the locker isn't team-owned.
+max_lp_unlocked_pct = 0.95
+# Extra locker contracts (lowercase 0x…). BNB already includes Team Finance /
+# Unicrypt / PinkLock. Hood: add chain-specific lockers here when they exist.
+lp_locker_addresses = []
 
 
 # ---------------------------------------------------------------------------

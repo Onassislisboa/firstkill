@@ -92,6 +92,13 @@ class PairSnapshot:
         )
         candidate.dex_photo = self.dex_photo
         candidate.dex_aligned = self.dex_aligned
+        candidate.symbol = candidate.symbol or self.symbol
+        candidate.name = candidate.name or self.name
+        # Pair birth, not visor arrival. hood_stream stamps now_ms until DS has pairCreatedAt.
+        if self.created_at_ms > 0 and (
+            not candidate.created_at_ms or candidate.created_at_ms > self.created_at_ms
+        ):
+            candidate.created_at_ms = self.created_at_ms
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -99,6 +106,13 @@ def _f(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def pair_created_ms(value: Any) -> int:
+    n = int(_f(value))
+    if 0 < n < 10**12:
+        n *= 1000
+    return n
 
 
 def orders_mark_paid(data: Any) -> bool:
@@ -242,7 +256,7 @@ def parse_pair(pair: dict[str, Any]) -> PairSnapshot | None:
         sells_m5=int(_f(txns.get("sells"))),
         price_change_m5=_f((pair.get("priceChange") or {}).get("m5")) / 100.0,
         price_change_h1=_f((pair.get("priceChange") or {}).get("h1")) / 100.0,
-        created_at_ms=int(_f(pair.get("pairCreatedAt"))),
+        created_at_ms=pair_created_ms(pair.get("pairCreatedAt")),
         dex_id=pair.get("dexId", ""),
         quote_symbol=(pair.get("quoteToken") or {}).get("symbol", ""),
         twitter=twitter,

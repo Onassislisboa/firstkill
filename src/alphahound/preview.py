@@ -674,7 +674,7 @@ function watchBody(w) {
     + '</div>';
   const kols = (w.kols && w.kols.length) ? w.kols.join(', ') : '—';
   const fomo = (w.fomo && w.fomo.length) ? w.fomo.join(', ') : '—';
-  return '<div class="wcard-h"><span class="sym" data-f="sym">'+(w.symbol || caHead(w.address))+'</span>'+copyBtn(w.address)+'</div>'
+  return '<div class="wcard-h"><span class="sym" data-f="sym">'+(w.symbol || w.name || caHead(w.address))+'</span>'+copyBtn(w.address)+'</div>'
     + '<div class="wcard-h"><span class="chain">'+chainShort(w.chain)+'</span><span class="age" data-f="age">'+ageTxt(w.age_min)+'</span></div>'
     + '<div class="mcap" data-f="mcap">'+mcapTxt(w.mcap)+'</div>'
     + certHtml(w.cert)+' '+pill+' '+role(w.role)
@@ -701,7 +701,7 @@ function fillLive(el, w) {
   const set = (f, t) => setNode(el.querySelector('[data-f="'+f+'"]'), t);
   set('mcap', mcapTxt(w.mcap));
   set('age', ageTxt(w.age_min));
-  set('sym', w.symbol || caHead(w.address));
+  set('sym', w.symbol || w.name || caHead(w.address));
   set('kols', 'kols '+((w.kols && w.kols.length) ? w.kols.join(', ') : '—'));
   set('fomo', 'fomo '+((w.fomo && w.fomo.length) ? w.fomo.join(', ') : '—'));
   set('why', (w.why && w.why !== 'ok') ? w.why : '');
@@ -846,7 +846,7 @@ function paintCoin(opts) {
   const fomo = (w.fomo&&w.fomo.length) ? w.fomo.join(', ') : '—';
   const vetoes = (w.vetoes&&w.vetoes.length) ? w.vetoes : (w.why ? [w.why] : []);
   box.innerHTML = '<div class="coin-h">'
-    + '<div class="sym">'+(esc(w.symbol)||'—')+'</div>'
+    + '<div class="sym">'+(esc(w.symbol||w.name)||'—')+'</div>'
     + '<div class="chain">'+esc(w.chain)+'</div>'
     + certHtml(w.cert)
     + '<span class="pill st-'+(w.call||'scan')+'">'+call+'</span>'
@@ -1190,7 +1190,7 @@ async function tick() {
   rows($('sold'), d.sold||[], t => `<tr>
     <td>
       <div class="sym">${t.symbol || caHead((t.key||'').split(':')[1])}</div>
-      <div class="ca">${chainShort(t.chain||'')}</div>
+      <div class="ca">${chainShort(t.chain||'')} · ${caHead((t.key||'').split(':')[1])} ${copyBtn((t.key||'').split(':')[1])}</div>
     </td>
     <td>${usd(t.size_usd)}</td>
     <td class="pnl ${cls(t.pnl_usd)}">${usd(t.pnl_usd)} <span class="muted">${pct(t.pnl_pct)}</span></td>
@@ -1231,7 +1231,7 @@ async function loadReview() {
         : '';
       return `<tr class="rev-row" data-rev="${i}"><td>${when(r.ts_ms)}</td>
         <td><div class="sym">${esc(r.symbol||caHead(ca))}</div><div class="ca">${chainShort(r.chain||'')} ${esc(caHead(ca))} ${copyBtn(ca)}</div></td>
-        <td>${esc(r.action)}<div class="meta">${esc(r.reason||'')}</div></td>
+        <td>${esc(r.action)}<div class="meta">${esc(r.reason||'')}${r.ticks>1 ? (' · '+r.ticks+' ticks') : ''}</div></td>
         <td>${pct(r.p)} / ${pct(r.ev)}</td>
         <td>${res}${soldBits}</td>
         <td class="out-${esc(r.outcome)}">${OUT_LAB[r.outcome]||r.outcome}</td></tr>

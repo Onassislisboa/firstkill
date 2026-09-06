@@ -139,6 +139,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             f"  max_cluster {pb_gate(strategy, chain0, 'max_cluster_pct', 0.20, store):.0%}"
             " (hard veto)"
         )
+        print(
+            f"  lp lock           max unlocked "
+            f"{pb_gate(strategy, chain0, 'max_lp_unlocked_pct', 0.95, store):.0%}"
+            " (Hood V4/V3 NFT / BNB V2; hard veto at entry)"
+        )
 
     engaged = store.get_kv("kill_switch") == "1"
     print(f"  kill switch       {'ENGAGED - ' + store.get_kv('kill_switch_reason') if engaged else 'clear'}")

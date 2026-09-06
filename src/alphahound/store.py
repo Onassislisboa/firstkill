@@ -51,7 +51,10 @@ CREATE TABLE IF NOT EXISTS decisions (
     contributions TEXT NOT NULL,
     weights_version INTEGER NOT NULL,
     reason TEXT,
-    unknown TEXT NOT NULL DEFAULT '[]'
+    unknown TEXT NOT NULL DEFAULT '[]',
+    first_ts_ms INTEGER,
+    last_ts_ms INTEGER,
+    ticks INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_key ON decisions(key);
 CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts_ms);
@@ -181,6 +184,18 @@ def lock_state_dir(state_dir: Path) -> IO[bytes]:
     return handle
 
 
+def episode_kind(action: str, reason: str) -> tuple[str, str]:
+    """Gate/score class, not the floats in the message.
+
+    `probability 0.389 < 0.420` and `probability 0.396 < 0.420` are one episode.
+    `cluster:` vs `liquidity:` are two.
+    """
+    r = (reason or "").strip()
+    if ":" in r:
+        return action, r.split(":", 1)[0].strip().lower()
+    return action, (r.split(None, 1)[0].lower() if r else "")
+
+
 def features_from_json(payload: str) -> Features:
     data = json.loads(payload)
     known = set(Features.names())
@@ -222,6 +237,9 @@ class Store:
         # column added later never appears in a database that already exists.
         for table, column, ddl in (
             ("decisions", "unknown", "TEXT NOT NULL DEFAULT '[]'"),
+            ("decisions", "first_ts_ms", "INTEGER"),
+            ("decisions", "last_ts_ms", "INTEGER"),
+            ("decisions", "ticks", "INTEGER NOT NULL DEFAULT 1"),
             ("trades", "unknown", "TEXT NOT NULL DEFAULT '[]'"),
             ("trades", "symbol", "TEXT NOT NULL DEFAULT ''"),
             ("trades", "mcap_entry_usd", "REAL NOT NULL DEFAULT 0"),
@@ -238,18 +256,55 @@ class Store:
         self.conn.close()
 
     # -- decisions ---------------------------------------------------------
+    # Same (key, action, reason) within this gap is one episode. Wider than
+    # one missed rescore; narrower than a token leaving the visor and returning.
+    EPISODE_GAP_MS = 120_000
+
     def record_decision(self, decision: Decision) -> int:
+        """Insert on state change; bump ticks on the live episode otherwise.
+
+        New episode: action/reason changed, or the last row for this key is
+        older than EPISODE_GAP_MS with no open shadow (left the radar).
+        ENTER always inserts. One shadow per reject episode, not per tick.
+        """
+        ts = decision.ts_ms
+        key = decision.candidate.key
+        action = decision.action.value
+        reason = decision.reason or ""
+        if decision.action is not Action.ENTER:
+            prev = self.conn.execute(
+                """SELECT id, action, IFNULL(reason,'') AS reason,
+                          COALESCE(last_ts_ms, ts_ms) AS last_ts_ms
+                   FROM decisions WHERE key = ? ORDER BY id DESC LIMIT 1""",
+                (key,),
+            ).fetchone()
+            if prev is not None and episode_kind(prev["action"], prev["reason"]) == episode_kind(
+                action, reason
+            ):
+                open_shadow = self.conn.execute(
+                    "SELECT 1 FROM shadow WHERE key = ? AND resolved = 0 LIMIT 1",
+                    (key,),
+                ).fetchone()
+                if open_shadow is not None or (ts - int(prev["last_ts_ms"])) < self.EPISODE_GAP_MS:
+                    self.conn.execute(
+                        """UPDATE decisions
+                           SET last_ts_ms = ?, ticks = COALESCE(ticks, 1) + 1,
+                               first_ts_ms = COALESCE(first_ts_ms, ts_ms)
+                           WHERE id = ?""",
+                        (ts, int(prev["id"])),
+                    )
+                    return int(prev["id"])
         cur = self.conn.execute(
             """INSERT INTO decisions (ts_ms, key, chain, symbol, action, probability,
                    expected_value, size_usd, signal_price, features, contributions,
-                   weights_version, reason, unknown)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   weights_version, reason, unknown, first_ts_ms, last_ts_ms, ticks)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                decision.ts_ms,
-                decision.candidate.key,
+                ts,
+                key,
                 decision.candidate.chain.value,
                 decision.candidate.symbol,
-                decision.action.value,
+                action,
                 decision.score.probability,
                 decision.score.expected_value,
                 decision.size_usd,
@@ -259,11 +314,14 @@ class Store:
                 decision.weights_version,
                 decision.reason,
                 json.dumps(sorted(decision.unknown)),
+                ts,
+                ts,
+                1,
             ),
         )
         decision_id = int(cur.lastrowid or 0)
         if decision.action is not Action.ENTER and decision.candidate.price_usd > 0:
-            self.open_shadow(decision_id, decision.candidate.key, decision.candidate.price_usd)
+            self.open_shadow(decision_id, key, decision.candidate.price_usd)
         return decision_id
 
     def recent_decision_keys(self, since_ms: int) -> set[str]:
@@ -347,7 +405,10 @@ class Store:
         if want_rej:
             sql = """SELECT d.ts_ms, d.key, d.symbol, d.chain, d.action, d.reason,
                             d.probability, d.expected_value, d.contributions,
-                            s.resolved, s.counterfactual_pct
+                            s.resolved, s.counterfactual_pct,
+                            COALESCE(d.ticks, 1) AS ticks,
+                            COALESCE(d.first_ts_ms, d.ts_ms) AS first_ts_ms,
+                            COALESCE(d.last_ts_ms, d.ts_ms) AS last_ts_ms
                      FROM decisions d JOIN shadow s ON s.decision_id = d.id"""
             params: list[Any] = []
             if outcome == "fumble":
@@ -378,6 +439,9 @@ class Store:
                         "action": r["action"],
                         "reason": r["reason"] or "",
                         "reason_why": describe_code(r["reason"] or ""),
+                        "ticks": int(r["ticks"] or 1),
+                        "first_ts_ms": int(r["first_ts_ms"] or r["ts_ms"]),
+                        "last_ts_ms": int(r["last_ts_ms"] or r["ts_ms"]),
                         "p": round(float(r["probability"] or 0.0), 4),
                         "ev": round(float(r["expected_value"] or 0.0), 4),
                         "mfe": round(cf, 4) if resolved else None,

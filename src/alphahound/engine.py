@@ -97,6 +97,11 @@ def mcap_is_dead(mcap_usd: float, floor: float) -> bool:
     return floor > 0 and 0 < mcap_usd < floor
 
 
+def below_scan_mcap(mcap_usd: float, floor: float) -> bool:
+    """No visor/enrich under the scan floor, including unquoted mcap=0."""
+    return floor > 0 and mcap_usd < floor
+
+
 def observe_early(source: str) -> bool:
     """On the visor before buy floors. Must still fail prefilter on enter."""
     return source == "hood_stream"
@@ -234,6 +239,7 @@ class Engine:
         self._reads: dict[str, dict] = {}
         self._inflight: set[str] = set()
         self._manual_sell: set[str] = set()
+        self._label_fail: set[str] = set()
         self._stop = asyncio.Event()
         self._loop_faults: dict[str, str] = {}
         self._loop_dead: set[str] = set()
@@ -349,7 +355,7 @@ class Engine:
             self._drain_inspect()
             found = await self.discovery.poll()
             before = set(self.watching)
-            dead_floor = float(self.strategy.get("loop.dead_mcap_usd", 40_000))
+            dead_floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
             for candidate in found:
                 prev = self.watching.get(candidate.key)
                 if prev is not None:
@@ -358,9 +364,7 @@ class Engine:
                         candidate.source = prev.source
                 if candidate.pack_role == "vamp":
                     continue
-                if mcap_is_dead(candidate.mcap_usd, dead_floor) and not observe_early(
-                    candidate.source
-                ):
+                if candidate.source != "inspect" and mcap_is_dead(candidate.mcap_usd, dead_floor):
                     continue
                 if candidate.source != "inspect" and not observe_early(candidate.source):
                     cheap = self.enricher.free_enrichment(candidate)
@@ -376,8 +380,7 @@ class Engine:
                 self._reads.setdefault(candidate.key, {"call": "scan"})
             self.discovery.prune()
             await self._refresh_watch_quotes()
-            # First card/decision before overflow prune so a factory log is not
-            # dropped unseen when the visor is already at max_watching.
+            self._drop_below_scan_mcap()
             await self.score_and_enter()
             self._prune_watching()
             self._watch_in = sum(1 for k in self.watching if k not in before)
@@ -899,9 +902,9 @@ class Engine:
         self._inflight.add(candidate.key)
         painted = False
         try:
-            if mcap_is_dead(
-                candidate.mcap_usd, float(self.strategy.get("loop.dead_mcap_usd", 40_000))
-            ) and not observe_early(candidate.source):
+            if candidate.source != "inspect" and below_scan_mcap(
+                candidate.mcap_usd, float(self.strategy.get("loop.dead_mcap_usd", 50_000))
+            ):
                 self._drop_watch(candidate, "dead_mcap")
                 return None
             if candidate.pack_role == "vamp":
@@ -1170,10 +1173,11 @@ class Engine:
                 snaps = await self.dex.token_pairs(addrs[i : i + 30])
             except Exception:  # noqa: BLE001
                 continue
-            by.update({s.token_address: s for s in snaps})
+            by.update({s.token_address.lower(): s for s in snaps})
         unpaid = []
+        unlabeled = []
         for candidate in self.watching.values():
-            snap = by.get(candidate.address)
+            snap = by.get(candidate.address.lower())
             was_paid = candidate.dex_paid
             if snap is not None:
                 candidate.price_usd = snap.price_usd or candidate.price_usd
@@ -1195,6 +1199,8 @@ class Engine:
                 read = self._reads.get(candidate.key)
                 if read is not None:
                     read["call"] = "scan"
+            if not candidate.symbol and not candidate.name and candidate.key not in self._label_fail:
+                unlabeled.append(candidate)
         if probe_paid:
             for candidate in unpaid[:8]:
                 try:
@@ -1208,6 +1214,18 @@ class Engine:
                 read = self._reads.get(candidate.key)
                 if read is not None:
                     read["call"] = "scan"
+        for candidate in unlabeled[:8]:
+            rpc = self.enricher.evm_rpcs.get(candidate.chain)
+            if rpc is None:
+                continue
+            try:
+                symbol, name = await rpc.erc20_labels(candidate.address)
+            except Exception:  # noqa: BLE001
+                continue
+            candidate.symbol = candidate.symbol or symbol
+            candidate.name = candidate.name or name
+            if not candidate.symbol and not candidate.name:
+                self._label_fail.add(candidate.key)
 
     def _retag(self) -> dict:
         by_key = {c.key: c for c in self.watching.values()}
@@ -1225,6 +1243,14 @@ class Engine:
             position.candidate.main_ret_5m = tag.main_ret_5m
             position.candidate.pack_size = tag.pack_size
         return tags
+
+    def _drop_below_scan_mcap(self) -> None:
+        floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
+        for candidate in list(self.watching.values()):
+            if candidate.key in self.positions or candidate.source == "inspect":
+                continue
+            if below_scan_mcap(candidate.mcap_usd, floor):
+                self._drop_watch(candidate, "dead_mcap")
 
     def _drop_watch(self, candidate: Candidate, tag: str) -> None:
         if candidate.key in self.positions:
@@ -1251,9 +1277,9 @@ class Engine:
             if ignore_mcap > 0 and candidate.mcap_usd > ignore_mcap:
                 self._drop_watch(candidate, "fat_mcap")
                 continue
-            if mcap_is_dead(
-                candidate.mcap_usd, float(self.strategy.get("loop.dead_mcap_usd", 40_000))
-            ) and not observe_early(candidate.source):
+            if below_scan_mcap(
+                candidate.mcap_usd, float(self.strategy.get("loop.dead_mcap_usd", 50_000))
+            ):
                 self._drop_watch(candidate, "dead_mcap")
                 continue
             if candidate.pack_role == "vamp":

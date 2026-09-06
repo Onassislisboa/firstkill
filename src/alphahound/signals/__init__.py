@@ -124,7 +124,8 @@ class Enricher:
     async def refresh(self, candidate: Candidate) -> PairSnapshot | None:
         """Update price/liquidity in place from the free provider."""
         snaps = await self.dex.token_pairs([candidate.address])
-        snap = next((s for s in snaps if s.token_address == candidate.address), None)
+        want = candidate.address.lower()
+        snap = next((s for s in snaps if s.token_address.lower() == want), None)
         if snap is None:
             return None
         candidate.price_usd = snap.price_usd or candidate.price_usd
@@ -132,8 +133,8 @@ class Enricher:
         candidate.mcap_usd = snap.mcap_usd or candidate.mcap_usd
         candidate.volume_5m_usd = snap.volume_m5
         candidate.pool_address = candidate.pool_address or snap.pair_address
-        candidate.created_at_ms = candidate.created_at_ms or snap.created_at_ms
         candidate.symbol = candidate.symbol or snap.symbol
+        candidate.name = candidate.name or snap.name
         candidate.dex_id = candidate.dex_id or snap.dex_id
         candidate.ret_5m = snap.price_change_m5
         snap.stamp(candidate)
@@ -256,7 +257,53 @@ class Enricher:
         values = self._aggregate_only_features(candidate, result)
         values.update(await self._evm_launch_distribution(candidate, result))
         values.update(await self._evm_labeled_crowd(candidate, result))
+        values.update(await self._evm_lp_lock(candidate, result))
         result.chain_probed = True
+        return values
+
+    async def _evm_lp_lock(self, candidate: Candidate, result: Enrichment) -> dict[str, float]:
+        """Fill lp_locked_pct from V4/V3 NFTs (Hood) or V2 LP token (BNB)."""
+        if candidate.chain not in (Chain.ROBINHOOD_CHAIN, Chain.BNB):
+            return {}
+        cached = self._evm_cached(f"lp:{candidate.key}")
+        if cached is not None:
+            if cached.get("unknown"):
+                result.unknown.add("lp_locked_pct")
+            else:
+                result.unknown.discard("lp_locked_pct")
+            if cached.get("note"):
+                result.notes.append(str(cached["note"]))
+            return dict(cached.get("values") or {})
+        rpc = self.evm_rpcs.get(candidate.chain)
+        if rpc is None:
+            result.unknown.add("lp_locked_pct")
+            result.notes.append("lp lock skipped: no RPC")
+            return {}
+        from .lp_lock import probe_lp_lock
+
+        extra = [
+            str(a).strip()
+            for a in (self.strategy.get("gates.lp_locker_addresses") or [])
+            if str(a).strip()
+        ]
+        probe = await probe_lp_lock(
+            rpc,
+            chain=candidate.chain,
+            pool=candidate.pool_address,
+            created_at_ms=candidate.created_at_ms,
+            extra_lockers=extra,
+        )
+        result.notes.append(probe.note)
+        values = {"lp_locked_pct": probe.locked_pct}
+        if not probe.ok:
+            result.unknown.add("lp_locked_pct")
+            values = {}
+        else:
+            result.unknown.discard("lp_locked_pct")
+        self._evm_put(
+            f"lp:{candidate.key}",
+            {"values": values, "note": probe.note, "unknown": not probe.ok},
+        )
         return values
 
     def _evm_cached(self, key: str) -> dict[str, Any] | None:
