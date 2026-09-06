@@ -83,7 +83,7 @@ ERROR_WHY: dict[str, str] = {
     "exit_too_fast": "Ganhou, mas devolveu a maior parte do que chegou a estar positivo.",
     "exit_too_slow": "Chegou a subir o bastante para ter realizado e mesmo assim fechou perdido.",
     "no_edge": "O sinal na entrada estava ok; o token simplesmente esfriou.",
-    "rug": "A liquidez evaporou (saída classificada a partir de liquidity_drain).",
+    "rug": "A liquidez evaporou e o trade fechou no prejuízo.",
     "late_entry": "O fill ficou bem mais caro que o preço do sinal.",
     "slippage_blowout": "A entrada escorregou demais no fill.",
     "adverse_selection": "No launch já tinha bundle/bots demais — entrou no float errado.",
@@ -137,6 +137,7 @@ def legs_for_display(trade: TradeRecord) -> list[dict]:
                 "mcap": round(trade.mcap_exit_usd) if trade.mcap_exit_usd else None,
                 "reason": trade.exit_reason.value,
                 "why": describe_exit(trade.exit_reason),
+                "note": trade.notes or "",
             }
         ]
     out: list[dict] = []
@@ -151,6 +152,7 @@ def legs_for_display(trade: TradeRecord) -> list[dict]:
                 "mcap": _opt_num(leg.get("mcap")),
                 "reason": reason,
                 "why": str(leg.get("why") or describe_exit(reason)),
+                "note": str(leg.get("note") or trade.notes or ""),
             }
         )
     return out

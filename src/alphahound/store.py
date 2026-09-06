@@ -426,6 +426,7 @@ class Store:
                         "mcap_entry": round(t.mcap_entry_usd),
                         "mcap_exit": round(t.mcap_exit_usd),
                         "exit_legs": legs_for_display(t),
+                        "exit_note": t.notes or "",
                     }
                 )
 

@@ -60,7 +60,7 @@ def classify(trade: TradeRecord, strategy: Config) -> ErrorClass:
     )
     realized = trade.pnl_pct
 
-    if trade.exit_reason is ExitReason.LIQUIDITY_DRAIN:
+    if trade.exit_reason is ExitReason.LIQUIDITY_DRAIN and not trade.won:
         return ErrorClass.RUG
 
     if trade.won:

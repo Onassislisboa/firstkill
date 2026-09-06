@@ -562,6 +562,7 @@ class Engine:
                 "mcap": round(position.candidate.mcap_usd),
                 "reason": reason.value,
                 "why": describe_exit(reason),
+                "note": note,
                 "tokens": tokens,
             }
         )
@@ -580,10 +581,10 @@ class Engine:
         )
 
         if position.tokens_remaining <= 1e-12:
-            self._close(position, reason)
+            self._close(position, reason, note)
         self._save_positions()
 
-    def _close(self, position: Position, reason: ExitReason) -> None:
+    def _close(self, position: Position, reason: ExitReason, note: str = "") -> None:
         mfe, mae = PositionManager.excursions(position)
         trade = TradeRecord(
             key=position.candidate.key,
@@ -609,6 +610,7 @@ class Engine:
             mcap_entry_usd=position.entry_mcap_usd or position.candidate.mcap_usd,
             mcap_exit_usd=position.candidate.mcap_usd,
             exit_legs=list(position.exit_legs),
+            notes=(note or "")[:400],
         )
         trade.error_class = learning.classify(trade, self.strategy)
         self.store.record_trade(trade)
@@ -650,6 +652,7 @@ class Engine:
             "mcap_entry": round(trade.mcap_entry_usd),
             "mcap_exit": round(trade.mcap_exit_usd),
             "exit": trade.exit_reason.value,
+            "note": trade.notes,
             "venue": trade.venue.value,
         }
         path.parent.mkdir(parents=True, exist_ok=True)

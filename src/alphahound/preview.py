@@ -164,6 +164,7 @@ def _closed_book(store: Store) -> dict[str, Any]:
                 "mcap_entry": round(t.mcap_entry_usd),
                 "mcap_exit": round(t.mcap_exit_usd),
                 "exit_legs": legs_for_display(t),
+                "exit_note": t.notes or "",
             }
             for t in reversed(recent)
         ],
@@ -1040,7 +1041,7 @@ function exitLegsHtml(legs) {
     const amt = l.usd_out != null ? usd(l.usd_out) : (l.size_usd != null ? usd(l.size_usd) : '—');
     const mcap = l.mcap != null ? mcapTxt(l.mcap) : '—';
     const pnl = l.pnl_usd != null ? (' · pnl '+usd(l.pnl_usd)) : '';
-    return '<li>'+clock(l.ts_ms)+' · vendeu '+amt+pnl+' · mcap '+mcap+(l.reason ? ' · '+esc(l.reason) : '')+'</li>';
+    return '<li>'+clock(l.ts_ms)+' · vendeu '+amt+pnl+' · mcap '+mcap+(l.reason ? ' · '+esc(l.reason) : '')+(l.note ? ' · '+esc(l.note) : '')+'</li>';
   }).join('')+'</ul>';
 }
 let lastPnlSig = '';
@@ -1130,6 +1131,7 @@ async function tick() {
     <td>${t.hold_min != null ? mins(t.hold_min) : '—'}</td>
     <td class="muted" title="${esc(t.exit_why||'')}">${t.exit}
       <div class="meta">${esc(t.exit_why||'')}</div>
+      ${t.exit_note ? '<div class="meta">'+esc(t.exit_note)+'</div>' : ''}
       <div class="meta">${clock(t.closed_at_ms)}</div>
       ${exitLegsHtml(t.exit_legs)}
     </td></tr>`, 'none closed', 6);
@@ -1156,7 +1158,7 @@ async function loadReview() {
         ? (usd(r.pnl_usd)+' · '+(r.error_class||''))
         : (r.mfe==null ? '—' : pct(r.mfe));
       const feat = (r.contrib||[]).map(kv => kv[0]+' '+(kv[1]>=0?'+':'')+Number(kv[1]).toFixed(2)).join(' · ') || '—';
-      const why = [r.exit_why, r.error_why, r.reason_why].filter((s,i,a) => s && a.indexOf(s)===i).join(' · ');
+      const why = [r.exit_note, r.exit_why, r.error_why, r.reason_why].filter((s,i,a) => s && a.indexOf(s)===i).join(' · ');
       const soldBits = r.action==='enter'
         ? ('<div class="meta">'+clock(r.closed_at_ms || r.ts_ms)+'</div>'+exitLegsHtml(r.exit_legs))
         : '';

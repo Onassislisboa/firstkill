@@ -1008,9 +1008,15 @@ def _trade(
 
 
 class TestPostmortem(unittest.TestCase):
-    def test_liquidity_drain_is_a_rug(self):
-        trade = _trade(exit_reason=ExitReason.LIQUIDITY_DRAIN)
+    def test_liquidity_drain_is_a_rug_when_it_costs_money(self):
+        trade = _trade(pnl=-20.0, exit_reason=ExitReason.LIQUIDITY_DRAIN)
         self.assertIs(learning.classify(trade, STRATEGY), ErrorClass.RUG)
+
+    def test_winning_liquidity_drain_is_not_a_rug(self):
+        trade = _trade(pnl=+65.0, exit_reason=ExitReason.LIQUIDITY_DRAIN, mfe=0.70)
+        self.assertIs(learning.classify(trade, STRATEGY), ErrorClass.WIN)
+        gave_back = _trade(pnl=+10.0, exit_reason=ExitReason.LIQUIDITY_DRAIN, mfe=2.5)
+        self.assertIs(learning.classify(gave_back, STRATEGY), ErrorClass.EXIT_TOO_FAST)
 
     def test_late_entry_detected_from_the_signal_price_gap(self):
         trade = _trade(entry_price=1.20, signal_price=1.0)
@@ -1248,6 +1254,21 @@ class TestStore(unittest.TestCase):
         self.assertEqual(loaded.symbol, "ODD")
         self.assertAlmostEqual(loaded.mcap_entry_usd, 80_000)
         self.assertAlmostEqual(loaded.mcap_exit_usd, 120_000)
+
+    def test_trade_round_trip_preserves_exit_note(self):
+        trade = _trade()
+        trade.notes = "5m flipped, selling with tape"
+        trade.exit_legs = [
+            {
+                "ts_ms": trade.closed_at_ms,
+                "reason": "thesis_cut",
+                "note": "5m flipped, selling with tape",
+            }
+        ]
+        self.store.record_trade(trade)
+        loaded = self.store.trades()[0]
+        self.assertEqual(loaded.notes, "5m flipped, selling with tape")
+        self.assertEqual(loaded.exit_legs[0]["note"], "5m flipped, selling with tape")
 
     def test_unmeasured_features_survive_a_round_trip_to_the_learner(self):
         # A 0.0 that was never measured must not train the model as if it were
