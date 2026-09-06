@@ -582,6 +582,25 @@ class Store:
         row = self.conn.execute("SELECT COUNT(*) AS n FROM trades").fetchone()
         return int(row["n"])
 
+    def win_count(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM trades WHERE pnl_usd > 0"
+        ).fetchone()
+        return int(row["n"])
+
+    def fees_sum(self) -> float:
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(fees_usd), 0) AS fees FROM trades"
+        ).fetchone()
+        return float(row["fees"])
+
+    def avg_hold_ms(self) -> float | None:
+        row = self.conn.execute(
+            "SELECT AVG(closed_at_ms - opened_at_ms) AS ms FROM trades "
+            "WHERE closed_at_ms > opened_at_ms"
+        ).fetchone()
+        return None if row["ms"] is None else float(row["ms"])
+
     def oldest_close_ms(self) -> int:
         row = self.conn.execute("SELECT MIN(closed_at_ms) AS t FROM trades").fetchone()
         return int(row["t"] or 0)

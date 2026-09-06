@@ -129,6 +129,39 @@ def observe_early(source: str) -> bool:
     return source == "hood_stream"
 
 
+_FLOOR_KINDS = frozenset({"mcap", "volume", "liquidity"})
+
+
+def stamp_live_floors(read: dict, floors: list[str]) -> dict:
+    """Keep cluster/etc vetoes; rewrite mcap/vol/liq from the live quote."""
+    kept = [
+        v
+        for v in (read.get("vetoes") or [])
+        if str(v).split(":", 1)[0] not in _FLOOR_KINDS
+    ]
+    out = {**read, "vetoes": floors + kept}
+    kind = str(out.get("why") or "").split(":", 1)[0]
+    if floors and kind in _FLOOR_KINDS | {"", "ok"}:
+        out["why"] = floors[0]
+        if not out.get("p"):
+            out["explain"] = floors[0]
+    elif kind in _FLOOR_KINDS:
+        out["why"] = kept[0] if kept else "ok"
+        if not out.get("p"):
+            out["explain"] = out["why"]
+    return out
+
+
+def best_setup_p(reads: dict[str, dict], keys: list[str]) -> float:
+    best = 0.0
+    for key in keys:
+        rec = reads.get(key) or {}
+        if rec.get("call") == "skip":
+            continue
+        best = max(best, float(rec.get("p") or 0))
+    return best
+
+
 def early_observe_floors(candidate: Candidate, strategy: Config) -> list[str]:
     """Treat unmeasured mcap/vol as below the buy floor. Detect ≠ eligible.
 
@@ -254,7 +287,6 @@ class Engine:
         self._closed_since_learn = 0
         self._lock: IO[bytes] | None = None
         self._tick_counts: Counter[str] = Counter()
-        self._best_probability = 0.0
         self._last_heartbeat_ms = now_ms()
         self._watch_in = 0
         self._watch_out = 0
@@ -305,7 +337,10 @@ class Engine:
                 ),
             },
         )
-        if not self.registry.attributable_labels:
+        if (
+            not self.registry.attributable_labels
+            and Chain.SOLANA in self.settings.enabled_chains
+        ):
             log.warning(
                 "no terminal fee accounts labeled: attribution features are inert. "
                 "Run `alphahound discover-terminals` to populate them."
@@ -416,7 +451,6 @@ class Engine:
                     {"call": "wait" if observe_early(candidate.source) else "scan"},
                 )
             self.discovery.prune()
-            await self._refresh_watch_quotes()
             self._drop_below_scan_mcap()
             self._drop_unpaid()
             await self.score_and_enter()
@@ -477,6 +511,7 @@ class Engine:
             )
         scan_floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
         visor = [c for c in self.watching.values() if on_scan_visor(c, scan_floor)]
+        visor_keys = [c.key for c in visor]
         write_preview(
             self.settings.state_dir,
             {
@@ -494,7 +529,7 @@ class Engine:
                         "name": c.name or "",
                         "chain": c.chain.value,
                         "address": c.address,
-                        "age_min": int(round(c.age_minutes)),
+                        "age_min": round(c.age_minutes, 1),
                         "mcap": round(c.mcap_usd),
                         "vol5m": round(c.volume_5m_usd),
                         "ret_5m": round(c.ret_5m, 4),
@@ -507,7 +542,10 @@ class Engine:
                         "dex_photo": c.dex_photo,
                         "dex_aligned": c.dex_aligned,
                         "liq": round(c.liquidity_usd),
-                        **(self._reads.get(c.key) or {"call": "scan"}),
+                        **stamp_live_floors(
+                            dict(self._reads.get(c.key) or {"call": "scan"}),
+                            early_observe_floors(c, self.strategy),
+                        ),
                     }
                     for c in sorted(
                         visor,
@@ -521,7 +559,7 @@ class Engine:
                         ),
                     )
                 ],
-                "best_probability": round(self._best_probability, 3),
+                "best_probability": round(best_setup_p(self._reads, visor_keys), 3),
                 "tick": dict(self._tick_counts),
                 "holds": holds,
                 "faults": dict(self._loop_faults),
@@ -541,21 +579,22 @@ class Engine:
         if interval <= 0 or now_ms() - self._last_heartbeat_ms < interval * 1000:
             return
         self._last_heartbeat_ms = now_ms()
+        scan_floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
+        visor = [c for c in self.watching.values() if on_scan_visor(c, scan_floor)]
         log.info(
             "heartbeat",
             extra={
-                "watching": len(self.watching),
+                "watching": len(visor),
                 "watch_in": self._watch_in,
                 "watch_out": self._watch_out,
                 "open": len(self.positions),
                 "equity_usd": round(self.risk.equity(), 2),
                 "since_last": dict(self._tick_counts),
-                "best_probability": round(self._best_probability, 3),
+                "best_probability": round(best_setup_p(self._reads, [c.key for c in visor]), 3),
                 "dead_loops": sorted(self._loop_dead),
             },
         )
         self._tick_counts.clear()
-        self._best_probability = 0.0
 
     # -- positions ---------------------------------------------------------
     async def manage_positions(self) -> None:
@@ -913,16 +952,20 @@ class Engine:
         mint = None if enrichment is None else enrichment.mint
         crowd = {} if enrichment is None else (enrichment.crowd or {})
         tw = {} if enrichment is None else (enrichment.twitter or {})
-        holders = 0
+        holders = None
         rt = None
         if enrichment is not None:
-            holders = int(enrichment.features.holder_count or 0)
+            if "holder_count" not in enrichment.unknown:
+                holders = int(enrichment.features.holder_count or 0)
             rt = round(float(enrichment.features.round_trip_cost or 0.0), 4)
         crowd_ui = {
             k: crowd[k]
             for k in ("kols", "fomo", "whale_n", "whale_pct", "whale_usd")
             if k in crowd
         }
+        explain = why if score.veto_reasons else (
+            self.scorer.explain(score) if score.probability else why
+        )
         return {
             **(score.dist or {}),
             **crowd_ui,
@@ -934,7 +977,7 @@ class Engine:
             "holders": holders,
             "rt": rt,
             "vetoes": list(score.veto_reasons),
-            "explain": self.scorer.explain(score) if score.probability else why,
+            "explain": explain,
             "cert": security_cert(
                 (score.dist or {}).get("label") or "",
                 score.veto_reasons,
@@ -1020,7 +1063,6 @@ class Engine:
 
             self._tick_counts["enriched"] += 1
             score = self.scorer.score(enrichment)
-            self._best_probability = max(self._best_probability, score.probability)
             ok, why = self.scorer.passes(score)
             call = watch_call(vetoed=score.vetoed, ok=ok, reasons=score.veto_reasons)
             self._reads[candidate.key] = self._score_read(

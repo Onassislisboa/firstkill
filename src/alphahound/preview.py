@@ -193,7 +193,9 @@ def _closed_book(store: Store) -> dict[str, Any]:
         return _BOOK[1]
     sample = store.trades(limit=500)
     recent = sample[-40:]
-    hold_ms = [t.closed_at_ms - t.opened_at_ms for t in sample if t.closed_at_ms > t.opened_at_ms]
+    hold_ms = store.avg_hold_ms()
+    closed_n = store.trade_count()
+    wins = store.win_count()
     book = {
         "sold": [
             {
@@ -218,11 +220,11 @@ def _closed_book(store: Store) -> dict[str, Any]:
             }
             for t in reversed(recent)
         ],
-        "wins": sum(1 for t in sample if t.won),
-        "fees": sum(t.fees_usd for t in sample),
-        "avg_hold_min": int(round((sum(hold_ms) / len(hold_ms)) / 60_000)) if hold_ms else None,
+        "wins": wins,
+        "fees": store.fees_sum(),
+        "avg_hold_min": int(round(hold_ms / 60_000)) if hold_ms else None,
         "realized": round(store.realized_pnl(), 2),
-        "closed_n": store.trade_count(),
+        "closed_n": closed_n,
         "pnl_chart": pnl_curves(sample),
         "pnl_windows": pnl_windows(store),
         "sample_n": len(sample),
@@ -270,11 +272,13 @@ def assemble(
         "fees_usd": round(fees, 2),
         "closed": closed_n,
         "wins": wins,
-        "win_rate": round(wins / book["sample_n"], 4) if book["sample_n"] else None,
+        "win_rate": round(wins / closed_n, 4) if closed_n else None,
         "avg_hold_min": avg_hold_min,
         "holding": len(holds),
         "holding_usd": round(sum(float(h.get("held_usd") or h.get("size_usd") or 0) for h in holds), 2),
         "watching": live.get("watching", len(watch)),
+        "watch_in": live.get("watch_in", 0),
+        "watch_out": live.get("watch_out", 0),
         "best_probability": live.get("best_probability", 0.0),
         "tick": live.get("tick") or {},
         "holds": holds,
@@ -579,9 +583,8 @@ const pctFull = n => {
 const esc = s => String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
 const kM = n => {
   n = Math.abs(Number(n)||0);
-  if (n >= 1e6) return (Math.round(n/1e5)/10) + 'M';
-  if (n >= 1e4) return Math.round(n/1000) + 'k';
-  if (n >= 1e3) return (Math.round(n/100)/10) + 'k';
+  if (n >= 1e6) return (n/1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1) + 'k';
   return String(Math.round(n));
 };
 const mcapTxt = n => {
@@ -590,16 +593,17 @@ const mcapTxt = n => {
   if (n >= 1e3) return '$' + (n/1e3).toFixed(1) + 'k';
   return '$' + Math.round(n);
 };
-const pct = n => (n>=0?'+':'') + Math.round(n*100) + '%';
+const pct = n => (n>=0?'+':'') + (Number(n)*100).toFixed(1) + '%';
 const cls = n => n>0?'up':n<0?'dn':'';
 const chainShort = c => ({solana:'SOL', bnb:'BNB', robinhood_chain:'HOOD'}[c] || (c||'').toUpperCase());
 const ageTxt = m => {
   m = Number(m)||0;
   if (m >= 60) {
     const h = m/60;
-    return (h >= 10 ? Math.round(h) : Math.round(h*10)/10) + 'h';
+    return (h >= 10 ? Math.round(h) : (Math.round(h*10)/10)) + 'h';
   }
-  return Math.round(m) + ' min';
+  const t = Math.round(m*10)/10;
+  return (t % 1 ? t.toFixed(1) : String(Math.round(t))) + ' min';
 };
 const certHtml = c => {
   const k = c==='ok'?'cert-ok':c==='no'?'cert-no':'cert-q';
@@ -657,8 +661,8 @@ const sellBtn = (key, sym) => key
   : '';
 let picked = '';
 let lastWatch = [];
-let uniReady = false;
 let inflight = false;
+let queued = false;
 
 function watchKey(w) { return w.chain+':'+w.address; }
 function watchBody(w) {
@@ -761,10 +765,7 @@ function paintWatch(list, running) {
   if (!box) return;
   if (!list.length) {
     const msg = running ? 'scanning…' : 'start the bot';
-    if (!box.querySelector('.wcard')) {
-      const cur = box.querySelector('.muted');
-      if (!cur || cur.textContent !== msg) box.innerHTML = '<div class="muted">'+msg+'</div>';
-    }
+    box.innerHTML = '<div class="muted">'+msg+'</div>';
     return;
   }
   if (box.querySelector('.muted') && !box.querySelector('.wcard')) box.innerHTML = '';
@@ -793,7 +794,7 @@ function fillCoin(el, w) {
   set('liq', usdFull(w.liq));
   set('vol5m', usdFull(w.vol5m));
   set('ret5m', pctFull(w.ret_5m));
-  set('age', (Number(w.age_min)||0).toFixed(2)+' min');
+  set('age', ageTxt(w.age_min));
   set('holders', w.holders==null?'—':numFull(w.holders));
   set('rt', w.rt==null?'—':pctFull(w.rt));
   set('c-score', r.total==null?'—':String(r.total));
@@ -810,12 +811,19 @@ function fillCoin(el, w) {
   set('whales', w.whale_n==null?'—':(numFull(w.whale_n)+' · '+pctFull(w.whale_pct)+' · '+usdFull(w.whale_usd)));
   set('kols', (w.kols&&w.kols.length) ? w.kols.join(', ') : '—');
   set('fomo', (w.fomo&&w.fomo.length) ? w.fomo.join(', ') : '—');
-  const dex = el.querySelector('[data-f="dex"]');
-  if (dex) {
-    dex.className = w.dex_paid ? 'dex-paid' : 'dex-no';
-    const t = w.dex_paid ? 'DEX PAID' : 'NOT DEX';
-    if (dex.textContent !== t) dex.textContent = t;
+  set('dexname', w.dex||'—');
+  set('source', w.source||'—');
+  set('dexpaid', w.dex_paid ? 'yes' : 'no');
+  const badge = el.querySelector('[data-f="dex"]');
+  if (badge) {
+    badge.className = w.dex_paid ? 'dex-paid' : 'dex-no';
+    setNode(badge, w.dex_paid ? 'DEX PAID' : 'NOT DEX');
   }
+  const vetoes = (w.vetoes&&w.vetoes.length) ? w.vetoes : (w.why ? [w.why] : []);
+  const vu = el.querySelector('[data-f="vetoes"]');
+  if (vu) vu.innerHTML = vetoes.map(s => '<li>'+esc(s)+'</li>').join('');
+  const su = el.querySelector('[data-f="signals"]');
+  if (su) su.innerHTML = (w.signals||[]).map(s => '<li>'+esc(s)+'</li>').join('');
 }
 
 function paintCoin(opts) {
@@ -825,7 +833,7 @@ function paintCoin(opts) {
   document.querySelectorAll('#watch .pick').forEach(r => r.classList.toggle('on', r.dataset.pick === picked));
   if (!w) { box.hidden = true; box.innerHTML = ''; box.dataset.pick = ''; return; }
   box.hidden = false;
-  const struct = [picked, w.call, w.cert, w.label, w.address].join('|');
+  const struct = [picked, w.call, w.cert, w.label, w.address, (w.vetoes||[]).join(), w.explain||'', String(w.dex_paid), String(w.holders)].join('|');
   if (box.dataset.pick === picked && box.dataset.struct === struct && box.querySelector('[data-f=mcap]') && !(opts && opts.scroll)) {
     fillCoin(box, w);
     return;
@@ -860,7 +868,7 @@ function paintCoin(opts) {
     + stat('liquidity', 'liq', usdFull(w.liq))
     + stat('vol 5m', 'vol5m', usdFull(w.vol5m))
     + stat('ret 5m', 'ret5m', pctFull(w.ret_5m))
-    + stat('age', 'age', (Number(w.age_min)||0).toFixed(2)+' min')
+    + stat('age', 'age', ageTxt(w.age_min))
     + stat('holders', 'holders', w.holders==null?'—':numFull(w.holders))
     + stat('round trip', 'rt', w.rt==null?'—':pctFull(w.rt))
     + stat('dex', 'dexname', esc(w.dex||'—'))
@@ -885,7 +893,7 @@ function paintCoin(opts) {
     + stat('call', 'call', call)
     + '</div>'
     + '<p data-f="why">'+esc(w.explain || w.why || '')+'</p>'
-    + (vetoes.length ? '<ul>'+vetoes.map(s => '<li>'+esc(s)+'</li>').join('')+'</ul>' : '')
+    + (vetoes.length ? '<ul data-f="vetoes">'+vetoes.map(s => '<li>'+esc(s)+'</li>').join('')+'</ul>' : '<ul data-f="vetoes"></ul>')
     + '</div>'
     + '<p class="wrap">whales <span data-f="whales">'+(w.whale_n==null?'—':(numFull(w.whale_n)+' · '+pctFull(w.whale_pct)+' · '+usdFull(w.whale_usd)))+'</span></p>'
     + '<p class="wrap">kols <span data-f="kols">'+esc(kols)+'</span></p>'
@@ -893,7 +901,7 @@ function paintCoin(opts) {
     + '<p class="wrap">wallets '+esc(wallets)+'</p>'
     + dexLine(w)
     + twBlock(w.tw)
-    + ((w.signals||[]).length ? '<ul>'+(w.signals||[]).map(s => '<li>'+esc(s)+'</li>').join('')+'</ul>' : '')
+    + '<ul data-f="signals">'+(w.signals||[]).map(s => '<li>'+esc(s)+'</li>').join('')+'</ul>'
     + '<p class="muted">Organic não é compra. Bundled = skip. Cabaled na Solana = skip; na Hood o EV desta moeda decide.</p>';
   if (opts && opts.scroll) box.scrollIntoView({behavior:'smooth', block:'nearest'});
 }
@@ -1148,16 +1156,18 @@ function paintPnl(chart) {
 }
 
 async function tick() {
-  if (inflight) return;
+  if (inflight) { queued = true; return; }
   inflight = true;
   let d;
   try { d = await (await fetch('/api?'+Date.now(), {cache:'no-store'})).json(); }
-  catch (err) { $('status').textContent = 'offline'; inflight = false; return; }
+  catch (err) { $('status').textContent = 'offline'; inflight = false; queued = false; return; }
   const live = d.running ? (d.mode || 'run') : 'stopped';
   const halt = d.halted ? (' · paused ' + (d.halt_reason || '')) : '';
   const learn = d.aggressive ? (' · aggressive ' + (d.aggressive_closes||0) + ' closes') : '';
   const dead = (d.dead_loops || []).length ? (' · loop dead ' + d.dead_loops.join(',')) : '';
-  $('status').textContent = live + halt + learn + dead + ' · ' + d.stale_s + 's';
+  $('status').textContent = live + halt + learn + dead
+    + ((d.watch_in||d.watch_out) ? (' · +'+(d.watch_in||0)+'/−'+(d.watch_out||0)) : '')
+    + ' · ' + d.stale_s + 's';
   $('status').className = (d.dead_loops || []).length ? 'dn' : 'muted';
   const fault = $('fault');
   const msgs = Object.entries(d.faults || {}).map(([k,v]) => k + ': ' + v);
@@ -1171,10 +1181,7 @@ async function tick() {
   setText('holding', (d.holding||0) + (d.holding ? '  '+usd(d.holding_usd) : ''), 'n gold');
   setText('watching', String(d.watching||0), 'n cyan');
   paintVerdict(d);
-  if (!uniReady) {
-    $('universe').innerHTML = (d.universe.chains||[]).map(chainCard).join('');
-    uniReady = true;
-  }
+  $('universe').innerHTML = (d.universe.chains||[]).map(chainCard).join('');
   lastWatch = d.watch || [];
   paintWatch(lastWatch, d.running);
   paintCoin();
@@ -1209,6 +1216,7 @@ async function tick() {
   paintPnl(d.pnl_chart);
   paintPnlWindows(d.pnl_windows);
   inflight = false;
+  if (queued) { queued = false; tick(); }
 }
 const OUT_LAB = {fumble:'fumble', rejeicao_correta:'rejeição correta', entrada_correta:'entrada correta',
   entrada_errada:'entrada errada', tracking:'tracking'};

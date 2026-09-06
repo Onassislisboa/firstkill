@@ -1769,6 +1769,7 @@ class TestPlaybook(unittest.TestCase):
         d.strategy = STRATEGY
         d.stats = DiscoveryStats()
         d._seen = {}
+        d._seen_addr = {}
         old = Candidate(
             chain=Chain.SOLANA,
             address="CTPoyCwkjMvoJwU4xvZZqoD8tiYk6yDchySiN5gGpump",
@@ -1783,6 +1784,9 @@ class TestPlaybook(unittest.TestCase):
             source="dexscreener",
         )
         self.assertFalse(d._accept(stale))
+        d._seen_addr["mint"] = now_ms()
+        self.assertFalse(d._pair_unknown("MINT"))
+        self.assertTrue(d._pair_unknown("fresh"))
 
     def test_hood_factory_log_emits_the_non_weth_token(self):
         from alphahound.discovery import (
@@ -2419,6 +2423,32 @@ class TestDeadMcap(unittest.TestCase):
         )
         self.assertFalse(unpaid_for_scan(inspect))
         self.assertTrue(on_scan_visor(inspect, 50_000))
+
+    def test_live_floors_replace_stale_mcap_why(self):
+        from alphahound.engine import best_setup_p, stamp_live_floors
+
+        stale = {
+            "call": "wait",
+            "why": "mcap: 80000 below 100000 floor",
+            "vetoes": ["mcap: 80000 below 100000 floor", "cluster: 37% linked supply"],
+            "p": 0.0,
+        }
+        live = stamp_live_floors(stale, ["mcap: 92000 below 100000 floor"])
+        self.assertEqual(live["why"], "mcap: 92000 below 100000 floor")
+        self.assertTrue(any(v.startswith("mcap: 92000") for v in live["vetoes"]))
+        self.assertTrue(any(v.startswith("cluster:") for v in live["vetoes"]))
+        recovered = stamp_live_floors(live, [])
+        self.assertTrue(recovered["why"].startswith("cluster:"))
+        self.assertEqual(
+            best_setup_p(
+                {
+                    "a": {"call": "skip", "p": 0.9},
+                    "b": {"call": "trade", "p": 0.48},
+                },
+                ["a", "b"],
+            ),
+            0.48,
+        )
 
 
 class TestLpLock(unittest.TestCase):
