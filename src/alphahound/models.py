@@ -274,6 +274,8 @@ class Features:
     volume_z: float = 0.0
     body_ratio: float = 0.0
     parabolic: float = 0.0
+    # 5m turnover × unsigned swing. Score prior only — never a gate.
+    volatility_volume_score: float = 0.0
 
     # --- holders / distribution -------------------------------------------
     holder_count: float = 0.0
@@ -477,6 +479,7 @@ class Position:
     last_hold_rubric: float = 0.0
     last_hold_why: str = ""
     entry_mcap_usd: float = 0.0
+    entry_vol_score: float = 0.0
     exit_legs: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:

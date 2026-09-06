@@ -163,6 +163,11 @@ class Enricher:
         }
         if candidate.pack_role:
             measured.update(pack)
+        vol_score = chart.volatility_volume_score(
+            candidate.volume_5m_usd, candidate.mcap_usd, candidate.ret_5m
+        )
+        if candidate.mcap_usd > 0 and candidate.volume_5m_usd > 0:
+            measured.add("volatility_volume_score")
         result.unknown.update(set(Features.names()) - measured)
         result.features = Features(
             liquidity_usd=candidate.liquidity_usd,
@@ -171,6 +176,7 @@ class Enricher:
             ),
             token_age_minutes=candidate.age_minutes,
             dex_profile=candidate.dex_profile,
+            volatility_volume_score=vol_score,
             **pack,
         )
         return result
@@ -226,25 +232,38 @@ class Enricher:
                 minutes=int(cfg.get("lookback_candles", 30)),
             )
         result.candles = candles
+        vol_5m = candidate.volume_5m_usd
+        mcap = candidate.mcap_usd
+        ret_5m = candidate.ret_5m
         if candles:
-            return chart.extract(candles, cfg)
-
-        # No candle provider. On Solana the trade stream gives us real candles
-        # a few lines further down; everywhere else we fall back to the
-        # aggregate price changes, which are coarse but not wrong.
-        if snap is not None:
+            values = chart.extract(candles, cfg)
+            values["volatility_volume_score"] = chart.volatility_volume_score(
+                vol_5m, mcap, values.get("ret_5m", ret_5m), chart.swing_range_pct(candles)
+            )
+        elif snap is not None:
+            # No candle provider. On Solana the trade stream gives us real candles
+            # a few lines further down; everywhere else we fall back to the
+            # aggregate price changes, which are coarse but not wrong.
             result.unknown.update({"vwap_dev", "atr_pct", "breakout", "volume_z", "body_ratio"})
             result.notes.append("chart from aggregate price changes, no candles")
-            return {
+            values = {
                 "ret_5m": snap.price_change_m5,
                 "ret_15m": snap.price_change_h1,
                 "parabolic": min(
                     1.0,
                     max(0.0, snap.price_change_h1 / float(cfg.get("parabolic_return_threshold", 1.5))),
                 ),
+                "volatility_volume_score": chart.volatility_volume_score(
+                    vol_5m, mcap, snap.price_change_m5
+                ),
             }
-        result.unknown.add("chart")
-        return {}
+        else:
+            result.unknown.add("chart")
+            values = {}
+        if mcap <= 0 or vol_5m <= 0:
+            result.unknown.add("volatility_volume_score")
+            values.pop("volatility_volume_score", None)
+        return values
 
     # -- chain -------------------------------------------------------------
     async def _onchain_features(
@@ -622,7 +641,15 @@ class Enricher:
             )
             if result.candles:
                 values.update(chart.extract(result.candles, self.strategy.section("chart")))
+                values["volatility_volume_score"] = chart.volatility_volume_score(
+                    candidate.volume_5m_usd,
+                    candidate.mcap_usd,
+                    values.get("ret_5m", candidate.ret_5m),
+                    chart.swing_range_pct(result.candles),
+                )
                 result.unknown -= {"vwap_dev", "atr_pct", "breakout", "volume_z", "body_ratio"}
+                if candidate.mcap_usd > 0 and candidate.volume_5m_usd > 0:
+                    result.unknown.discard("volatility_volume_score")
 
         attribution = terminals.attribute(buys, self.registry)
         result.attribution = attribution

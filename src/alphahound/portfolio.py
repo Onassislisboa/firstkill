@@ -18,6 +18,7 @@ from .models import ExitReason, Position, now_ms
 from .playbook import ladder as pb_ladder
 from .playbook import thesis_cut as pb_thesis_cut
 from .settings import Config
+from .signals.chart import tape_cut_ret, trail_pct_for_regime, volatility_volume_score, vol_regime
 from .store import Store
 
 log = get("portfolio")
@@ -38,6 +39,11 @@ class PositionManager:
 
     def _p(self, name: str, default: float) -> float:
         return self.store.param(f"exits.{name}", float(self.strategy.get(f"exits.{name}", default)))
+
+    def _vol_regime(self, position: Position) -> float:
+        c = position.candidate
+        live = volatility_volume_score(c.volume_5m_usd, c.mcap_usd, c.ret_5m)
+        return vol_regime(position.entry_vol_score, live)
 
     def _ladder(self, position: Position) -> list[tuple[float, float]]:
         return pb_ladder(self.strategy, position.candidate.chain)
@@ -107,8 +113,13 @@ class PositionManager:
                 )
             ]
 
+        # -0.12 is the tape *base*. Do not treat a vol-relative widen as a new
+        # threshold — 15–20 thesis_cut notes still gate changing this number.
+        tape_base = -0.12
+        regime = self._vol_regime(position)
         tape = position.candidate.ret_5m
-        if age_minutes >= min_thesis and gain > 0.08 and tape <= -0.12:
+        tape_cut = tape_cut_ret(tape_base, regime)
+        if age_minutes >= min_thesis and gain > 0.08 and tape <= tape_cut:
             return [
                 ExitOrder(1.0, ExitReason.THESIS_CUT, "5m flipped, selling with tape")
             ]
@@ -141,7 +152,7 @@ class PositionManager:
             return orders
 
         if position.trailing_active:
-            trail = self._p("trailing_stop_pct", 0.22)
+            trail = trail_pct_for_regime(self._p("trailing_stop_pct", 0.22), self._vol_regime(position))
             if position.peak_price > 0 and price <= position.peak_price * (1.0 - trail):
                 return [
                     ExitOrder(

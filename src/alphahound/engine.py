@@ -1207,6 +1207,7 @@ class Engine:
             entry_sponsors=list(sponsors or []),
             entry_rubric=float((decision.score.rubric or {}).get("total") or 0.0),
             entry_mcap_usd=candidate.mcap_usd,
+            entry_vol_score=float(decision.features.volatility_volume_score or 0.0),
         )
         self.positions[candidate.key] = position
         self._save_positions()

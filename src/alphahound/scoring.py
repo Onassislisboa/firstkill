@@ -79,6 +79,7 @@ NORMALIZERS: dict[str, object] = {
     "volume_z": lambda x: _clip(x / 3.0),
     "body_ratio": lambda x: _clip(x),
     "parabolic": lambda x: _clip(x, 0.0, 1.0),
+    "volatility_volume_score": lambda x: _clip(x, 0.0, 1.0),
     # distribution
     "holder_count": _log_center(2.0, 1.5),
     "holder_growth_5m": _tanh(0.1),
@@ -150,6 +151,7 @@ PRIOR_WEIGHTS: dict[str, float] = {
     "volume_z": 0.60,
     "body_ratio": 0.40,
     "parabolic": -1.20,
+    "volatility_volume_score": 0.45,
     "holder_count": 0.30,
     "holder_growth_5m": 0.90,
     "top10_pct": -0.90,

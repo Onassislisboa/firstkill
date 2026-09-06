@@ -144,6 +144,55 @@ def body_ratio(candles: list[Candle]) -> float:
     return max(-1.0, min(1.0, (c.close - c.open) / rng))
 
 
+def swing_range_pct(candles: list[Candle], window: int = 15) -> float:
+    """Unsigned high-low span. Distinct from parabolic (close vs window low)."""
+    if len(candles) < 3:
+        return 0.0
+    seg = candles[-min(window, len(candles)) :]
+    hi = max(c.high for c in seg)
+    lo = min(c.low for c in seg)
+    mid = (hi + lo) / 2.0
+    if mid <= 0:
+        return 0.0
+    return (hi - lo) / mid
+
+
+def volatility_volume_score(
+    vol_5m: float, mcap: float, ret_5m: float, range_pct: float = 0.0
+) -> float:
+    """Real tape now: 5m turnover × a little unsigned swing.
+
+    Not −parabolic. Winners entered with ret_5m ~ 0 (dip) and unknown volume_z,
+    so turnover is the term; |ret_5m| only tops up. Scale 0.12 is ~2× the $5k
+    vol / $100k mcap buy floor.
+    """
+    if mcap <= 0 or vol_5m <= 0:
+        return 0.0
+    vol_term = math.tanh((vol_5m / mcap) / 0.12)
+    swing = range_pct if range_pct > 0 else abs(ret_5m)
+    range_term = math.tanh(swing / 0.20)
+    # ponytail: 70% turnover so a high-vol dip still scores; 30% range is heat.
+    return max(0.0, min(1.0, vol_term * (0.70 + 0.30 * range_term)))
+
+
+def vol_regime(*scores: float) -> float:
+    return max(0.0, min(1.0, max((s or 0.0) for s in scores) if scores else 0.0))
+
+
+# Tape/trail bases stay in portfolio/config. These only scale them per token.
+TAPE_VOL_WIDEN = 0.5
+TRAIL_VOL_WIDEN = 0.5
+
+
+def tape_cut_ret(base: float, regime: float) -> float:
+    """More negative when the token's own tape is already violent."""
+    return float(base) * (1.0 + TAPE_VOL_WIDEN * vol_regime(regime))
+
+
+def trail_pct_for_regime(base: float, regime: float) -> float:
+    return float(base) * (1.0 + TRAIL_VOL_WIDEN * vol_regime(regime))
+
+
 def parabolic(candles: list[Candle], window: int, threshold: float) -> float:
     """1.0 when the token has already gone vertical inside the window.
 

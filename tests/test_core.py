@@ -500,6 +500,30 @@ class TestGates(unittest.TestCase):
         self.assertEqual(watch_call(vetoed=False, ok=False, reasons=[]), "wait")
         self.assertEqual(watch_call(vetoed=False, ok=True, reasons=[]), "trade")
 
+    def test_volatility_volume_is_a_prior_not_a_gate(self):
+        from alphahound.models import Features
+        from alphahound.scoring import PRIOR_WEIGHTS, normalize
+        from alphahound.signals.chart import volatility_volume_score
+
+        self.assertIn("volatility_volume_score", Features.names())
+        self.assertGreater(PRIOR_WEIGHTS["volatility_volume_score"], 0.0)
+        self.assertLess(PRIOR_WEIGHTS["volatility_volume_score"], abs(PRIOR_WEIGHTS["parabolic"]))
+        self.assertEqual(PRIOR_WEIGHTS["parabolic"], -1.20)
+        dip = volatility_volume_score(40_000, 100_000, 0.0)
+        ripped = volatility_volume_score(40_000, 100_000, 0.30)
+        quiet = volatility_volume_score(5_000, 100_000, 0.0)
+        self.assertGreater(dip, quiet)
+        self.assertGreater(ripped, dip)
+        self.assertLess(dip / ripped, 1.15)
+        raw = normalize(Features(volatility_volume_score=0.5), unknown=set())
+        missing = normalize(Features(volatility_volume_score=0.5), unknown={"volatility_volume_score"})
+        self.assertAlmostEqual(raw["volatility_volume_score"], 0.5)
+        self.assertEqual(missing["volatility_volume_score"], 0.0)
+        src = Path(__file__).resolve().parents[1] / "src" / "alphahound" / "scoring.py"
+        gates = src.read_text(encoding="utf-8")
+        gate_fn = gates[gates.index("def evaluate_gates") : gates.index("def patience_only")]
+        self.assertNotIn("volatility_volume_score", gate_fn)
+
     def test_hood_official_x_is_not_required(self):
         enr = self.enrichment(twitter_mentions=5.0)
         enr.candidate.chain = Chain.ROBINHOOD_CHAIN
@@ -1058,6 +1082,31 @@ class TestExits(unittest.TestCase):
         self.assertEqual(len(orders), 1)
         self.assertIs(orders[0].reason, ExitReason.THESIS_CUT)
         self.assertIn("tape", orders[0].note)
+
+    def test_hot_tape_waits_past_twelve_percent(self):
+        position = self.position()
+        position.opened_at_ms = now_ms() - 26 * 60_000
+        position.candidate.mcap_usd = 100_000
+        position.candidate.volume_5m_usd = 80_000
+        position.entry_vol_score = 1.0
+        position.candidate.ret_5m = -0.15
+        self.assertEqual(self.manager.evaluate(position, 1.12, 100_000.0), [])
+        position.candidate.ret_5m = -0.20
+        orders = self.manager.evaluate(position, 1.12, 100_000.0)
+        self.assertEqual(len(orders), 1)
+        self.assertIs(orders[0].reason, ExitReason.THESIS_CUT)
+
+    def test_hot_trail_uses_token_regime_not_a_new_base(self):
+        armed = self.position()
+        armed.candidate.mcap_usd = 100_000
+        armed.candidate.volume_5m_usd = 80_000
+        armed.entry_vol_score = 1.0
+        self.manager.evaluate(armed, 1.50, 100_000.0)
+        self.assertTrue(armed.trailing_active)
+        # 25% off 1.50 is inside a hot 22% * 1.5 trail, outside the raw 22%.
+        self.assertEqual(self.manager.evaluate(armed, 1.50 * 0.75, 100_000.0), [])
+        orders = self.manager.evaluate(armed, 1.50 * 0.65, 100_000.0)
+        self.assertIs(orders[0].reason, ExitReason.TRAILING_STOP)
 
     def test_excursions(self):
         position = self.position()
