@@ -218,6 +218,30 @@ class Enricher:
         result.features = Features(**{k: v for k, v in values.items() if k in known})
         return result
 
+    async def rug_probe(self, candidate: Candidate) -> Enrichment:
+        """Launch cluster/LP only. WAIT floors must not skip this or bundled sits on the visor."""
+        result = Enrichment(candidate=candidate, features=Features())
+        values = self._aggregate_only_features(candidate, result)
+        values.update(await self._evm_launch_distribution(candidate, result))
+        values.update(await self._evm_lp_lock(candidate, result))
+        cluster = 0.0
+        holders_ok = result.holders is not None
+        if holders_ok:
+            cluster = result.holders.largest_funding_cluster_pct
+        if self.bubbles and self.bubbles.enabled:
+            bm = await self.bubbles.cluster_pct(candidate.chain, candidate.address)
+            if bm is not None:
+                cluster = max(cluster, bm)
+                holders_ok = True
+        if holders_ok:
+            values["cluster_pct"] = cluster
+            result.unknown.discard("cluster_pct")
+        known = set(Features.names())
+        result.features = Features(**{k: v for k, v in values.items() if k in known})
+        # ponytail: not a full chain read. chain_probed would turn holder/mint
+        # abstentions into live unmeasured vetoes and empty the WAIT lane.
+        return result
+
     # -- chart -------------------------------------------------------------
     async def _chart_features(
         self, candidate: Candidate, snap: PairSnapshot | None, result: Enrichment

@@ -24,11 +24,13 @@ max_candidate_age_minutes = 240
 max_candidates_per_tick = 0
 # How many enrichments run at once. Sequential was one SCAN pill on the visor.
 enrich_concurrency = 4
-# Discovery dumps hundreds of pairs. Cap the visor and skip the rest; vamps
-# drop first, mains stay. Unseen names rotate in next scan.
-max_watching = 40
+# Discovery dumps hundreds of pairs. Cap the visor so wait/skip cannot sit
+# for hours — oldest wait loses the slot, new paid mints get the look.
+max_watching = 12
 # Full enrich this often. Quotes still tick; new coins jump the queue.
-rescore_seconds = 15
+rescore_seconds = 8
+# Bundle/LP skip stays off the visor this long so it cannot steal a card again.
+skip_ban_minutes = 120
 # Below this, skip visor/enrich. Buy floor is playbook copy_min (100k), not this.
 dead_mcap_usd = 50000
 # Proof of life, with a breakdown of what rejected everything. 0 disables.
@@ -112,10 +114,9 @@ mint_suffixes = ["pump"]
 dex_ids = ["fourmeme"]
 
 [launchpads.robinhood_chain]
-# Pons and Pools.trade. Graduates land on Uniswap V4, which Dexscreener labels
-# `uniswap` - on this chain that is the launchpad exit, not a stealth pool.
-# The Robinhood brokerage (majors, US app) is a different product and is off.
-dex_ids = ["pons", "pools", "uniswap"]
+# Pons factory only. Handmade Uniswap pools and Pools.trade are out.
+# A Pons mint that later quotes as `uniswap` keeps dex_id=pons on the visor.
+dex_ids = ["pons"]
 
 
 # ---------------------------------------------------------------------------

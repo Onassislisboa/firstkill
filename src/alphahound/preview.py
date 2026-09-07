@@ -390,7 +390,7 @@ HTML = """<!doctype html>
                      padding: 6px 10px; border-radius: 6px; min-width: 220px; flex: 1; }
   .watch-bar button { font: inherit; background: #1a1a1a; color: #fff; border: 1px solid #333;
                       padding: 6px 12px; cursor: pointer; border-radius: 6px; }
-  .watch-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 8px; }
+  .watch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 6px; }
   .lane { margin: 0 0 16px; padding: 10px 12px 12px; border: 1px solid var(--line); border-radius: 8px; }
   .lane > h1 { margin: 0 0 8px; }
   .lane-hold { border-color: #5a4a18; background: #0c0a04; }
@@ -401,22 +401,22 @@ HTML = """<!doctype html>
   .lane-wait > h1 { color: #ffb020; }
   .lane-skip { border-color: #3a1518; background: #0c0406; }
   .lane-skip > h1 { color: #ff6b7a; }
-  .wcard { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #050505;
-           cursor: pointer; min-height: 186px; contain: layout; }
+  .wcard { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; background: #050505;
+           cursor: pointer; min-height: 0; contain: layout; }
   .wcard.on { border-color: #555; background: #0c0c0c; }
-  .wcard-h { display: flex; justify-content: space-between; align-items: center; gap: 6px; margin-bottom: 4px; }
-  .wcard .mcap { font-size: 22px; font-weight: 800; color: #fff; letter-spacing: -.03em; line-height: 1.1;
-                 font-variant-numeric: tabular-nums; min-width: 6ch; }
-  .wcard .age { font-size: 15px; font-weight: 700; color: #ffd24a; font-variant-numeric: tabular-nums; }
-  .wcard .meta { font-size: 11px; color: var(--muted); margin: 2px 0; }
-  .wcard .kols { font-size: 11px; color: #c8c8c8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .wcard-h { display: flex; justify-content: space-between; align-items: center; gap: 6px; margin-bottom: 2px; }
+  .wcard .mcap { font-size: 16px; font-weight: 800; color: #fff; letter-spacing: -.03em; line-height: 1.1;
+                 font-variant-numeric: tabular-nums; min-width: 5ch; }
+  .wcard .age { font-size: 12px; font-weight: 700; color: #ffd24a; font-variant-numeric: tabular-nums; }
+  .wcard .meta { font-size: 10px; color: var(--muted); margin: 1px 0; }
+  .wcard .kols { font-size: 10px; color: #c8c8c8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .dex-paid { color: #3dff9a; font-weight: 800; letter-spacing: .08em; }
   .dex-no { color: #ff3b4e; font-weight: 800; letter-spacing: .08em; }
   a.xbtn { display: inline-block; margin: 4px 0 2px; padding: 2px 8px; border: 1px solid #333;
            border-radius: 99px; color: #3ad6ff; text-decoration: none; font-size: 11px; font-weight: 700; }
   a.xbtn:hover { border-color: #3ad6ff; color: #fff; }
-  .score { display: flex; align-items: center; gap: 10px; margin: 6px 0 4px; }
-  .score-n { font-size: 28px; font-weight: 800; letter-spacing: -.04em; line-height: 1;
+  .score { display: flex; align-items: center; gap: 8px; margin: 3px 0 2px; }
+  .score-n { font-size: 18px; font-weight: 800; letter-spacing: -.04em; line-height: 1;
              font-variant-numeric: tabular-nums; min-width: 2.2ch; }
   .score-hi .score-n { color: #3dff9a; } .score-mid .score-n { color: #ffd24a; }
   .score-lo .score-n { color: #ff3b4e; }
@@ -582,7 +582,7 @@ HTML = """<!doctype html>
   <p class="muted" style="padding:8px 20px 0">MFE do shadow é o pico na janela, não o close. Dump e flat parecem iguais se não bombou. Clique a linha pras features.</p>
   <section>
     <table id="review" class="book"><thead><tr>
-      <th>quando</th><th>token</th><th>decisão</th><th>p / ev</th><th>resultado</th><th>outcome</th>
+      <th>quando</th><th>token</th><th>1st mcap</th><th>decisão</th><th>p / ev</th><th>resultado</th><th>outcome</th>
     </tr></thead><tbody></tbody></table>
   </section>
 </div>
@@ -713,10 +713,13 @@ function watchBody(w) {
     ? '<span class="pill v-'+w.label+'" data-f="pill"'+(skipHint?' title="'+skipHint+'"':'')+'>'+call.toUpperCase()+' '+w.label+'</span>'
     : '<span class="pill st-'+call+'" data-f="pill">'+call.toUpperCase()+'</span>';
   const whales = '<div class="meta" data-f="whales">'
-    + (w.whale_n == null ? '' : ('whales '+w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0)))
+    + (w.whale_n == null ? 'whales —' : ('whales '+w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0)))
     + '</div>';
   const kols = (w.kols && w.kols.length) ? w.kols.join(', ') : '—';
   const fomo = (w.fomo && w.fomo.length) ? w.fomo.join(', ') : '—';
+  const pev = (w.p != null && Number(w.p) > 0)
+    ? '<div class="meta" data-f="pev">p '+Number(w.p).toFixed(3)+' · EV '+(Number(w.ev)>=0?'+':'')+Number(w.ev).toFixed(3)+'</div>'
+    : '<div class="meta" data-f="pev"></div>';
   return '<div class="wcard-h"><span class="sym" data-f="sym">'+(w.symbol || w.name || caHead(w.address))+'</span>'+copyBtn(w.address)+'</div>'
     + '<div class="wcard-h"><span class="chain">'+chainShort(w.chain)+'</span><span class="age" data-f="age">'+ageTxt(w.age_min)+'</span></div>'
     + '<div class="mcap" data-f="mcap">'+mcapTxt(w.mcap)+'</div>'
@@ -727,7 +730,7 @@ function watchBody(w) {
     + dexLine(w)
     + rubricLine(w.rubric || {})
     + '<div class="meta" data-f="why">'+(w.why && w.why !== 'ok' ? w.why : '')+'</div>'
-    + '<div class="meta" data-f="pev">'+(w.p != null ? ('p '+Number(w.p).toFixed(3)+' · EV '+(Number(w.ev)>=0?'+':'')+Number(w.ev).toFixed(3)) : '')+'</div>'
+    + pev
     + '<div data-f="tw" data-h="'+esc(xHandle(w.tw && w.tw.official)||'')+'">'+twLine(w.tw)+'</div>'
     + '<div data-f="ret" class="'+cls(w.ret_5m)+'">'+pct(w.ret_5m||0)+' · vol '+kM(w.vol5m)+'</div>';
 }
@@ -753,7 +756,7 @@ function fillLive(el, w) {
   set('kols', 'kols '+((w.kols && w.kols.length) ? w.kols.join(', ') : '—'));
   set('fomo', 'fomo '+((w.fomo && w.fomo.length) ? w.fomo.join(', ') : '—'));
   set('why', (w.why && w.why !== 'ok') ? w.why : '');
-  set('whales', w.whale_n == null ? '' : ('whales '+w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0)));
+  set('whales', w.whale_n == null ? 'whales —' : ('whales '+w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0)));
   const cert = el.querySelector('[data-f="cert"]');
   if (cert) {
     const ck = w.cert==='ok'?'cert-ok':w.cert==='no'?'cert-no':'cert-q';
@@ -840,7 +843,7 @@ function paintWatch(list, running) {
     }
     items.forEach(w => {
       const key = watchKey(w);
-      let el = document.querySelector('#tab-watch .wcard[data-pick="'+key.replace(/"/g,'')+'"]');
+      let el = [...document.querySelectorAll('#tab-watch .wcard')].find(n => n.dataset.pick === key);
       const fp = cardFp(w);
       if (!el) {
         el = document.createElement('div');
@@ -1056,7 +1059,7 @@ function paintHoldTable(items) {
   const body = $('holds').querySelector('tbody');
   if (!body) return;
   const lane = body.closest('.lane');
-  if (lane) lane.hidden = !items.length && !lane.querySelector('.wcard');
+  if (lane) lane.hidden = false;
   if (!items.length) {
     const empty = '<tr class="empty"><td class="muted" colspan="7">none open</td></tr>';
     if (body.innerHTML !== empty) body.innerHTML = empty;
@@ -1350,7 +1353,10 @@ async function tick() {
   const uniHtml = (d.universe.chains||[]).map(chainCard).join('');
   if (uni.innerHTML !== uniHtml) uni.innerHTML = uniHtml;
   const incoming = d.watch || [];
-  if (incoming.length || !lastWatch.length || !d.running || !(d.watching > 0)) lastWatch = incoming;
+  // ponytail: a torn preview.json is {} — running/watching both look dead and
+  // used to wipe lastWatch, so WAIT rebuilt every engine write (the blink).
+  if (incoming.length) lastWatch = incoming;
+  else if (d.running && !(d.watching > 0) && (d.stale_s || 0) < 3) lastWatch = incoming;
   paintWatch(lastWatch, d.running);
   paintCoin();
   paintHoldTable(d.holds||[]);
@@ -1397,14 +1403,16 @@ async function loadReview() {
       const soldBits = r.action==='enter'
         ? ('<div class="meta">'+clock(r.closed_at_ms || r.ts_ms)+'</div>'+exitLegsHtml(r.exit_legs))
         : '';
+      const firstM = Number(r.mcap_first)||0;
       return `<tr class="rev-row" data-rev="${i}"><td>${when(r.ts_ms)}</td>
         <td><div class="sym">${esc(r.symbol||caHead(ca))}</div><div class="ca">${chainShort(r.chain||'')} ${esc(caHead(ca))} ${copyBtn(ca)}</div></td>
+        <td>${firstM ? mcapTxt(firstM) : '—'}</td>
         <td>${esc(r.action)}<div class="meta">${esc(r.reason||'')}${r.ticks>1 ? (' · '+r.ticks+' ticks') : ''}</div></td>
         <td>${pct(r.p)} / ${pct(r.ev)}</td>
         <td>${res}${soldBits}</td>
         <td class="out-${esc(r.outcome)}">${OUT_LAB[r.outcome]||r.outcome}</td></tr>
-        <tr class="rev-feat" data-rev-feat="${i}" hidden><td colspan="6">${esc(why ? why+' · ' : '')}${esc(feat)}</td></tr>`;
-    }).join('') || '<tr><td colspan="6" class="muted">vazio</td></tr>';
+        <tr class="rev-feat" data-rev-feat="${i}" hidden><td colspan="7">${esc(why ? why+' · ' : '')}${esc(feat)}</td></tr>`;
+    }).join('') || '<tr><td colspan="7" class="muted">vazio</td></tr>';
     $('review').querySelector('tbody').innerHTML = body;
   } catch (err) {
     $('rev-meta').textContent = 'falhou o review';

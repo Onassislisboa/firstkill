@@ -629,17 +629,23 @@ class TestGates(unittest.TestCase):
         )
         self.assertFalse(launchpad_origin(trump, STRATEGY)[0])
 
-        pons = Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0xabc", dex_id="uniswap")
+        uni = Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0xabc", dex_id="uniswap")
+        self.assertFalse(launchpad_origin(uni, STRATEGY)[0])
+        pons = Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0xabc", dex_id="pons")
         self.assertTrue(launchpad_origin(pons, STRATEGY)[0])
         stream = Candidate(
-            chain=Chain.ROBINHOOD_CHAIN, address="0xabc", source="hood_stream", dex_id=""
+            chain=Chain.ROBINHOOD_CHAIN, address="0xabc", source="hood_stream", dex_id="pons"
         )
         self.assertTrue(launchpad_origin(stream, STRATEGY)[0])
+        handmade_stream = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN, address="0xabc", source="hood_stream", dex_id="uniswap"
+        )
+        self.assertFalse(launchpad_origin(handmade_stream, STRATEGY)[0])
         baby = Candidate(
             chain=Chain.ROBINHOOD_CHAIN,
             address="0xabc",
             source="hood_stream",
-            dex_id="uniswap",
+            dex_id="pons",
             mcap_usd=12_000,
             volume_5m_usd=100,
             liquidity_usd=4_000,
@@ -1297,6 +1303,35 @@ class TestReviewHistory(unittest.TestCase):
         self.assertEqual(fumbles[0]["symbol"], "RUN")
         self.assertEqual(fumbles[0]["contrib"][0][0], "copy_signal")
 
+    def test_review_keeps_first_sight_mcap(self):
+        from alphahound.models import Score
+
+        first = Decision(
+            candidate=Candidate(
+                chain=Chain.SOLANA, address="keep", price_usd=1.0, symbol="KEEP", mcap_usd=55_000
+            ),
+            features=Features(),
+            score=Score(probability=0.2, expected_value=0.0),
+            action=Action.REJECT_GATE,
+            reason="mcap: 55000 below 100000 floor",
+        )
+        later = Decision(
+            candidate=Candidate(
+                chain=Chain.SOLANA, address="keep", price_usd=1.0, symbol="KEEP", mcap_usd=180_000
+            ),
+            features=Features(),
+            score=Score(probability=0.2, expected_value=0.0),
+            action=Action.REJECT_GATE,
+            reason="cluster: 44% linked supply",
+            ts_ms=first.ts_ms + 200_000,
+        )
+        self.store.resolve_shadow(self.store.record_decision(first), 0.01)
+        self.store.resolve_shadow(self.store.record_decision(later), 0.01)
+        rows = [r for r in self.store.review_history()["rows"] if r["symbol"] == "KEEP"]
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["mcap_first"], 55000)
+        self.assertEqual(rows[-1]["mcap_first"], 55000)
+
 
 class TestExitCopy(unittest.TestCase):
     def test_exit_and_gate_copy_match_known_codes(self):
@@ -1933,10 +1968,7 @@ class TestPlaybook(unittest.TestCase):
             },
             weth=weth,
         )
-        self.assertEqual(len(found), 1)
-        self.assertEqual(found[0].address.lower(), meme)
-        self.assertEqual(found[0].source, "hood_stream")
-        self.assertEqual(found[0].dex_id, "uniswap")
+        self.assertEqual(len(found), 0)
 
         pons = candidates_from_hood_log(
             {
@@ -1988,6 +2020,10 @@ class TestPlaybook(unittest.TestCase):
         self.assertFalse(hide_from_visor(["chase: 5m ripped, wait dip"]))
         self.assertFalse(hide_from_visor(["mcap: 90000 below 100000 floor"]))
         self.assertTrue(hide_from_visor(["lp_unlocked: 100% da liquidez livre"]))
+        self.assertTrue(hide_from_visor(["volume: 819 < 5000 (5m)", "cluster: 37% linked supply"]))
+        self.assertFalse(
+            hide_from_visor(["chase: 5m ripped, wait dip", "volume: 2000 < 5000 (5m)"])
+        )
         Engine._assert_loop_helpers(Engine)
 
     def test_public_hood_rpc_has_no_jsonrpc_websocket(self):
@@ -2001,16 +2037,16 @@ class TestPlaybook(unittest.TestCase):
         )
 
     def test_hood_factory_log_uses_block_timestamp_when_present(self):
-        from alphahound.discovery import TOPIC_POOL_CREATED, UNI_V3_FACTORY, candidates_from_hood_log
+        from alphahound.discovery import PONS_FACTORY, TOPIC_TOKEN_LAUNCHED, candidates_from_hood_log
 
         weth = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD97"
         meme = "0xa3602804e096cb73bd8344afc1ff3f3390b899c5"
         pad = lambda a: "0x" + a[2:].lower().rjust(64, "0")
         found = candidates_from_hood_log(
             {
-                "address": UNI_V3_FACTORY,
-                "topics": [TOPIC_POOL_CREATED, pad(weth), pad(meme), "0x" + "0" * 62 + "0bb8"],
-                "data": "0x" + "0" * 64 + "0" * 24 + "b" * 40,
+                "address": PONS_FACTORY,
+                "topics": [TOPIC_TOKEN_LAUNCHED, pad(meme)],
+                "data": "0x",
                 "blockTimestamp": hex(1_700_000_000),
             },
             weth=weth,
@@ -2576,6 +2612,21 @@ class TestDeadMcap(unittest.TestCase):
         self.assertFalse(unpaid_for_scan(inspect))
         self.assertTrue(on_scan_visor(inspect, 50_000))
 
+    def test_skip_call_is_not_a_visor_card(self):
+        from alphahound.engine import visor_card
+
+        c = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            mcap_usd=200_000,
+            dex_paid=True,
+        )
+        reads = {c.key: {"call": "skip", "why": "cluster: 40% linked supply"}}
+        self.assertFalse(visor_card(c, reads, 50_000))
+        reads[c.key]["call"] = "wait"
+        self.assertTrue(visor_card(c, reads, 50_000))
+
     def test_absorb_watch_keeps_quoted_mcap_on_blank_reemit(self):
         from alphahound.engine import absorb_watch
 
@@ -2599,6 +2650,11 @@ class TestDeadMcap(unittest.TestCase):
         self.assertEqual(live.volume_5m_usd, 12000)
         self.assertEqual(live.last_scored_ms, 9)
         self.assertTrue(live.dex_paid)
+        live.dex_id = "pons"
+        blank.dex_id = "uniswap"
+        blank.mcap_usd = 1
+        absorb_watch(live, blank)
+        self.assertEqual(live.dex_id, "pons")
 
     def test_live_floors_replace_stale_mcap_why(self):
         from alphahound.engine import best_setup_p, stamp_live_floors

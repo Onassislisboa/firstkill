@@ -261,7 +261,7 @@ class Discovery:
             pass
 
     async def _hood_stream(self) -> None:
-        """New Hood pools as they land: Uniswap V3 Factory + Pons TokenLaunched.
+        """Pons TokenLaunched only. Handmade Uniswap V3 pools are ignored.
 
         eth_subscribe when the RPC actually speaks JSON-RPC over WebSocket
         (Alchemy/QuickNode). The public Hood RPC is HTTP-only (wss → 400), so
@@ -282,10 +282,7 @@ class Discovery:
             log.warning("pip install 'alphahound[stream]' to enable hood factory subscribe")
             return
 
-        filt = {
-            "address": [UNI_V3_FACTORY, PONS_FACTORY],
-            "topics": [[TOPIC_POOL_CREATED, TOPIC_TOKEN_LAUNCHED]],
-        }
+        filt = {"address": [PONS_FACTORY], "topics": [[TOPIC_TOKEN_LAUNCHED]]}
         backoff = 1.0
         while True:
             try:
@@ -344,8 +341,8 @@ class Discovery:
                     if head >= from_block:
                         logs = await rpc.get_logs(
                             {
-                                "address": [UNI_V3_FACTORY, PONS_FACTORY],
-                                "topics": [[TOPIC_POOL_CREATED, TOPIC_TOKEN_LAUNCHED]],
+                                "address": [PONS_FACTORY],
+                                "topics": [[TOPIC_TOKEN_LAUNCHED]],
                                 "fromBlock": hex(from_block),
                                 "toBlock": hex(head),
                             }
@@ -457,7 +454,7 @@ def _is_quote(address: str, weth: str) -> bool:
 
 
 def candidates_from_hood_log(log: dict, *, weth: str = "") -> list[Candidate]:
-    """Parse Uniswap V3 PoolCreated or Pons TokenLaunched into watch cards."""
+    """Parse Pons TokenLaunched. PoolCreated (own LP) is dropped."""
     topics = [str(t).lower() for t in (log.get("topics") or [])]
     if not topics:
         return []
@@ -479,17 +476,8 @@ def candidates_from_hood_log(log: dict, *, weth: str = "") -> list[Candidate]:
             )
         )
 
-    if topics[0] == TOPIC_POOL_CREATED and len(topics) >= 3:
-        token0, token1 = _topic_addr(topics[1]), _topic_addr(topics[2])
-        data = str(log.get("data") or "").replace("0x", "")
-        pool = ("0x" + data[-40:]) if len(data) >= 40 else str(log.get("address") or "")
-        emit(token0, "uniswap", pool)
-        emit(token1, "uniswap", pool)
-        return out
-    if topics[0] == TOPIC_TOKEN_LAUNCHED and len(topics) >= 2:
-        dex = "pons" if emitter == PONS_FACTORY else "uniswap"
-        emit(_topic_addr(topics[1]), dex)
-        return out
+    if topics[0] == TOPIC_TOKEN_LAUNCHED and emitter == PONS_FACTORY and len(topics) >= 2:
+        emit(_topic_addr(topics[1]), "pons")
     return out
 
 

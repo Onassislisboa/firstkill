@@ -1,7 +1,7 @@
 """Launch origin: launchpad tokens only, per chain.
 
-Solana is pump.fun. BNB is four.meme. Robinhood Chain is Pons (and Pools.trade).
-The brokerage API is a different product and is not a source of candidates.
+Solana is pump.fun. BNB is four.meme. Robinhood Chain is Pons only — not
+Uniswap handmade pools, not Pools.trade. The brokerage API is majors.
 """
 
 from __future__ import annotations
@@ -27,9 +27,10 @@ def launchpad_origin(candidate: Candidate, strategy: Config) -> tuple[bool, str]
             return True, "pump.fun stream"
         return False, "pump.fun stream on a non-solana chain"
     if candidate.source == "hood_stream":
-        if candidate.chain is Chain.ROBINHOOD_CHAIN:
-            return True, "hood factory stream"
-        return False, "hood stream on a non-hood chain"
+        dex = (candidate.dex_id or "").lower()
+        if candidate.chain is Chain.ROBINHOOD_CHAIN and dex in {"", "pons"}:
+            return True, "pons factory"
+        return False, "not a pons launch"
 
     cfg = strategy.section(f"launchpads.{candidate.chain.value}")
     if not cfg:

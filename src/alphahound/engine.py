@@ -123,6 +123,13 @@ def on_scan_visor(candidate: Candidate, floor: float) -> bool:
     return not below_scan_mcap(candidate.mcap_usd, floor)
 
 
+def visor_card(candidate: Candidate, reads: dict, floor: float) -> bool:
+    """Skip/bundle/LP never occupy a card. WAIT floors still do."""
+    if not on_scan_visor(candidate, floor):
+        return False
+    return (reads.get(candidate.key) or {}).get("call") != "skip"
+
+
 def observe_early(source: str) -> bool:
     """On the visor before buy floors. Must still fail prefilter on enter."""
     return source == "hood_stream"
@@ -132,7 +139,9 @@ def absorb_watch(dst: Candidate, src: Candidate) -> None:
     """Keep the visor object. Discovery re-emits a blank mint and would freeze mcap."""
     dst.symbol = src.symbol or dst.symbol
     dst.name = src.name or dst.name
-    dst.dex_id = src.dex_id or dst.dex_id
+    # ponytail: Dexscreener relabels Pons graduates as uniswap; keep origin.
+    if (dst.dex_id or "").lower() != "pons":
+        dst.dex_id = src.dex_id or dst.dex_id
     dst.pool_address = src.pool_address or dst.pool_address
     dst.dex_paid = dst.dex_paid or src.dex_paid
     dst.dex_photo = dst.dex_photo or src.dex_photo
@@ -308,6 +317,7 @@ class Engine:
         self._last_heartbeat_ms = now_ms()
         self._watch_in = 0
         self._watch_out = 0
+        self._skip_ban: dict[str, int] = {}
         self._reads: dict[str, dict] = {}
         self._inflight: set[str] = set()
         self._manual_sell: set[str] = set()
@@ -385,6 +395,8 @@ class Engine:
             raise RuntimeError("buy-floor volume must stay on the visor")
         if not hide_from_visor(["lp_unlocked: 100% da liquidez livre"]):
             raise RuntimeError("hard skip must still hide at ingest")
+        if not hide_from_visor(["volume: 819 < 5000 (5m)", "cluster: 37% linked supply"]):
+            raise RuntimeError("bundle must hide even when a wait floor is also true")
 
     async def _every(self, seconds: float, body, label: str) -> None:
         while not self._stop.is_set():
@@ -453,6 +465,15 @@ class Engine:
                         continue
                     if unpaid_for_scan(candidate):
                         continue
+                ban_ms = int(float(self.strategy.get("loop.skip_ban_minutes", 120)) * 60_000)
+                banned = self._skip_ban.get(candidate.key)
+                if (
+                    ban_ms > 0
+                    and candidate.source != "inspect"
+                    and banned
+                    and now_ms() - banned < ban_ms
+                ):
+                    continue
                 prev = self.watching.get(candidate.key)
                 if prev is not None:
                     absorb_watch(prev, candidate)
@@ -537,7 +558,7 @@ class Engine:
                 }
             )
         scan_floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
-        visor = [c for c in self.watching.values() if on_scan_visor(c, scan_floor)]
+        visor = [c for c in self.watching.values() if visor_card(c, self._reads, scan_floor)]
         visor_keys = [c.key for c in visor]
         write_preview(
             self.settings.state_dir,
@@ -607,7 +628,7 @@ class Engine:
             return
         self._last_heartbeat_ms = now_ms()
         scan_floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
-        visor = [c for c in self.watching.values() if on_scan_visor(c, scan_floor)]
+        visor = [c for c in self.watching.values() if visor_card(c, self._reads, scan_floor)]
         log.info(
             "heartbeat",
             extra={
@@ -1046,14 +1067,31 @@ class Engine:
                         free_vetoes.append(veto)
                         seen.add(kind)
             if free_vetoes and candidate.source != "inspect":
+                if wait_on_visor(free_vetoes):
+                    try:
+                        rug = await self.enricher.rug_probe(candidate)
+                    except Exception:  # noqa: BLE001
+                        rug = cheap
+                    extra = [
+                        v
+                        for v in self.scorer.prefilter(rug)
+                        if v.startswith("cluster:") or v.startswith("bundle:")
+                    ]
+                    merged = list(free_vetoes)
+                    seen = {v.split(":", 1)[0] for v in merged}
+                    for veto in extra:
+                        kind = veto.split(":", 1)[0]
+                        if kind not in seen:
+                            merged.append(veto)
+                            seen.add(kind)
+                    free_vetoes = merged
+                    cheap = rug
                 self._tick_counts[f"free_veto:{free_vetoes[0].split(':')[0]}"] += 1
                 cheap_score = Score(
                     probability=0.0,
                     expected_value=0.0,
                     veto_reasons=free_vetoes,
                 )
-                # First sqlite row is the observation. Later floor waits stay on
-                # the visor without flooding Review every rescore_seconds.
                 if not candidate.last_scored_ms:
                     self._record(
                         candidate,
@@ -1064,7 +1102,10 @@ class Engine:
                         free_vetoes[0],
                         cheap.unknown,
                     )
-                call = "wait" if wait_on_visor(free_vetoes) else "skip"
+                if hide_from_visor(free_vetoes):
+                    self._ban_skip(candidate, free_vetoes[0].split(":")[0])
+                    return None
+                call = "wait"
                 self._reads[candidate.key] = self._score_read(
                     candidate, cheap_score, call, free_vetoes[0], cheap
                 )
@@ -1095,6 +1136,12 @@ class Engine:
                 self._record(
                     candidate, enrichment.features, score, action, 0.0, why, enrichment.unknown
                 )
+                if hide_from_visor(score.veto_reasons) or call == "skip":
+                    self._ban_skip(
+                        candidate,
+                        (score.veto_reasons[0].split(":")[0] if score.veto_reasons else "skip"),
+                    )
+                    return None
                 return None
 
             sizing = self.risk.size(candidate, score, self.scorer.payoff, list(self.positions.values()))
@@ -1389,6 +1436,11 @@ class Engine:
         self.enricher.forget(candidate.key)
         self._tick_counts[tag] += 1
 
+    def _ban_skip(self, candidate: Candidate, tag: str) -> None:
+        if candidate.source != "inspect":
+            self._skip_ban[candidate.key] = now_ms()
+        self._drop_watch(candidate, tag)
+
     def _prune_watching(self) -> None:
         tags = self._retag()
         dying = dump_beta_keys(tags)
@@ -1413,6 +1465,9 @@ class Engine:
                 continue
             if unpaid_for_scan(candidate):
                 self._drop_watch(candidate, "unpaid")
+                continue
+            if (self._reads.get(key) or {}).get("call") == "skip":
+                self._ban_skip(candidate, "skip")
                 continue
             if candidate.pack_role == "vamp":
                 del self.watching[key]
