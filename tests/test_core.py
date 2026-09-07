@@ -1367,8 +1367,80 @@ class TestProviderCache(unittest.TestCase):
         asyncio.run(scenario())
         self.assertEqual(len(http.calls), 2, "a cache hit must not hit the network")
         # The second call asks only for what it is missing.
-        self.assertIn("OTHER", http.calls[1])
-        self.assertNotIn("MINT", http.calls[1].rsplit("/", 1)[-1])
+        self.assertIn("other", http.calls[1].lower())
+        self.assertNotIn("mint", http.calls[1].rsplit("/", 1)[-1].lower())
+
+    def test_token_pairs_cache_ignores_address_case(self):
+        class FakeHttp:
+            def __init__(self):
+                self.calls = 0
+
+            def limit(self, *_args, **_kw):
+                pass
+
+            async def get(self, url, **_kw):
+                self.calls += 1
+                return {
+                    "pairs": [
+                        {
+                            "chainId": "solana",
+                            "baseToken": {"address": "0xAbC", "symbol": "X"},
+                            "priceUsd": "1.0",
+                            "liquidity": {"usd": 50_000},
+                            "marketCap": 80_000,
+                        }
+                    ]
+                }
+
+        http = FakeHttp()
+        dex = Dexscreener(http, cache_seconds=60.0)
+
+        async def scenario():
+            a = await dex.token_pairs(["0xabc"])
+            b = await dex.token_pairs(["0xAbC"])
+            self.assertEqual(len(a), 1)
+            self.assertEqual(len(b), 1)
+            self.assertEqual(a[0].mcap_usd, 80_000)
+
+        asyncio.run(scenario())
+        self.assertEqual(http.calls, 1)
+
+    def test_token_pairs_keeps_last_quote_on_fetch_fail(self):
+        class FakeHttp:
+            def __init__(self):
+                self.n = 0
+
+            def limit(self, *_args, **_kw):
+                pass
+
+            async def get(self, url, **_kw):
+                from alphahound.net import HttpError
+
+                self.n += 1
+                if self.n == 1:
+                    return {
+                        "pairs": [
+                            {
+                                "chainId": "solana",
+                                "baseToken": {"address": "mint", "symbol": "X"},
+                                "priceUsd": "1.0",
+                                "liquidity": {"usd": 50_000},
+                                "marketCap": 90_000,
+                            }
+                        ]
+                    }
+                raise HttpError(429, "slow down", url)
+
+        http = FakeHttp()
+        dex = Dexscreener(http, cache_seconds=0.0)
+
+        async def scenario():
+            first = await dex.token_pairs(["mint"])
+            second = await dex.token_pairs(["mint"])
+            self.assertEqual(first[0].mcap_usd, 90_000)
+            self.assertEqual(second[0].mcap_usd, 90_000)
+
+        asyncio.run(scenario())
 
     def test_stamp_uses_pair_birth_not_visor_arrival(self):
         from alphahound.providers import PairSnapshot, pair_created_ms
@@ -2503,6 +2575,30 @@ class TestDeadMcap(unittest.TestCase):
         )
         self.assertFalse(unpaid_for_scan(inspect))
         self.assertTrue(on_scan_visor(inspect, 50_000))
+
+    def test_absorb_watch_keeps_quoted_mcap_on_blank_reemit(self):
+        from alphahound.engine import absorb_watch
+
+        live = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            mcap_usd=1485629,
+            volume_5m_usd=12000,
+            last_scored_ms=9,
+            dex_paid=True,
+        )
+        blank = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            mcap_usd=0,
+        )
+        absorb_watch(live, blank)
+        self.assertEqual(live.mcap_usd, 1485629)
+        self.assertEqual(live.volume_5m_usd, 12000)
+        self.assertEqual(live.last_scored_ms, 9)
+        self.assertTrue(live.dex_paid)
 
     def test_live_floors_replace_stale_mcap_why(self):
         from alphahound.engine import best_setup_p, stamp_live_floors

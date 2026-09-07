@@ -363,6 +363,8 @@ HTML = """<!doctype html>
   tr.pick { cursor: pointer; }
   tr.pick.on td { background: #0c0c0c; }
   .coin-panel { margin: 0 0 14px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; }
+  #coin[hidden] { display: none !important; margin: 0; padding: 0; border: 0; }
+  .lane[hidden] { display: none !important; }
   .coin-h { display: flex; gap: 14px; flex-wrap: wrap; align-items: baseline; }
   .coin-h .fit { font-size: 28px; font-weight: 800; color: #fff; }
   .coin-h .mcap { font-size: 22px; font-weight: 800; color: #fff; font-variant-numeric: tabular-nums; }
@@ -388,7 +390,7 @@ HTML = """<!doctype html>
                      padding: 6px 10px; border-radius: 6px; min-width: 220px; flex: 1; }
   .watch-bar button { font: inherit; background: #1a1a1a; color: #fff; border: 1px solid #333;
                       padding: 6px 12px; cursor: pointer; border-radius: 6px; }
-  .watch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; }
+  .watch-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 8px; }
   .lane { margin: 0 0 16px; padding: 10px 12px 12px; border: 1px solid var(--line); border-radius: 8px; }
   .lane > h1 { margin: 0 0 8px; }
   .lane-hold { border-color: #5a4a18; background: #0c0a04; }
@@ -448,6 +450,8 @@ HTML = """<!doctype html>
   .out-tracking { color: #5b8cff; }
   main { display: grid; grid-template-columns: 1fr 1fr; }
   main > section:first-child { grid-column: 1 / -1; }
+  #tab-watch main { grid-template-columns: 1fr; }
+  #tab-watch main > section + section { border-left: 0; border-top: 1px solid var(--line); }
   section { padding: 14px 20px; }
   section + section { border-left: 1px solid var(--line); }
   .full { grid-column: 1 / -1; border-top: 1px solid var(--line); border-left: 0 !important; }
@@ -827,6 +831,8 @@ function paintWatch(list, running) {
     if (!box) return;
     const items = groups[lane];
     if (!items.length) return;
+    const laneEl = box.closest('.lane');
+    if (laneEl) laneEl.hidden = false;
     if (box.dataset.empty) {
       box.dataset.empty = '';
       const muted = box.querySelector(':scope > .muted');
@@ -855,7 +861,17 @@ function paintWatch(list, running) {
   ['hold','scan','wait','skip'].forEach(lane => {
     const box = $('watch-'+lane);
     if (!box) return;
-    if (box.querySelector('.wcard')) return;
+    const laneEl = box.closest('.lane');
+    const has = !!box.querySelector('.wcard');
+    if (laneEl && lane !== 'hold') laneEl.hidden = !has;
+    if (has) {
+      box.dataset.empty = '';
+      return;
+    }
+    if (lane === 'hold') {
+      if (box.dataset.empty) { box.innerHTML = ''; box.dataset.empty = ''; }
+      return;
+    }
     const empty = emptyMsg[lane];
     if (box.dataset.empty !== empty) {
       box.dataset.empty = empty;
@@ -1039,6 +1055,8 @@ function fillHoldRow(tr, h) {
 function paintHoldTable(items) {
   const body = $('holds').querySelector('tbody');
   if (!body) return;
+  const lane = body.closest('.lane');
+  if (lane) lane.hidden = !items.length && !lane.querySelector('.wcard');
   if (!items.length) {
     const empty = '<tr class="empty"><td class="muted" colspan="7">none open</td></tr>';
     if (body.innerHTML !== empty) body.innerHTML = empty;

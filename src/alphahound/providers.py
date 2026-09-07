@@ -299,32 +299,45 @@ class Dexscreener:
         now = time.monotonic()
         out: dict[str, PairSnapshot] = {}
         missing: list[str] = []
-        for address in addresses[:30]:
+        want: list[str] = []
+        seen: set[str] = set()
+        for raw in addresses[:30]:
+            address = (raw or "").lower()
+            if not address or address in seen:
+                continue
+            seen.add(address)
+            want.append(address)
             cached = self._cache.get(address)
             if cached is not None and now - cached[0] < self.cache_seconds:
                 out[address] = cached[1]
             else:
                 missing.append(address)
 
+        data: Any = None
         if missing:
             data = await self._get("/latest/dex/tokens/" + ",".join(missing))
             for raw in (data or {}).get("pairs") or []:
                 snap = parse_pair(raw)
                 if snap is None or not snap.token_address:
                     continue
-                current = out.get(snap.token_address)
+                key = snap.token_address.lower()
+                current = out.get(key)
                 if current is None or snap.liquidity_usd > current.liquidity_usd:
-                    out[snap.token_address] = snap
+                    out[key] = snap
             for address in missing:
                 snap = out.get(address)
                 if snap is not None:
                     self._cache[address] = (now, snap)
+                elif data is None:
+                    stale = self._cache.get(address)
+                    if stale is not None:
+                        out[address] = stale[1]
 
         if len(self._cache) > 1024:
             self._cache = {
-                k: v for k, v in self._cache.items() if now - v[0] < self.cache_seconds
+                k: v for k, v in self._cache.items() if now - v[0] < self.cache_seconds * 8
             }
-        return list(out.values())
+        return [out[a] for a in want if a in out]
 
     async def search(self, query: str) -> list[PairSnapshot]:
         data = await self._get("/latest/dex/search", params={"q": query})
@@ -348,17 +361,18 @@ class Dexscreener:
     async def token_is_paid(self, chain: Chain, address: str) -> bool:
         """Profile/boost order, cached. Pair.boosts.active misses paid listings."""
         now = time.monotonic()
-        hit = self._paid.get(address)
+        key = (address or "").lower()
+        hit = self._paid.get(key)
         if hit is not None and now - hit[0] < 45:
             return hit[1]
         slug = DEX_CHAIN_SLUG.get(chain)
-        if not slug or not address:
+        if not slug or not key:
             return False
-        data = await self._get(f"/orders/v1/{slug}/{address}")
+        data = await self._get(f"/orders/v1/{slug}/{key}")
         if data is None:
-            return False
+            return hit[1] if hit is not None else False
         paid = orders_mark_paid(data)
-        self._paid[address] = (now, paid)
+        self._paid[key] = (now, paid)
         return paid
 
     async def boosted(self) -> list[str]:

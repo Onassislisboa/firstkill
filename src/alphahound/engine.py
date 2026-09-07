@@ -128,6 +128,25 @@ def observe_early(source: str) -> bool:
     return source == "hood_stream"
 
 
+def absorb_watch(dst: Candidate, src: Candidate) -> None:
+    """Keep the visor object. Discovery re-emits a blank mint and would freeze mcap."""
+    dst.symbol = src.symbol or dst.symbol
+    dst.name = src.name or dst.name
+    dst.dex_id = src.dex_id or dst.dex_id
+    dst.pool_address = src.pool_address or dst.pool_address
+    dst.dex_paid = dst.dex_paid or src.dex_paid
+    dst.dex_photo = dst.dex_photo or src.dex_photo
+    dst.dex_aligned = dst.dex_aligned or src.dex_aligned
+    if src.mcap_usd > 0:
+        dst.price_usd = src.price_usd or dst.price_usd
+        dst.mcap_usd = src.mcap_usd
+        dst.volume_5m_usd = src.volume_5m_usd
+        dst.liquidity_usd = src.liquidity_usd
+        dst.ret_5m = src.ret_5m
+    if src.created_at_ms and (not dst.created_at_ms or src.created_at_ms < dst.created_at_ms):
+        dst.created_at_ms = src.created_at_ms
+
+
 _FLOOR_KINDS = frozenset({"mcap", "volume", "liquidity"})
 
 
@@ -436,9 +455,8 @@ class Engine:
                         continue
                 prev = self.watching.get(candidate.key)
                 if prev is not None:
-                    candidate.last_scored_ms = prev.last_scored_ms
-                    if observe_early(prev.source):
-                        candidate.source = prev.source
+                    absorb_watch(prev, candidate)
+                    candidate = prev
                 if candidate.pack_role == "vamp":
                     continue
                 if candidate.source != "inspect" and mcap_is_dead(candidate.mcap_usd, dead_floor):
