@@ -1139,12 +1139,20 @@ class Engine:
                 if hide_from_visor(free_vetoes):
                     self._ban_skip(candidate, free_vetoes[0].split(":")[0])
                     return None
-                call = "wait"
-                self._reads[candidate.key] = self._score_read(
-                    candidate, cheap_score, call, free_vetoes[0], cheap
-                )
-                painted = True
-                return None
+                floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
+                if visor_card(
+                    candidate, self._reads, floor, dip_ok=self._floor_dip_ok(candidate, floor)
+                ):
+                    # Paid and above the floor: spend the RPC. Dexscreener-only
+                    # WAIT vetoes must not skip holders/crowd.
+                    pass
+                else:
+                    call = "wait"
+                    self._reads[candidate.key] = self._score_read(
+                        candidate, cheap_score, call, free_vetoes[0], cheap
+                    )
+                    painted = True
+                    return None
 
             try:
                 enrichment = await self.enricher.enrich(candidate, probe_size)

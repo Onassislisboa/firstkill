@@ -606,8 +606,17 @@ class Enricher:
                 result.notes.append(f"holders failed: {exc}")
                 return None
 
-        mint, launch_slot, holders_or_none = await asyncio.gather(
-            mint_job(), launch_job(), holders_job()
+        async def das_job():
+            if not (self.helius and self.helius.enabled):
+                return [], False
+            try:
+                return await self.helius.token_accounts(candidate.address)
+            except Exception as exc:  # noqa: BLE001
+                result.notes.append(f"das holders failed: {exc}")
+                return [], False
+
+        mint, launch_slot, holders_or_none, das_pack = await asyncio.gather(
+            mint_job(), launch_job(), holders_job(), das_job()
         )
         result.mint = mint
         if mint is None:
@@ -633,14 +642,37 @@ class Enricher:
         stats = analyze(holders, now_ms=now_ms(), launch_slot=launch_slot or 0)
         result.holders = stats
 
-        exact_count = None
-        if self.helius and self.helius.enabled:
-            exact_count = await self.helius.holder_count(candidate.address)
+        from ..providers import das_owners
+
+        das_rows, das_complete = das_pack
+        decimals = mint.decimals if mint is not None else 0
+        das_bal = das_owners(das_rows, decimals=decimals)
+        crowd_holders = list(holders)
+        seen_h = {h.address for h in crowd_holders}
+        for owner, bal in das_bal.items():
+            if owner in seen_h:
+                continue
+            crowd_holders.append(
+                Holder(
+                    address=owner,
+                    balance=bal,
+                    is_lp=owner in pool_addresses,
+                    is_deployer=bool(candidate.deployer) and owner == candidate.deployer,
+                )
+            )
+            seen_h.add(owner)
+
+        exact_count = len(das_bal) if das_bal else None
         if exact_count is None:
             result.unknown.add("holder_count")
-            result.notes.append("holder count unknown (no Helius key)")
+            result.notes.append(
+                "holder count unknown"
+                + ("" if self.helius and self.helius.enabled else " (no Helius key)")
+            )
         else:
             stats.holder_count = exact_count
+            if not das_complete:
+                result.notes.append(f"holder count {exact_count}+ (DAS page cap)")
             history = self._holder_history[candidate.key]
             history.append((now_ms(), exact_count))
             del history[:-40]
@@ -713,15 +745,15 @@ class Enricher:
                 "bundle_pct": stats.bundle_pct,
                 "dev_holding_pct": stats.dev_holding_pct,
                 "lp_locked_pct": stats.burned_pct,
-                "known_holder_pct": known_holder_share(holders, smart),
+                "known_holder_pct": known_holder_share(crowd_holders, smart),
             }
         )
         for key in unmeasured_from_stats(stats):
             result.unknown.add(key)
             values.pop(key, None)
         values.setdefault("holder_growth_5m", 0.0)
-        values.update(await self._crowd_features(candidate, holders, trades, result))
-        if "top10_pct" in result.unknown:
+        values.update(await self._crowd_features(candidate, crowd_holders, trades, result))
+        if "top10_pct" in result.unknown and not crowd_holders:
             result.unknown.update(
                 {
                     "fomo_inside",
@@ -774,7 +806,13 @@ class Enricher:
         whale_set = crowd_addresses(self.whale_rows, "whale")
         if size_pct is None:
             size_pct = float(self.strategy.get("whales.size_pct", 0.02))
-        whale = whales.crowd_read(holders, trades, whale_set, size_pct=size_pct)
+        whale = whales.crowd_read(
+            holders,
+            trades,
+            whale_set,
+            size_pct=size_pct,
+            supply=float(getattr(result.mint, "supply", 0.0) or 0.0),
+        )
         kol_map: dict[str, str] = {}
         fomo_map: dict[str, str] = {}
         for row in self.whale_rows:

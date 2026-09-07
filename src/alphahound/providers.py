@@ -395,9 +395,25 @@ class Dexscreener:
         return parse_pair(pairs[0]) if pairs else None
 
 
+def das_owners(rows: list, *, decimals: int = 0) -> dict[str, float]:
+    """Unique wallets from a DAS `token_accounts` page. `total` on that payload
+    is the page size, not the holder count."""
+    scale = 10 ** decimals if decimals else 1.0
+    out: dict[str, float] = {}
+    for row in rows:
+        owner = str((row or {}).get("owner") or "")
+        raw = (row or {}).get("amount") or 0
+        try:
+            amt = float(raw) / scale
+        except (TypeError, ValueError):
+            continue
+        if owner and amt > 0:
+            out[owner] = out.get(owner, 0.0) + amt
+    return out
+
+
 class Helius:
-    """Optional. Used for the one number nothing else gives away for free: the
-    exact holder count."""
+    """DAS token accounts: unique holders and wallets to match KOL/fomo."""
 
     def __init__(self, http: Http, api_key: str) -> None:
         self.http = http
@@ -408,25 +424,49 @@ class Helius:
     def enabled(self) -> bool:
         return bool(self.api_key)
 
+    async def token_accounts(
+        self, mint: str, *, max_pages: int = 4, limit: int = 1000
+    ) -> tuple[list[dict], bool]:
+        """Page DAS `getTokenAccounts`. complete=False means we hit the cap."""
+        if not self.enabled or not mint:
+            return [], False
+        rows: list[dict] = []
+        complete = False
+        for page in range(1, max_pages + 1):
+            try:
+                data = await self.http.post(
+                    self.url,
+                    json_body={
+                        "jsonrpc": "2.0",
+                        "id": "holders",
+                        "method": "getTokenAccounts",
+                        "params": {
+                            "mint": mint,
+                            "page": page,
+                            "limit": limit,
+                            "options": {"showZeroBalance": False},
+                        },
+                    },
+                )
+            except HttpError as exc:
+                log.debug("helius token_accounts failed", extra={"status": exc.status})
+                break
+            result = (data or {}).get("result") or {}
+            batch = result.get("token_accounts") if isinstance(result, dict) else None
+            if not isinstance(batch, list):
+                break
+            rows.extend(row for row in batch if isinstance(row, dict))
+            if len(batch) < limit:
+                complete = True
+                break
+        else:
+            complete = False
+        return rows, complete
+
     async def holder_count(self, mint: str) -> int | None:
-        if not self.enabled:
-            return None
-        try:
-            data = await self.http.post(
-                self.url,
-                json_body={
-                    "jsonrpc": "2.0",
-                    "id": "holders",
-                    "method": "getTokenAccounts",
-                    "params": {"mint": mint, "limit": 1, "options": {"showZeroBalance": False}},
-                },
-            )
-        except HttpError as exc:
-            log.debug("helius holder_count failed", extra={"status": exc.status})
-            return None
-        result = (data or {}).get("result") or {}
-        total = result.get("total")
-        return int(total) if isinstance(total, (int, float)) else None
+        rows, _complete = await self.token_accounts(mint)
+        n = len(das_owners(rows))
+        return n if n else None
 
 
 class Birdeye:

@@ -1752,6 +1752,23 @@ class TestCrowd(unittest.TestCase):
         self.assertEqual(sized.inside, 2)
         self.assertAlmostEqual(sized.hold_pct, 0.90)
 
+        vs_supply = crowd_read(holders, [], set(), size_pct=0.02, supply=10_000)
+        self.assertEqual(vs_supply.inside, 0)
+
+    def test_das_page_total_is_not_holder_count(self):
+        from alphahound.providers import das_owners
+
+        page = [
+            {"owner": "A", "amount": "10"},
+            {"owner": "A", "amount": "5"},
+            {"owner": "B", "amount": "0"},
+            {"owner": "C", "amount": "20"},
+        ]
+        owners = das_owners(page, decimals=0)
+        self.assertEqual(owners["A"], 15.0)
+        self.assertEqual(set(owners), {"A", "C"})
+        self.assertNotEqual(1, len(owners))  # DAS `total: 1` on limit=1 is a lie
+
     def test_fomo_supply_pct_is_a_score_prior_not_a_gate(self):
         from alphahound.models import Features
         from alphahound.scoring import PRIOR_WEIGHTS, normalize

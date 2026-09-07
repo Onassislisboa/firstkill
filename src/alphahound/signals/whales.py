@@ -51,16 +51,19 @@ def crowd_read(
     labeled: set[str],
     *,
     size_pct: float = 0.0,
+    supply: float = 0.0,
 ) -> CrowdRead:
     """Holdings and recent flow for a labeled crowd.
 
     `size_pct` > 0 also treats an unlabeled holder as a whale when they own
     at least that share of circulating supply. Deployer and LP are never the
-    crowd we want to chase.
+    crowd we want to chase. `supply` is mint supply when we have it; without
+    it, % is vs the holder list (top-20 looks like 100% whales).
     """
     labeled_n = {_norm(a) for a in labeled if a}
     circ = [h for h in holders if not (h.is_lp or h.is_burn or h.is_deployer)]
-    total = sum(h.balance for h in circ)
+    listed = sum(h.balance for h in circ)
+    total = supply if supply > 0 else listed
     members: dict[str, float] = {}
     if total > 0:
         for h in circ:
