@@ -2132,6 +2132,34 @@ class TestPlaybook(unittest.TestCase):
         self.assertEqual(stamped.created_at_ms, 1_700_000_000_000)
         self.assertEqual(stamped.discovered_at_ms, 1_700_000_100_000)
 
+    def test_restart_keeps_the_radar_not_just_the_cards(self):
+        from alphahound.engine import keep_on_radar, visor_card
+
+        floor = 50_000
+        # Unquoted Pons launch: no card, but the radar must carry it or the
+        # observe-early queue is wiped on every restart.
+        hood = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            mcap_usd=0.0,
+        )
+        self.assertFalse(visor_card(hood, {}, floor))
+        self.assertTrue(keep_on_radar(hood, {}, floor))
+
+        # Priced under the floor, unpaid, skipped or vamp: gone either way.
+        dead = Candidate(chain=Chain.SOLANA, address="m1", source="pump_stream", mcap_usd=9_000)
+        self.assertFalse(keep_on_radar(dead, {}, floor))
+        unpaid = Candidate(
+            chain=Chain.SOLANA, address="m2", source="dexscreener_boosts", mcap_usd=90_000
+        )
+        self.assertFalse(keep_on_radar(unpaid, {}, floor))
+        unpaid.dex_paid = True
+        self.assertTrue(keep_on_radar(unpaid, {}, floor))
+        self.assertFalse(keep_on_radar(unpaid, {unpaid.key: {"call": "skip"}}, floor))
+        unpaid.pack_role = "vamp"
+        self.assertFalse(keep_on_radar(unpaid, {}, floor))
+
     def test_visor_stale_is_time_on_radar_not_pair_birth(self):
         from alphahound.engine import visor_seen_stale
 
@@ -2148,6 +2176,18 @@ class TestPlaybook(unittest.TestCase):
         self.assertFalse(visor_seen_stale(c, 240, now))
         c.discovered_at_ms = now - 241 * 60_000
         self.assertTrue(visor_seen_stale(c, 240, now))
+
+    def test_heavy_blocks_resend_only_when_they_change(self):
+        from alphahound.preview import HEAVY_KEYS, heavy_sig
+
+        payload = {"watch": [{"mcap": 1}], "sold": [{"pnl": 1}], "fomo": [], "kols": []}
+        sig = heavy_sig(payload)
+        # Same heavy blocks, moving visor: the client's hash still matches.
+        self.assertEqual(sig, heavy_sig({**payload, "watch": [{"mcap": 2}]}))
+        # A closed trade lands: hash moves, so the block is sent again.
+        self.assertNotEqual(sig, heavy_sig({**payload, "sold": [{"pnl": 1}, {"pnl": 2}]}))
+        self.assertIn("sold", HEAVY_KEYS)
+        self.assertNotIn("watch", HEAVY_KEYS)
 
     def test_pnl_curve_sums_per_chain(self):
         from alphahound.preview import pnl_curves

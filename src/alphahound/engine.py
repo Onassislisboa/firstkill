@@ -181,6 +181,24 @@ def keep_unpaid_watch(candidate: Candidate) -> bool:
     return candidate.source == "inspect" or observe_early(candidate.source)
 
 
+def keep_on_radar(candidate: Candidate, reads: dict, floor: float) -> bool:
+    """Radar keep rule, mirroring `_prune_watching`'s drops.
+
+    Wider than `visor_card` on purpose: an unquoted Pons launch has no card but
+    belongs on the radar until Dexscreener prices it. Restoring with the card
+    rule instead wipes that queue on every restart.
+    """
+    if candidate.source == "inspect":
+        return True
+    if (reads.get(candidate.key) or {}).get("call") == "skip":
+        return False
+    if candidate.pack_role == "vamp":
+        return False
+    if drop_for_scan_mcap(candidate, floor):
+        return False
+    return not (unpaid_for_scan(candidate) and not keep_unpaid_watch(candidate))
+
+
 def absorb_watch(dst: Candidate, src: Candidate) -> None:
     """Keep the visor object. Discovery re-emits a blank mint and would freeze mcap."""
     dst.symbol = src.symbol or dst.symbol
@@ -1139,20 +1157,16 @@ class Engine:
                 if hide_from_visor(free_vetoes):
                     self._ban_skip(candidate, free_vetoes[0].split(":")[0])
                     return None
-                floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
-                if visor_card(
-                    candidate, self._reads, floor, dip_ok=self._floor_dip_ok(candidate, floor)
-                ):
-                    # Paid and above the floor: spend the RPC. Dexscreener-only
-                    # WAIT vetoes must not skip holders/crowd.
-                    pass
-                else:
-                    call = "wait"
-                    self._reads[candidate.key] = self._score_read(
-                        candidate, cheap_score, call, free_vetoes[0], cheap
-                    )
-                    painted = True
-                    return None
+                # A buy-floor veto is patience, not a verdict. Enriching here
+                # would collect quality vetoes the coin cannot answer yet and
+                # `_ban_skip` would hide it for skip_ban_minutes, emptying the
+                # wait lane. Full chain reads start once it clears the floors.
+                call = "wait"
+                self._reads[candidate.key] = self._score_read(
+                    candidate, cheap_score, call, free_vetoes[0], cheap
+                )
+                painted = True
+                return None
 
             try:
                 enrichment = await self.enricher.enrich(candidate, probe_size)
@@ -1676,9 +1690,7 @@ class Engine:
                 call = "wait"
             rec = {k: v for k, v in row.items() if k not in {"chain", "address"}}
             rec["call"] = call
-            if candidate.source != "inspect" and not visor_card(
-                candidate, {candidate.key: rec}, floor
-            ):
+            if not keep_on_radar(candidate, {candidate.key: rec}, floor):
                 continue
             self.watching[candidate.key] = candidate
             self._reads.setdefault(candidate.key, rec)

@@ -7,6 +7,7 @@ stays current without another data API.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +32,10 @@ from .store import Store
 
 PREVIEW_NAME = "preview.json"
 WATCHING_NAME = "watching.json"
+# Closed trades and the wallet lists are ~50 of the 60 KB /api used to resend
+# 2.5x a second while only `watch` moved. The client echoes back the hash it
+# already holds and these are dropped from the reply when they still match.
+HEAVY_KEYS = ("sold", "fomo", "kols", "universe", "pnl_chart", "pnl_windows")
 SELL_QUEUE = "sell.json"
 POSITIONS_FILE = "positions.json"
 
@@ -170,6 +175,17 @@ def watch_row_to_candidate(row: dict[str, Any]) -> Candidate | None:
     )
 
 
+def heavy_sig(payload: dict[str, Any]) -> str:
+    """Fingerprint of the slow-moving blocks, so a client can say it has them."""
+    blob = json.dumps(
+        {k: payload.get(k) for k in HEAVY_KEYS},
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.blake2s(blob.encode(), digest_size=8).hexdigest()
+
+
 def universe(settings: Settings | None, strategy: Config | None) -> dict[str, Any]:
     if settings is None or strategy is None:
         return {"mode": "", "chains": []}
@@ -235,13 +251,16 @@ def pnl_windows(store: Store, now: int | None = None) -> dict[str, Any]:
             "history_days": hist_days if partial else (min(hist_days, span_days) if span_days else hist_days),
         }
 
+    # Quantized: a boundary that slides every millisecond makes this block look
+    # new on every /api poll, which is how a static 14 KB got resent 2.5x a second.
+    edge = now - now % 60_000
     return {
         "history_days": hist_days,
         "windows": [
             pack("hoje", utc_day_start_ms(now / 1000.0)),
-            pack("7d", now - 7 * _DAY_MS, 7),
-            pack("15d", now - 15 * _DAY_MS, 15),
-            pack("30d", now - 30 * _DAY_MS, 30),
+            pack("7d", edge - 7 * _DAY_MS, 7),
+            pack("15d", edge - 15 * _DAY_MS, 15),
+            pack("30d", edge - 30 * _DAY_MS, 30),
         ],
     }
 
@@ -766,6 +785,7 @@ let picked = '';
 let lastWatch = [];
 let inflight = false;
 let queued = false;
+let heavySig = '';
 
 function watchKey(w) { return w.chain+':'+w.address; }
 function watchBody(w) {
@@ -1391,8 +1411,10 @@ async function tick() {
   if (inflight) { queued = true; return; }
   inflight = true;
   let d;
-  try { d = await (await fetch('/api?'+Date.now(), {cache:'no-store'})).json(); }
+  try { d = await (await fetch('/api?h='+heavySig+'&_='+Date.now(), {cache:'no-store'})).json(); }
   catch (err) { $('status').textContent = 'offline'; inflight = false; queued = false; return; }
+  // Blocks absent from the reply are the ones we already hold unchanged.
+  heavySig = d.heavy_sig || '';
   const live = d.running ? (d.mode || 'run') : 'stopped';
   const halt = d.halted ? (' · paused ' + (d.halt_reason || '')) : '';
   const learn = d.aggressive ? (' · aggressive ' + (d.aggressive_closes||0) + ' closes') : '';
@@ -1413,9 +1435,11 @@ async function tick() {
   setText('holding', (d.holding||0) + (d.holding ? '  '+usd(d.holding_usd) : ''), 'n gold');
   setText('watching', String(d.watching||0), 'n cyan');
   paintVerdict(d);
-  const uni = $('universe');
-  const uniHtml = (d.universe.chains||[]).map(chainCard).join('');
-  if (uni.innerHTML !== uniHtml) uni.innerHTML = uniHtml;
+  if (d.universe) {
+    const uni = $('universe');
+    const uniHtml = (d.universe.chains||[]).map(chainCard).join('');
+    if (uni.innerHTML !== uniHtml) uni.innerHTML = uniHtml;
+  }
   const incoming = d.watch || [];
   // Keep the last non-empty paint. Empty watch + watching=0 is Hood unpaid on
   // radar / a torn file — wiping lastWatch blanks Sol cards the operator still has.
@@ -1423,7 +1447,7 @@ async function tick() {
   paintWatch(lastWatch, d.running);
   paintCoin();
   paintHoldTable(d.holds||[]);
-  rows($('sold'), d.sold||[], t => `<tr>
+  if (d.sold) rows($('sold'), d.sold, t => `<tr>
     <td>
       <div class="sym">${t.symbol || caHead((t.key||'').split(':')[1])}</div>
       <div class="ca">${chainShort(t.chain||'')} · ${caHead((t.key||'').split(':')[1])} ${copyBtn((t.key||'').split(':')[1])}</div>
@@ -1438,10 +1462,10 @@ async function tick() {
       <div class="meta">${clock(t.closed_at_ms)}</div>
       ${exitLegsHtml(t.exit_legs)}
     </td></tr>`, 'none closed', 6);
-  paintKols(d.kols);
-  paintFomo(d.fomo);
-  paintPnl(d.pnl_chart);
-  paintPnlWindows(d.pnl_windows);
+  if (d.kols) paintKols(d.kols);
+  if (d.fomo) paintFomo(d.fomo);
+  if (d.pnl_chart) paintPnl(d.pnl_chart);
+  if (d.pnl_windows) paintPnlWindows(d.pnl_windows);
   inflight = false;
   if (queued) { queued = false; tick(); }
 }
@@ -1499,10 +1523,15 @@ def serve(
     settings: Settings | None = None,
     strategy: Config | None = None,
 ) -> None:
-    def snapshot() -> bytes:
+    def snapshot(client_sig: str = "") -> bytes:
         # Reuse the process Store. Opening sqlite on every /api poll made the
         # visor hitch and fight the engine for preview.json.
-        return json.dumps(assemble(state_dir, store, equity, settings, strategy)).encode()
+        payload = assemble(state_dir, store, equity, settings, strategy)
+        payload["heavy_sig"] = sig = heavy_sig(payload)
+        if client_sig and client_sig == sig:
+            for key in HEAVY_KEYS:
+                payload.pop(key, None)
+        return json.dumps(payload).encode()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:
@@ -1534,7 +1563,7 @@ def serve(
                 return
             if parsed.path == "/api":
                 try:
-                    body = snapshot()
+                    body = snapshot((parse_qs(parsed.query).get("h") or [""])[0])
                 except Exception as exc:  # noqa: BLE001
                     body = json.dumps({"error": str(exc)}).encode()
                     self.send_response(500)
