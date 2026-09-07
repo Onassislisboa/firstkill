@@ -365,8 +365,7 @@ shadow_track_minutes = 180
 
 
 # ---------------------------------------------------------------------------
-# Per-chain playbooks. Hood is the live venue; Solana/BNB stay in the file
-# but ENABLED_CHAINS should be robinhood_chain until Sol recovers.
+# Per-chain playbooks. Solana is pump.fun, BNB is four.meme, Hood is Pons.
 # ---------------------------------------------------------------------------
 [playbooks.solana]
 # Coins die in minutes and vamps are everywhere. Short window, tight cluster.

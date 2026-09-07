@@ -739,6 +739,14 @@ class Enricher:
                 "whale_net_flow",
             ):
                 values.pop(key, None)
+            # No holder list (RPC 429) means blind, not clean. "whales 0" on the
+            # card reads as measured-and-empty, so publish nothing instead.
+            result.crowd = {
+                **(result.crowd or {}),
+                "whale_n": None,
+                "whale_pct": None,
+                "whale_usd": None,
+            }
         return values
 
     def _known_wallets(self, chain: Chain) -> set[str]:

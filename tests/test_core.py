@@ -630,7 +630,7 @@ class TestGates(unittest.TestCase):
         self.assertFalse(launchpad_origin(trump, STRATEGY)[0])
 
         uni = Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0xabc", dex_id="uniswap")
-        self.assertFalse(launchpad_origin(uni, STRATEGY)[0])
+        self.assertTrue(launchpad_origin(uni, STRATEGY)[0])
         pons = Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0xabc", dex_id="pons")
         self.assertTrue(launchpad_origin(pons, STRATEGY)[0])
         stream = Candidate(
@@ -1981,6 +1981,19 @@ class TestPlaybook(unittest.TestCase):
         self.assertEqual(pons[0].address.lower(), meme)
         self.assertEqual(pons[0].dex_id, "pons")
 
+        from alphahound.discovery import PONS_V2_FACTORY, TOPIC_TOKEN_LAUNCHED_V2
+
+        v2 = candidates_from_hood_log(
+            {
+                "address": PONS_V2_FACTORY,
+                "topics": [TOPIC_TOKEN_LAUNCHED_V2, pad(meme), pad("0x" + "2" * 40), pad("0x" + "3" * 40)],
+                "data": "0x",
+            },
+            weth=weth,
+        )
+        self.assertEqual(v2[0].address.lower(), meme)
+        self.assertEqual(v2[0].dex_id, "pons")
+
     def test_hood_stream_is_observe_not_a_buy_bypass(self):
         from alphahound.engine import early_observe_floors, observe_early
 
@@ -2054,13 +2067,70 @@ class TestPlaybook(unittest.TestCase):
         self.assertEqual(found[0].created_at_ms, 1_700_000_000_000)
 
     def test_erc20_string_decode(self):
-        from alphahound.execution.evm import decode_erc20_string
+        from alphahound.execution.evm import decode_erc20_string, pons_registered
 
         # dynamic ABI string "PEPE"
         raw = "0x" + "0" * 62 + "20" + "0" * 62 + "04" + "50455045" + "0" * 56
         self.assertEqual(decode_erc20_string(raw), "PEPE")
         self.assertEqual(decode_erc20_string("0x" + "57455448".ljust(64, "0")), "WETH")
         self.assertEqual(decode_erc20_string("0x"), "")
+        # Live Pons V2: word 0 is the mint, 15 static words, last word is `exists`.
+        mint = "0x83f46adf291ca7d4c7ffd42f77f8ea59e96d4bd8"
+        words = ["0" * 64] * 15
+        words[0] = mint.removeprefix("0x").rjust(64, "0")
+        words[14] = "0" * 63 + "1"
+        self.assertTrue(pons_registered("0x" + "".join(words), mint))
+        # Unknown mint returns an all-zero struct, whatever the field count.
+        self.assertFalse(pons_registered("0x" + "0" * 64 * 15, mint))
+        self.assertFalse(pons_registered("0x" + "0" * 64 * 13, mint))
+        # A struct for a different mint is not a match.
+        other = ["0" * 64] * 15
+        other[0] = ("b" * 40).rjust(64, "0")
+        self.assertFalse(pons_registered("0x" + "".join(other), mint))
+        self.assertFalse(pons_registered("0x", mint))
+
+    def test_watch_row_survives_restart(self):
+        from alphahound.preview import watch_row_to_candidate
+
+        row = {
+            "chain": "solana",
+            "address": "CTALnV64vd1dkMxvtsuBgoYVhzB8tZ1XyRQFNS3ppump",
+            "symbol": "TRONK",
+            "age_min": 84.5,
+            "mcap": 1280957,
+            "vol5m": 8201,
+            "dex": "pumpswap",
+            "source": "dexscreener_boosts",
+            "dex_paid": True,
+        }
+        c = watch_row_to_candidate(row)
+        self.assertIsNotNone(c)
+        self.assertEqual(c.symbol, "TRONK")
+        self.assertTrue(c.dex_paid)
+        self.assertGreater(c.created_at_ms, 0)
+
+        stamped = watch_row_to_candidate(
+            {**row, "created_at_ms": 1_700_000_000_000, "discovered_at_ms": 1_700_000_100_000}
+        )
+        self.assertEqual(stamped.created_at_ms, 1_700_000_000_000)
+        self.assertEqual(stamped.discovered_at_ms, 1_700_000_100_000)
+
+    def test_visor_stale_is_time_on_radar_not_pair_birth(self):
+        from alphahound.engine import visor_seen_stale
+
+        now = 1_800_000_000_000
+        c = Candidate(
+            chain=Chain.SOLANA,
+            address="CTALnV64vd1dkMxvtsuBgoYVhzB8tZ1XyRQFNS3ppump",
+            source="dexscreener_boosts",
+            created_at_ms=now - 300 * 60_000,
+            discovered_at_ms=now - 2 * 60_000,
+            mcap_usd=1_200_000,
+            dex_paid=True,
+        )
+        self.assertFalse(visor_seen_stale(c, 240, now))
+        c.discovered_at_ms = now - 241 * 60_000
+        self.assertTrue(visor_seen_stale(c, 240, now))
 
     def test_pnl_curve_sums_per_chain(self):
         from alphahound.preview import pnl_curves
@@ -2590,7 +2660,7 @@ class TestDeadMcap(unittest.TestCase):
         self.assertTrue(drop_for_scan_mcap(ds, 50_000))
 
     def test_unpaid_dex_stays_off_the_visor(self):
-        from alphahound.engine import on_scan_visor, unpaid_for_scan
+        from alphahound.engine import keep_unpaid_watch, on_scan_visor, unpaid_for_scan
 
         raw = Candidate(
             chain=Chain.ROBINHOOD_CHAIN,
@@ -2600,6 +2670,7 @@ class TestDeadMcap(unittest.TestCase):
         )
         self.assertTrue(unpaid_for_scan(raw))
         self.assertFalse(on_scan_visor(raw, 50_000))
+        self.assertTrue(keep_unpaid_watch(raw))
         raw.dex_paid = True
         self.assertFalse(unpaid_for_scan(raw))
         self.assertTrue(on_scan_visor(raw, 50_000))
@@ -2611,6 +2682,73 @@ class TestDeadMcap(unittest.TestCase):
         )
         self.assertFalse(unpaid_for_scan(inspect))
         self.assertTrue(on_scan_visor(inspect, 50_000))
+        ds = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xaaa",
+            source="dexscreener_profiles",
+            mcap_usd=80_000,
+        )
+        self.assertFalse(keep_unpaid_watch(ds))
+
+    def test_stale_quote_keeps_the_card_but_a_small_mint_never_gets_one(self):
+        from alphahound.engine import floor_dip_ok, visor_card
+
+        now = 1_800_000_000_000
+        # Was above the floor 5s ago: one zero/stale quote keeps the card.
+        self.assertTrue(floor_dip_ok(now - 5_000, 45, now))
+        self.assertFalse(floor_dip_ok(now - 60_000, 45, now))
+        # Never above the floor (HLK at 26k) gets no grace.
+        self.assertFalse(floor_dip_ok(0, 45, now))
+
+        sol = Candidate(
+            chain=Chain.SOLANA,
+            address="CTALnV64vd1dkMxvtsuBgoYVhzB8tZ1XyRQFNS3ppump",
+            source="dexscreener_boosts",
+            mcap_usd=0.0,
+            dex_paid=True,
+        )
+        self.assertTrue(visor_card(sol, {}, 50_000, dip_ok=True))
+        self.assertFalse(visor_card(sol, {}, 50_000))
+        # Priced below the floor: no grace is granted, so no card either.
+        sol.mcap_usd = 40_000
+        self.assertFalse(visor_card(sol, {}, 50_000))
+
+        # A Pons launch waits on the radar until it is priced at or above the floor.
+        hood = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            mcap_usd=0.0,
+        )
+        self.assertFalse(visor_card(hood, {}, 50_000))
+        hood.mcap_usd = 26_000
+        self.assertFalse(visor_card(hood, {}, 50_000))
+        hood.mcap_usd = 74_000
+        self.assertFalse(visor_card(hood, {}, 50_000))
+        hood.dex_paid = True
+        self.assertTrue(visor_card(hood, {}, 50_000))
+        # Skip still never occupies a card.
+        self.assertFalse(visor_card(hood, {hood.key: {"call": "skip"}}, 50_000))
+
+    def test_overflow_keeps_visor_over_unpaid_hood(self):
+        from alphahound.engine import watch_keep_key
+
+        sol = Candidate(
+            chain=Chain.SOLANA,
+            address="CTALnV64vd1dkMxvtsuBgoYVhzB8tZ1XyRQFNS3ppump",
+            source="dexscreener_boosts",
+            mcap_usd=1_200_000,
+            dex_paid=True,
+        )
+        hood = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            mcap_usd=0.0,
+            dex_paid=False,
+        )
+        reads: dict = {}
+        self.assertLess(watch_keep_key(sol, reads, 50_000), watch_keep_key(hood, reads, 50_000))
 
     def test_skip_call_is_not_a_visor_card(self):
         from alphahound.engine import visor_card

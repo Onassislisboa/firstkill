@@ -26,11 +26,17 @@ def launchpad_origin(candidate: Candidate, strategy: Config) -> tuple[bool, str]
         if candidate.chain is Chain.SOLANA:
             return True, "pump.fun stream"
         return False, "pump.fun stream on a non-solana chain"
-    if candidate.source == "hood_stream":
+    if candidate.chain is Chain.ROBINHOOD_CHAIN:
         dex = (candidate.dex_id or "").lower()
-        if candidate.chain is Chain.ROBINHOOD_CHAIN and dex in {"", "pons"}:
-            return True, "pons factory"
-        return False, "not a pons launch"
+        if candidate.source == "hood_stream":
+            if dex in {"", "pons"}:
+                return True, "pons factory"
+            return False, "not a pons launch"
+        # Pons V1 seeds a Uniswap V3 pool; Dexscreener labels that `uniswap`.
+        # The engine confirms the mint on the Pons factory before it sits.
+        if dex in {"pons", "uniswap"}:
+            return True, "hood pons venue"
+        return False, f"handmade pool on {dex or 'unknown'}"
 
     cfg = strategy.section(f"launchpads.{candidate.chain.value}")
     if not cfg:

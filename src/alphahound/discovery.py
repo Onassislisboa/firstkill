@@ -282,7 +282,10 @@ class Discovery:
             log.warning("pip install 'alphahound[stream]' to enable hood factory subscribe")
             return
 
-        filt = {"address": [PONS_FACTORY], "topics": [[TOPIC_TOKEN_LAUNCHED]]}
+        filt = {
+            "address": [PONS_FACTORY, PONS_V2_FACTORY],
+            "topics": [[TOPIC_TOKEN_LAUNCHED, TOPIC_TOKEN_LAUNCHED_V2]],
+        }
         backoff = 1.0
         while True:
             try:
@@ -332,19 +335,22 @@ class Discovery:
         log.info("hood stream polling factory logs")
         try:
             while True:
+                caught_up = True
                 try:
                     head = int(await rpc.call("eth_blockNumber", []), 16)
                     if from_block is None:
-                        from_block = max(0, head - 2)
+                        from_block = max(0, head - HOOD_LOG_CHUNK)
                     if head < from_block:
                         from_block = head
                     if head >= from_block:
+                        to_block = min(head, from_block + HOOD_LOG_CHUNK - 1)
+                        caught_up = to_block >= head
                         logs = await rpc.get_logs(
                             {
-                                "address": [PONS_FACTORY],
-                                "topics": [[TOPIC_TOKEN_LAUNCHED]],
+                                "address": [PONS_FACTORY, PONS_V2_FACTORY],
+                                "topics": [[TOPIC_TOKEN_LAUNCHED, TOPIC_TOKEN_LAUNCHED_V2]],
                                 "fromBlock": hex(from_block),
-                                "toBlock": hex(head),
+                                "toBlock": hex(to_block),
                             }
                         )
                         stamps: dict[int, int] = {}
@@ -373,7 +379,7 @@ class Discovery:
                         if len(seen) > 4000:
                             for old in list(seen)[:2000]:
                                 del seen[old]
-                        from_block = head + 1
+                        from_block = to_block + 1
                     backoff = 1.0
                 except asyncio.CancelledError:
                     raise
@@ -382,7 +388,8 @@ class Discovery:
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
                     continue
-                await asyncio.sleep(1.0)
+                if caught_up:
+                    await asyncio.sleep(1.0)
         finally:
             if owned:
                 await http.aclose()
@@ -391,8 +398,11 @@ class Discovery:
 # Uniswap V3 factory + Pons launch factory, chain 4663.
 UNI_V3_FACTORY = "0x1f7d7550b1b028f7571e69a784071f0205fd2efa"
 PONS_FACTORY = "0xa5aab3f0c6eeadf30ef1d3eb997108e976351feb"
+PONS_V2_FACTORY = "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e"
 TOPIC_POOL_CREATED = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118"
 TOPIC_TOKEN_LAUNCHED = "0xdb51ea9ad51ab453a65a4cb7e60c3cb378c9501bb002609f8f97778fb6c4235a"
+TOPIC_TOKEN_LAUNCHED_V2 = "0x8d4aad4953d0ca700d468f3753aa14432d1b35b43ec6409f051fb6aa43a89607"
+HOOD_LOG_CHUNK = 400
 
 
 def _hood_jsonrpc_ws(http_rpc: str) -> str | None:
@@ -476,7 +486,11 @@ def candidates_from_hood_log(log: dict, *, weth: str = "") -> list[Candidate]:
             )
         )
 
-    if topics[0] == TOPIC_TOKEN_LAUNCHED and emitter == PONS_FACTORY and len(topics) >= 2:
+    if (
+        topics[0] in {TOPIC_TOKEN_LAUNCHED, TOPIC_TOKEN_LAUNCHED_V2}
+        and emitter in {PONS_FACTORY, PONS_V2_FACTORY}
+        and len(topics) >= 2
+    ):
         emit(_topic_addr(topics[1]), "pons")
     return out
 

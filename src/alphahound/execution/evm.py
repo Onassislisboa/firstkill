@@ -38,6 +38,11 @@ SEL_BALANCE_OF = "0x70a08231"
 SEL_TOTAL_SUPPLY = "0x18160ddd"
 SEL_NAME = "0x06fdde03"
 SEL_SYMBOL = "0x95d89b41"
+SEL_GET_LAUNCHED_TOKEN = "0x3cf28b5a"
+PONS_FACTORIES = (
+    "0xa5aab3f0c6eeadf30ef1d3eb997108e976351feb",
+    "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e",
+)
 SEL_APPROVE = "0x095ea7b3"
 SEL_ALLOWANCE = "0xdd62ed3e"
 MAX_UINT256 = (1 << 256) - 1
@@ -53,6 +58,20 @@ def _pad_address(address: str) -> str:
 
 def _pad_uint(value: int) -> str:
     return f"{value:064x}"
+
+
+def pons_registered(raw: str, token: str) -> bool:
+    """Pons getLaunchedToken: word 0 is the mint itself, all-zero when unknown.
+
+    Field count differs per factory (V1 returns 13 words, V2 returns 15), so
+    match the address instead of indexing a bool — the layout moved once and a
+    field index silently rejected every real launch.
+    """
+    h = (raw or "").removeprefix("0x")
+    want = (token or "").lower().removeprefix("0x")
+    if len(h) < 64 or not want:
+        return False
+    return h[:64] == want.rjust(64, "0")
 
 
 def decode_erc20_string(raw: str) -> str:
@@ -100,8 +119,30 @@ class EvmRpc:
     async def eth_call(self, to: str, data: str) -> str:
         return await self.call("eth_call", [{"to": to, "data": data}, "latest"])
 
-    async def erc20_labels(self, token: str) -> tuple[str, str]:
-        """Ticker then name. Visor title before Dexscreener has indexed the pair."""
+    async def pons_token_exists(self, token: str) -> bool | None:
+        """True registered, False on no factory, None when the RPC never answered.
+
+        None matters: the public Hood RPC 429s, and answering False there would
+        cache a real Pons launch as a handmade pool.
+        """
+        payload = SEL_GET_LAUNCHED_TOKEN + _pad_address(token)
+        errors = 0
+        for factory in PONS_FACTORIES:
+            try:
+                raw = await self.eth_call(factory, payload)
+            except Exception:  # noqa: BLE001
+                errors += 1
+                continue
+            if pons_registered(raw, token):
+                return True
+        return None if errors == len(PONS_FACTORIES) else False
+
+    async def erc20_labels(self, token: str) -> tuple[str, str] | None:
+        """Ticker then name, or None when the RPC never answered.
+
+        None instead of ("", "") so the caller can retry: a rate-limited read
+        is not proof the token has no name.
+        """
         import asyncio
 
         try:
@@ -110,7 +151,7 @@ class EvmRpc:
                 self.eth_call(token, SEL_NAME),
             )
         except Exception:  # noqa: BLE001
-            return "", ""
+            return None
         return decode_erc20_string(str(sym_raw or "")), decode_erc20_string(str(name_raw or ""))
 
     async def decimals(self, token: str) -> int:

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .models import Chain, now_ms, describe_error, describe_exit, legs_for_display
+from .models import Candidate, Chain, now_ms, describe_error, describe_exit, legs_for_display
 from .playbook import max_age_minutes
 from .risk import RiskEngine, utc_day_start_ms
 from .settings import (
@@ -30,6 +30,7 @@ from .settings import (
 from .store import Store
 
 PREVIEW_NAME = "preview.json"
+WATCHING_NAME = "watching.json"
 SELL_QUEUE = "sell.json"
 POSITIONS_FILE = "positions.json"
 
@@ -82,28 +83,91 @@ def enqueue_manual_sell(state_dir: Path, needle: str) -> dict[str, Any]:
     return {"ok": True, "queued": True, "key": key, "symbol": hit["symbol"]}
 
 
-def write_preview(state_dir: Path, payload: dict[str, Any]) -> None:
-    path = state_dir / PREVIEW_NAME
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     blob = json.dumps(payload, separators=(",", ":"))
     tmp = path.with_suffix(".tmp")
     tmp.write_text(blob, encoding="utf-8")
-    try:
-        tmp.replace(path)
-    except PermissionError:
-        # ponytail: Windows holds preview.json while the HTTP handler reads it.
-        path.write_text(blob, encoding="utf-8")
-        tmp.unlink(missing_ok=True)
+    for attempt in range(4):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            # Windows blocks the rename while a reader holds the file. Wait it
+            # out: the non-atomic fallback below is what readers see as torn
+            # JSON, and a torn read used to blank the visor.
+            time.sleep(0.02 * (attempt + 1))
+    path.write_text(blob, encoding="utf-8")
+    tmp.unlink(missing_ok=True)
+
+
+def write_preview(state_dir: Path, payload: dict[str, Any]) -> None:
+    _atomic_json(state_dir / PREVIEW_NAME, payload)
+
+
+def write_watching(state_dir: Path, payload: dict[str, Any]) -> None:
+    """Full radar, not visor-filtered. preview.json watch can be empty while these stay."""
+    _atomic_json(state_dir / WATCHING_NAME, payload)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    """One retry: a half-written snapshot is transient, an empty dict is not."""
+    for attempt in range(2):
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            if attempt == 0:
+                time.sleep(0.03)
+                continue
+            return {}
+        return data if isinstance(data, dict) else {}
+    return {}
 
 
 def read_preview(state_dir: Path) -> dict[str, Any]:
-    path = state_dir / PREVIEW_NAME
-    if not path.exists():
-        return {}
+    return _read_json(state_dir / PREVIEW_NAME)
+
+
+def read_watching(state_dir: Path) -> dict[str, Any]:
+    return _read_json(state_dir / WATCHING_NAME)
+
+
+def watch_row_to_candidate(row: dict[str, Any]) -> Candidate | None:
+    """Rebuild a visor card after an engine restart."""
+    chain_s = str(row.get("chain") or "")
+    address = str(row.get("address") or "")
+    if not chain_s or not address:
+        return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (ValueError, OSError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        chain = Chain(chain_s)
+    except ValueError:
+        return None
+    age_min = float(row.get("age_min") or 0.0)
+    created = int(row.get("created_at_ms") or 0)
+    if not created and age_min > 0:
+        created = now_ms() - int(age_min * 60_000)
+    discovered = int(row.get("discovered_at_ms") or 0) or now_ms()
+    return Candidate(
+        chain=chain,
+        address=address,
+        symbol=str(row.get("symbol") or ""),
+        name=str(row.get("name") or ""),
+        created_at_ms=created,
+        discovered_at_ms=discovered,
+        mcap_usd=float(row.get("mcap") or 0.0),
+        volume_5m_usd=float(row.get("vol5m") or 0.0),
+        liquidity_usd=float(row.get("liq") or 0.0),
+        ret_5m=float(row.get("ret_5m") or 0.0),
+        source=str(row.get("source") or "dexscreener"),
+        dex_id=str(row.get("dex") or ""),
+        pack_role=str(row.get("role") or ""),
+        pack_stem=str(row.get("stem") or ""),
+        pack_size=int(row.get("pack") or 1),
+        dex_paid=bool(row.get("dex_paid")),
+        dex_photo=bool(row.get("dex_photo")),
+        dex_aligned=bool(row.get("dex_aligned")),
+    )
 
 
 def universe(settings: Settings | None, strategy: Config | None) -> dict[str, Any]:
@@ -1353,10 +1417,9 @@ async function tick() {
   const uniHtml = (d.universe.chains||[]).map(chainCard).join('');
   if (uni.innerHTML !== uniHtml) uni.innerHTML = uniHtml;
   const incoming = d.watch || [];
-  // ponytail: a torn preview.json is {} — running/watching both look dead and
-  // used to wipe lastWatch, so WAIT rebuilt every engine write (the blink).
+  // Keep the last non-empty paint. Empty watch + watching=0 is Hood unpaid on
+  // radar / a torn file — wiping lastWatch blanks Sol cards the operator still has.
   if (incoming.length) lastWatch = incoming;
-  else if (d.running && !(d.watching > 0) && (d.stale_s || 0) < 3) lastWatch = incoming;
   paintWatch(lastWatch, d.running);
   paintCoin();
   paintHoldTable(d.holds||[]);
