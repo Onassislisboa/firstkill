@@ -422,6 +422,7 @@ class Engine:
         self.watching: dict[str, Candidate] = {}
         self._positions_path = settings.state_dir / "positions.json"
         self._closed_since_learn = 0
+        self._resolved_since_learn = 0
         self._lock: IO[bytes] | None = None
         self._tick_counts: Counter[str] = Counter()
         self._last_heartbeat_ms = now_ms()
@@ -977,6 +978,7 @@ class Engine:
             self.store.resolve_shadow(
                 row["decision_id"], (best / entry - 1.0) if entry > 0 else 0.0
             )
+            self._resolved_since_learn += 1
 
         if not live_rows:
             return
@@ -1412,9 +1414,13 @@ class Engine:
         if not self.strategy.get("learning.enabled", True):
             return
         cadence = int(self.strategy.get("learning.retrain_every_closed_trades", 10))
-        if self._closed_since_learn < cadence:
+        if (
+            self._closed_since_learn < cadence
+            and self._resolved_since_learn < cadence
+        ):
             return
         self._closed_since_learn = 0
+        self._resolved_since_learn = 0
 
         rolled_back = learning.check_rollback(self.store, self.strategy)
         report = learning.run_postmortem(self.store, self.strategy)

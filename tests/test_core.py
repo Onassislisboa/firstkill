@@ -1278,6 +1278,50 @@ class TestSelfTuning(unittest.TestCase):
         self.assertFalse(result.trained)
         self.assertIn("keeping prior weights", result.note)
 
+    def test_training_uses_score_shadows_not_safety_vetoes(self):
+        from alphahound.models import Action, Decision
+
+        feat = Features(copy_signal=1.0, retail_share_delta_5m=0.8)
+        for i in range(40):
+            decision = Decision(
+                candidate=Candidate(chain=Chain.SOLANA, address=f"s{i}", price_usd=1.0),
+                features=feat,
+                score=Score(probability=0.39, expected_value=0.02),
+                action=Action.REJECT_SCORE,
+                reason=f"probability 0.39{i % 9} < 0.420",
+            )
+            self.store.resolve_shadow(self.store.record_decision(decision), 0.80)
+        for i in range(40):
+            skip = Decision(
+                candidate=Candidate(chain=Chain.SOLANA, address=f"t{i}", price_usd=1.0),
+                features=feat,
+                score=Score(probability=0.0, expected_value=0.0),
+                action=Action.REJECT_GATE,
+                reason="top10: 62% unknown",
+            )
+            self.store.resolve_shadow(self.store.record_decision(skip), 0.90)
+        self.assertTrue(learning.shadow_teaches_score("reject_score", "probability 0.4 < 0.42"))
+        self.assertTrue(learning.shadow_teaches_score("reject_gate", "chase: 5m ripped"))
+        self.assertFalse(learning.shadow_teaches_score("reject_gate", "top10: cabaled"))
+        result = learning.train(self.store, STRATEGY)
+        self.assertTrue(result.trained)
+        self.assertEqual(result.samples, 40)
+
+    def test_filter_cost_groups_probability_rejects(self):
+        from alphahound.models import Action, Decision
+
+        for i in range(12):
+            decision = Decision(
+                candidate=Candidate(chain=Chain.SOLANA, address=f"p{i}", price_usd=1.0),
+                features=Features(),
+                score=Score(probability=0.39, expected_value=0.02),
+                action=Action.REJECT_SCORE,
+                reason=f"probability 0.39{i} < 0.420",
+            )
+            self.store.resolve_shadow(self.store.record_decision(decision), 0.80)
+        costs = {c.gate: c for c in learning.filter_cost(self.store)}
+        self.assertEqual(costs["probability"].rejected, 12)
+
     def test_filter_cost_surfaces_expensive_gates(self):
         from alphahound.models import Action, Decision
 
