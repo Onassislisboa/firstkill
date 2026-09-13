@@ -92,6 +92,13 @@ def enrich_due(last_scored_ms: int, now: int, ttl_ms: int) -> bool:
     return last_scored_ms <= 0 or ttl_ms <= 0 or now - last_scored_ms >= ttl_ms
 
 
+def score_ttl_ms(call: str, base_ttl_ms: int, skip_ttl_ms: int) -> int:
+    """Skip already paid for a full chain read. Quote loop still prices the card."""
+    if call == "skip":
+        return max(base_ttl_ms, skip_ttl_ms)
+    return base_ttl_ms
+
+
 def mcap_is_dead(mcap_usd: float, floor: float) -> bool:
     return floor > 0 and 0 < mcap_usd < floor
 
@@ -1036,6 +1043,7 @@ class Engine:
 
         # Every visor card gets a note. Halt only blocks the fill, not the grade.
         ttl_ms = int(float(self.strategy.get("loop.rescore_seconds", 15)) * 1000)
+        skip_ttl_ms = int(float(self.strategy.get("gates.bundle_cache_seconds", 60)) * 1000)
         scan_floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
         ranked = [
             c
@@ -1043,7 +1051,18 @@ class Engine:
             if c.key not in self.positions
             and c.key not in self._inflight
             and self.router.has_venue(c.chain)
-            and (c.source == "inspect" or enrich_due(c.last_scored_ms, now, ttl_ms))
+            and (
+                c.source == "inspect"
+                or enrich_due(
+                    c.last_scored_ms,
+                    now,
+                    score_ttl_ms(
+                        str((self._reads.get(c.key) or {}).get("call") or ""),
+                        ttl_ms,
+                        skip_ttl_ms,
+                    ),
+                )
+            )
             and on_scan_visor(c, scan_floor)
         ]
 

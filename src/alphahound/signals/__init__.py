@@ -344,9 +344,13 @@ class Enricher:
             values = {}
         else:
             result.unknown.discard("lp_locked_pct")
+        # ponytail: locked stays locked on this probe. Re-read sooner if we
+        # start seeing unlock-and-rug after a 95% lock print.
+        ttl_ms = 300_000 if probe.ok and probe.locked_pct >= 0.95 else None
         self._evm_put(
             f"lp:{candidate.key}",
             {"values": values, "note": probe.note, "unknown": not probe.ok},
+            ttl_ms=ttl_ms,
         )
         return values
 
@@ -356,8 +360,13 @@ class Enricher:
             return None
         return hit[1]
 
-    def _evm_put(self, key: str, payload: dict[str, Any]) -> None:
-        ttl = int(float(self.strategy.get("gates.bundle_cache_seconds", 60)) * 1000)
+    def _chain_ttl_ms(self) -> int:
+        return int(float(self.strategy.get("gates.bundle_cache_seconds", 60)) * 1000)
+
+    def _evm_put(
+        self, key: str, payload: dict[str, Any], *, ttl_ms: int | None = None
+    ) -> None:
+        ttl = self._chain_ttl_ms() if ttl_ms is None else ttl_ms
         self._evm_cache[key] = (now_ms() + max(0, ttl), payload)
 
     async def _evm_launch_distribution(
@@ -577,11 +586,19 @@ class Enricher:
         pool_addresses = {candidate.pool_address} if candidate.pool_address else set()
 
         async def mint_job():
+            hit = self._evm_cached(f"sol:mint:{candidate.key}")
+            if hit is not None:
+                return hit.get("mint")
             try:
-                return await self.solana.mint_info(candidate.address)
+                mint = await self.solana.mint_info(candidate.address)
             except Exception as exc:  # noqa: BLE001
                 result.notes.append(f"mint_info failed: {exc}")
                 return None
+            if mint is not None:
+                # ponytail: revoked stays revoked. Still-live authority rechecks on TTL.
+                ttl = 86_400_000 if mint.authorities_revoked else None
+                self._evm_put(f"sol:mint:{candidate.key}", {"mint": mint}, ttl_ms=ttl)
+            return mint
 
         async def launch_job():
             cached = self._launch_slots.get(candidate.address)
@@ -595,8 +612,11 @@ class Enricher:
             return slot
 
         async def holders_job():
+            hit = self._evm_cached(f"sol:h:{candidate.key}")
+            if hit is not None:
+                return hit.get("holders")
             try:
-                return await self.solana.largest_holders(
+                holders = await self.solana.largest_holders(
                     candidate.address,
                     pool_addresses=pool_addresses,
                     deployer=candidate.deployer,
@@ -605,15 +625,26 @@ class Enricher:
             except Exception as exc:  # noqa: BLE001
                 result.notes.append(f"holders failed: {exc}")
                 return None
+            if holders is not None:
+                self._evm_put(f"sol:h:{candidate.key}", {"holders": holders})
+            return holders
 
         async def das_job():
             if not (self.helius and self.helius.enabled):
                 return [], False
+            hit = self._evm_cached(f"sol:das:{candidate.key}")
+            if hit is not None:
+                return hit.get("rows") or [], bool(hit.get("complete"))
             try:
-                return await self.helius.token_accounts(candidate.address)
+                pack = await self.helius.token_accounts(candidate.address)
             except Exception as exc:  # noqa: BLE001
                 result.notes.append(f"das holders failed: {exc}")
                 return [], False
+            self._evm_put(
+                f"sol:das:{candidate.key}",
+                {"rows": pack[0], "complete": pack[1]},
+            )
+            return pack
 
         mint, launch_slot, holders_or_none, das_pack = await asyncio.gather(
             mint_job(), launch_job(), holders_job(), das_job()
@@ -681,13 +712,23 @@ class Enricher:
         trades: list[flow.Trade] = []
         buys: list[terminals.BuyerTx] = []
         source = candidate.pool_address or candidate.address
-        try:
-            trades, buys = await self.solana.recent_activity(
-                source, candidate.address, candidate.price_usd, max_txs=max_txs
-            )
-        except Exception as exc:  # noqa: BLE001
-            result.notes.append(f"activity failed: {exc}")
-            result.unknown.update({"retail_share", "bot_share", "axiom_share"})
+        act = self._evm_cached(f"sol:act:{candidate.key}")
+        if act is not None:
+            trades = list(act.get("trades") or [])
+            buys = list(act.get("buys") or [])
+        else:
+            try:
+                trades, buys = await self.solana.recent_activity(
+                    source, candidate.address, candidate.price_usd, max_txs=max_txs
+                )
+                self._evm_put(
+                    f"sol:act:{candidate.key}",
+                    {"trades": trades, "buys": buys},
+                    ttl_ms=max(15_000, self._chain_ttl_ms() // 3),
+                )
+            except Exception as exc:  # noqa: BLE001
+                result.notes.append(f"activity failed: {exc}")
+                result.unknown.update({"retail_share", "bot_share", "axiom_share"})
         result.trades = trades
 
         if not result.candles and trades:
@@ -1100,8 +1141,8 @@ class Enricher:
     def forget(self, key: str) -> None:
         self.shares.forget(key)
         self._holder_history.pop(key, None)
-        self._evm_cache.pop(f"dist:{key}", None)
-        self._evm_cache.pop(f"crowd:{key}", None)
+        for prefix in ("dist", "crowd", "lp", "sol:mint", "sol:h", "sol:das", "sol:act"):
+            self._evm_cache.pop(f"{prefix}:{key}", None)
 
     def exit_tape(self, candidate: Candidate) -> dict[str, float]:
         """Volume/holder slope at this tick. Entry features are stale by exit."""

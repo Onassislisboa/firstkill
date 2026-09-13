@@ -40,7 +40,7 @@ from alphahound.models import (  # noqa: E402
     legs_for_display,
     now_ms,
 )
-from alphahound.engine import enrich_due, loop_bug  # noqa: E402
+from alphahound.engine import enrich_due, loop_bug, score_ttl_ms  # noqa: E402
 from alphahound.portfolio import PositionManager, banked_from_peak  # noqa: E402
 from alphahound.risk import RiskEngine, kelly_fraction, mcap_position_pct  # noqa: E402
 from alphahound.scoring import (  # noqa: E402
@@ -75,6 +75,33 @@ class TestEnrichDue(unittest.TestCase):
     def test_skips_until_ttl(self):
         self.assertFalse(enrich_due(1_000, 10_000, 15_000))
         self.assertTrue(enrich_due(1_000, 20_000, 15_000))
+
+    def test_skip_call_uses_longer_ttl(self):
+        self.assertEqual(score_ttl_ms("skip", 8_000, 60_000), 60_000)
+        self.assertEqual(score_ttl_ms("scan", 8_000, 60_000), 8_000)
+        self.assertEqual(score_ttl_ms("wait", 8_000, 60_000), 8_000)
+
+
+class TestWalletAgeCache(unittest.TestCase):
+    def test_second_fill_does_not_rpc(self):
+        from alphahound.signals.solana import SolanaReader
+
+        reader = SolanaReader.__new__(SolanaReader)
+        reader.commitment = "confirmed"
+        reader._first_seen = {}
+        calls: list[str] = []
+
+        async def rpc(method, _params):
+            calls.append(method)
+            return [{"blockTime": 1_700_000_000}]
+
+        reader._rpc = rpc
+        first = Holder("Wallet111111111111111111111111111111111", 1.0)
+        asyncio.run(reader._fill_wallet_ages([first]))
+        again = Holder("Wallet111111111111111111111111111111111", 2.0)
+        asyncio.run(reader._fill_wallet_ages([again]))
+        self.assertEqual(calls, ["getSignaturesForAddress"])
+        self.assertEqual(again.first_seen_ms, 1_700_000_000_000)
 
 
 class TestLoopBug(unittest.TestCase):

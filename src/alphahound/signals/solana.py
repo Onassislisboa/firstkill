@@ -95,6 +95,8 @@ class SolanaReader:
         host = urlsplit(rpc_url).netloc
         if host:
             http.limit(host, rate_per_sec=rate_per_sec, burst=max(2, int(rate_per_sec)))
+        # ponytail: first-seen never gets younger. 0 = not fresh (≥200 sigs).
+        self._first_seen: dict[str, int] = {}
 
     async def _rpc(self, method: str, params: list) -> object:
         self._id += 1
@@ -225,7 +227,17 @@ class SolanaReader:
         first-transaction endpoint.
         """
 
+        ages = getattr(self, "_first_seen", None)
+        if ages is None:
+            self._first_seen = {}
+            ages = self._first_seen
+
         async def one(holder: Holder) -> None:
+            cached = ages.get(holder.address)
+            if cached is not None:
+                if cached:
+                    holder.first_seen_ms = cached
+                return
             try:
                 result = await self._rpc(
                     "getSignaturesForAddress",
@@ -235,10 +247,12 @@ class SolanaReader:
                 return
             sigs = result if isinstance(result, list) else []
             if not sigs or len(sigs) >= 200:
+                ages[holder.address] = 0
                 return
             oldest = sigs[-1].get("blockTime")
             if oldest:
                 holder.first_seen_ms = int(oldest) * 1000
+                ages[holder.address] = holder.first_seen_ms
 
         await gather_ok(*(one(h) for h in holders))
 
