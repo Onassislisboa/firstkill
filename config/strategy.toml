@@ -27,6 +27,8 @@ enrich_concurrency = 4
 # Discovery dumps hundreds of pairs. Cap visor *cards* at this N. Unquoted
 # Hood waits sit in a separate pool of the same size, so they cannot eat cards.
 max_watching = 12
+# Wait/skip this long then drop — new mints get the slot. 0 = off.
+max_wait_minutes = 20
 # Full enrich this often. Quotes still tick; new coins jump the queue.
 rescore_seconds = 8
 # Bundle/LP skip stays off the visor this long so it cannot steal a card again.

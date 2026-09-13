@@ -411,8 +411,9 @@ def evaluate_gates(
     # is UNKNOWN wallets stacking circulating supply: that is a rug. LP and
     # burn are already excluded from top1/top10 in distribution.analyze.
     # Labeled Fomo/KOL inside is the explanation the top10 check is looking for.
-    # Without this, a coin stuffed with fomo.json wallets still dies as "unknown".
-    covered = _sponsored(enr)
+    # Size-whales and copy_signal from their flow do NOT count: mikedyson
+    # bought at top10 61% because unlabeled whale_net_flow set covered=True.
+    covered = _labeled_inside(enr)
     unknown_whale = (
         not covered
         and f.top1_pct > p("max_unknown_top1_pct", 0.50)
@@ -515,7 +516,7 @@ def evaluate_gates(
             classify(f, unknown, age_minutes=enr.candidate.age_minutes),
             chain.value,
         )
-        if extra and extra.startswith("cabaled:") and _sponsored(enr):
+        if extra and extra.startswith("cabaled:") and _labeled_inside(enr):
             extra = None
         if extra and not (
             extra.startswith("unverified:") and enr.candidate.dex_paid
@@ -556,16 +557,26 @@ def watch_call(*, vetoed: bool, ok: bool, reasons: list[str]) -> str:
     return "wait"
 
 
-def _sponsored(enr: Enrichment) -> bool:
+def _labeled_inside(enr: Enrichment) -> bool:
+    """KOL/Fomo we named. Size-whales are not a sponsor — they are often the rug."""
     crowd = getattr(enr, "crowd", None) or {}
     if crowd.get("kols") or crowd.get("fomo"):
-        return True
-    if int(crowd.get("whale_n") or 0) >= 1:
         return True
     f = enr.features
     unknown = enr.unknown
     if "fomo_inside" not in unknown and f.fomo_inside >= 1:
         return True
+    return False
+
+
+def _sponsored(enr: Enrichment) -> bool:
+    crowd = getattr(enr, "crowd", None) or {}
+    if _labeled_inside(enr):
+        return True
+    if int(crowd.get("whale_n") or 0) >= 1:
+        return True
+    f = enr.features
+    unknown = enr.unknown
     if "copy_signal" not in unknown and f.copy_signal >= 1.0:
         return True
     if "whale_net_flow" not in unknown and f.whale_net_flow > 0:

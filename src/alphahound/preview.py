@@ -612,13 +612,13 @@ HTML = """<!doctype html>
         <th>token</th><th>held</th><th>pnl</th><th>left</th><th>hold</th><th>mcap</th><th>stage 3</th>
       </tr></thead><tbody></tbody></table>
     </div>
-    <div class="lane lane-scan">
-      <h1>scanning</h1>
-      <div id="watch-scan" class="watch-grid"></div>
-    </div>
     <div class="lane lane-wait">
       <h1>wait</h1>
       <div id="watch-wait" class="watch-grid"></div>
+    </div>
+    <div class="lane lane-scan">
+      <h1>scanning</h1>
+      <div id="watch-scan" class="watch-grid"></div>
     </div>
     <div class="lane lane-skip" hidden>
       <h1>skip</h1>
@@ -984,7 +984,7 @@ function paintWatch(list, running) {
     scan: running ? 'scanning…' : 'start the bot',
     wait: 'nenhum wait',
   };
-  ['hold','scan','wait'].forEach(lane => {
+  ['hold','wait','scan'].forEach(lane => {
     const box = $('watch-'+lane);
     if (!box) return;
     const items = groups[lane];
@@ -1014,7 +1014,7 @@ function paintWatch(list, running) {
   document.querySelectorAll('#tab-watch .wcard').forEach(el => {
     if (!keep.has(el.dataset.pick)) el.remove();
   });
-  ['hold','scan','wait'].forEach(lane => {
+  ['hold','wait','scan'].forEach(lane => {
     const box = $('watch-'+lane);
     if (!box) return;
     const n = groups[lane].length;

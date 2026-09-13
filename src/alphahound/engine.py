@@ -171,12 +171,15 @@ def visor_card(
 
 def watch_keep_key(candidate: Candidate, reads: dict, floor: float) -> tuple:
     """Lower stays when over max_watching. Paid visor cards beat unpaid Hood wait."""
+    call = str((reads.get(candidate.key) or {}).get("call") or "scan")
+    # Scan/trade can still become a buy. Wait/skip occupying the slot is the leak.
+    lane = 2 if call == "skip" else 1 if call == "wait" else 0
     return (
         0 if visor_card(candidate, reads, floor) else 1,
         0 if candidate.source == "inspect" else 1,
         0 if candidate.dex_paid else 1,
         0 if candidate.pack_role == "main" else 1 if candidate.pack_role == "beta" else 2,
-        3 if (reads.get(candidate.key) or {}).get("call") == "skip" else 0,
+        lane,
         candidate.age_minutes,
         -candidate.volume_5m_usd,
     )
@@ -191,6 +194,26 @@ def visor_seen_stale(candidate: Candidate, cap_minutes: float, now: int | None =
     if not start:
         return False
     return (t - start) / 60_000.0 > cap_minutes
+
+
+def wait_slot_expired(
+    candidate: Candidate, read: dict, max_wait_minutes: float, now: int | None = None
+) -> bool:
+    """Wait/skip that never became a buy gives the slot back. Inspect and unquoted Hood stay."""
+    if max_wait_minutes <= 0:
+        return False
+    if candidate.source == "inspect":
+        return False
+    call = str((read or {}).get("call") or "")
+    if call not in ("wait", "skip"):
+        return False
+    if observe_early(candidate.source) and candidate.mcap_usd <= 0:
+        return False
+    t = now_ms() if now is None else now
+    start = candidate.first_scored_ms or candidate.discovered_at_ms or candidate.created_at_ms
+    if not start:
+        return False
+    return (t - start) / 60_000.0 > max_wait_minutes
 
 
 def observe_early(source: str) -> bool:
@@ -1697,6 +1720,11 @@ class Engine:
             visor_age = float(self.strategy.get("loop.max_candidate_age_minutes", 180))
             if visor_seen_stale(candidate, visor_age):
                 self._drop_watch(candidate, "stale")
+                continue
+            max_wait = float(self.strategy.get("loop.max_wait_minutes", 20))
+            if wait_slot_expired(candidate, self._reads.get(key) or {}, max_wait, now):
+                self._drop_watch(candidate, "wait_expired")
+                continue
 
         overflow = [c for c in self.watching.values() if c.key not in self.positions]
         floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))

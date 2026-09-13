@@ -767,6 +767,21 @@ class TestGates(unittest.TestCase):
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
         self.assertTrue(any(v.startswith("top10:") for v in vetoes), vetoes)
 
+    def test_size_whale_flow_does_not_excuse_unknown_top10(self):
+        # mikedyson: top10 61%, known 0, copy_signal from unlabeled size-whales.
+        enr = self.enrichment(
+            top10_pct=0.61,
+            top1_pct=0.07,
+            known_holder_pct=0.0,
+            copy_signal=1.0,
+            whale_net_flow=1.0,
+            whale_hold_pct=0.17,
+        )
+        enr.mint = _FakeMint(None, None)
+        enr.crowd = {"whale_n": 3, "kols": [], "fomo": []}
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertTrue(any(v.startswith("top10:") for v in vetoes), vetoes)
+
     def test_fomo_kols_excuse_concentration(self):
         enr = self.enrichment(top10_pct=0.65, top1_pct=0.40, known_holder_pct=0.0)
         enr.mint = _FakeMint(None, None)
@@ -2372,6 +2387,26 @@ class TestPlaybook(unittest.TestCase):
         self.assertFalse(visor_seen_stale(c, 240, now))
         c.discovered_at_ms = now - 241 * 60_000
         self.assertTrue(visor_seen_stale(c, 240, now))
+
+    def test_wait_slot_expires_so_new_mints_rotate_in(self):
+        from alphahound.engine import wait_slot_expired
+
+        now = 1_800_000_000_000
+        c = Candidate(
+            chain=Chain.SOLANA,
+            address="CTALnV64vd1dkMxvtsuBgoYVhzB8tZ1XyRQFNS3ppump",
+            source="dexscreener_boosts",
+            discovered_at_ms=now - 21 * 60_000,
+            first_scored_ms=now - 21 * 60_000,
+            mcap_usd=80_000,
+            dex_paid=True,
+        )
+        self.assertTrue(wait_slot_expired(c, {"call": "wait"}, 20, now))
+        self.assertTrue(wait_slot_expired(c, {"call": "skip"}, 20, now))
+        self.assertFalse(wait_slot_expired(c, {"call": "scan"}, 20, now))
+        self.assertFalse(wait_slot_expired(c, {"call": "wait"}, 20, now - 10 * 60_000))
+        c.source = "inspect"
+        self.assertFalse(wait_slot_expired(c, {"call": "wait"}, 20, now))
 
     def test_heavy_blocks_resend_only_when_they_change(self):
         from alphahound.preview import HEAVY_KEYS, heavy_sig
