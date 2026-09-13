@@ -139,6 +139,17 @@ def unpaid_for_scan(candidate: Candidate) -> bool:
     return candidate.source != "inspect" and not candidate.dex_paid
 
 
+def boosted_off_radar(candidate: Candidate) -> bool:
+    """Dexscreener boost is paid dump-into-the-feed. Inspect can still look."""
+    if candidate.source == "inspect":
+        return False
+    return candidate.dex_boosted or candidate.source == "dexscreener_boosts"
+
+
+def bundle_off_wait(reasons: list[str]) -> bool:
+    return any((r or "").startswith("bundle:") for r in reasons)
+
+
 def on_scan_visor(candidate: Candidate, floor: float) -> bool:
     if candidate.source == "inspect":
         return True
@@ -237,7 +248,13 @@ def keep_on_radar(candidate: Candidate, reads: dict, floor: float) -> bool:
         return True
     if candidate.pack_role == "vamp":
         return False
+    if boosted_off_radar(candidate):
+        return False
     if drop_for_scan_mcap(candidate, floor):
+        return False
+    rec = reads.get(candidate.key) or {}
+    why = [str(rec.get("why") or ""), *[str(v) for v in (rec.get("vetoes") or [])]]
+    if bundle_off_wait(why):
         return False
     return not (unpaid_for_scan(candidate) and not keep_unpaid_watch(candidate))
 
@@ -251,6 +268,7 @@ def absorb_watch(dst: Candidate, src: Candidate) -> None:
         dst.dex_id = src.dex_id or dst.dex_id
     dst.pool_address = src.pool_address or dst.pool_address
     dst.dex_paid = dst.dex_paid or src.dex_paid
+    dst.dex_boosted = dst.dex_boosted or src.dex_boosted
     dst.dex_photo = dst.dex_photo or src.dex_photo
     dst.dex_aligned = dst.dex_aligned or src.dex_aligned
     if src.mcap_usd > 0:
@@ -658,6 +676,9 @@ class Engine:
                     candidate = prev
                 if candidate.pack_role == "vamp":
                     continue
+                if boosted_off_radar(candidate):
+                    self._ban_skip(candidate, "dex_boost")
+                    continue
                 if not await self._hood_pons_ok(candidate):
                     continue
                 if candidate.source != "inspect" and mcap_is_dead(candidate.mcap_usd, dead_floor):
@@ -670,6 +691,9 @@ class Engine:
                         if not v.startswith("age:") and not v.startswith("priced:")
                     ]
                     if vetoes:
+                        if bundle_off_wait(vetoes):
+                            self._ban_skip(candidate, "bundle")
+                            continue
                         if hide_from_visor(vetoes):
                             self._tick_counts[f"free_veto:{vetoes[0].split(':')[0]}"] += 1
                             continue
@@ -683,6 +707,7 @@ class Engine:
             self.discovery.prune()
             self._drop_below_scan_mcap()
             self._drop_unpaid()
+            self._drop_boosted()
             await self.score_and_enter()
             self._prune_watching()
             self._watch_in = sum(1 for k in self.watching if k not in before)
@@ -1164,9 +1189,23 @@ class Engine:
             key=lambda x: (x[0].score.expected_value, x[0].score.probability),
             reverse=True,
         )
-        decision, buyers, sponsors = picks[0]
-        decision_id = self.store.record_decision(decision)
-        await self._enter(decision, decision_id, buyers=buyers, sponsors=sponsors)
+        # ponytail: one tick used to buy picks[0] only; fill every open slot
+        for decision, buyers, sponsors in picks:
+            halted, _reason = self.risk.halted()
+            if halted:
+                return
+            sizing = self.risk.size(
+                decision.candidate,
+                decision.score,
+                self.scorer.payoff,
+                list(self.positions.values()),
+            )
+            if not sizing.allowed:
+                continue
+            decision.size_usd = sizing.size_usd
+            decision.reason = sizing.reason
+            decision_id = self.store.record_decision(decision)
+            await self._enter(decision, decision_id, buyers=buyers, sponsors=sponsors)
 
     def _buy_floors(self) -> dict[str, float]:
         min_p, min_ev = score_floors(self.strategy, self.store)
@@ -1274,6 +1313,24 @@ class Engine:
                             seen.add(kind)
                     free_vetoes = merged
                     cheap = rug
+                if bundle_off_wait(free_vetoes) and candidate.source != "inspect":
+                    if not candidate.last_scored_ms:
+                        cheap_score = Score(
+                            probability=0.0,
+                            expected_value=0.0,
+                            veto_reasons=free_vetoes,
+                        )
+                        self._record(
+                            candidate,
+                            cheap.features,
+                            cheap_score,
+                            Action.REJECT_GATE,
+                            0.0,
+                            free_vetoes[0],
+                            cheap.unknown,
+                        )
+                    self._ban_skip(candidate, "bundle")
+                    return None
                 self._tick_counts[f"free_veto:{free_vetoes[0].split(':')[0]}"] += 1
                 cheap_score = Score(
                     probability=0.0,
@@ -1318,6 +1375,12 @@ class Engine:
             self._tick_counts["enriched"] += 1
             score = self.scorer.score(enrichment)
             ok, why = self.scorer.passes(score)
+            if not ok and bundle_off_wait(score.veto_reasons) and candidate.source != "inspect":
+                self._record(
+                    candidate, enrichment.features, score, Action.REJECT_GATE, 0.0, why, enrichment.unknown
+                )
+                self._ban_skip(candidate, "bundle")
+                return None
             call = watch_call(vetoed=score.vetoed, ok=ok, reasons=score.veto_reasons)
             self._reads[candidate.key] = self._score_read(
                 candidate, score, call, why, enrichment
@@ -1607,6 +1670,7 @@ class Engine:
             candidate.name = candidate.name or name
             if not candidate.symbol and not candidate.name:
                 self._label_fail.add(candidate.key)
+        self._drop_boosted()
 
     def _retag(self) -> dict:
         by_key = {c.key: c for c in self.watching.values()}
@@ -1670,6 +1734,18 @@ class Engine:
             if unpaid_for_scan(candidate):
                 self._drop_watch(candidate, "unpaid")
 
+    def _drop_boosted(self) -> None:
+        for candidate in list(self.watching.values()):
+            if candidate.key in self.positions:
+                continue
+            if boosted_off_radar(candidate):
+                self._ban_skip(candidate, "dex_boost")
+
+    def _ban_skip(self, candidate: Candidate, tag: str) -> None:
+        if candidate.source != "inspect":
+            self._skip_ban[candidate.key] = now_ms()
+        self._drop_watch(candidate, tag)
+
     def _drop_watch(self, candidate: Candidate, tag: str) -> None:
         if candidate.key in self.positions:
             return
@@ -1706,6 +1782,15 @@ class Engine:
                 continue
             if unpaid_for_scan(candidate) and not keep_unpaid_watch(candidate):
                 self._drop_watch(candidate, "unpaid")
+                continue
+            if boosted_off_radar(candidate):
+                self._ban_skip(candidate, "dex_boost")
+                continue
+            read = self._reads.get(key) or {}
+            if bundle_off_wait(
+                [str(read.get("why") or ""), *[str(v) for v in (read.get("vetoes") or [])]]
+            ):
+                self._ban_skip(candidate, "bundle")
                 continue
             if candidate.pack_role == "vamp":
                 del self.watching[key]
@@ -1830,6 +1915,7 @@ class Engine:
             "dex_paid": candidate.dex_paid,
             "dex_photo": candidate.dex_photo,
             "dex_aligned": candidate.dex_aligned,
+            "dex_boosted": candidate.dex_boosted,
             "liq": round(candidate.liquidity_usd),
             **watch_latency(candidate),
             **stamp_live_floors(

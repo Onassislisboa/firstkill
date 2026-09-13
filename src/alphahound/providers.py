@@ -63,9 +63,11 @@ class PairSnapshot:
     dex_paid: bool = False
     dex_photo: bool = False
     dex_aligned: bool = False
+    dex_boosted: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
 
     def to_candidate(self, source: str) -> Candidate:
+        boosted = self.dex_boosted or source == "dexscreener_boosts"
         return Candidate(
             chain=self.chain,
             address=self.token_address,
@@ -81,12 +83,14 @@ class PairSnapshot:
             source=source,
             dex_id=self.dex_id,
             ret_5m=self.price_change_m5,
-            dex_paid=self.dex_paid or source == "dexscreener_boosts",
+            dex_paid=self.dex_paid or boosted,
             dex_photo=self.dex_photo,
             dex_aligned=self.dex_aligned,
+            dex_boosted=boosted,
         )
 
     def stamp(self, candidate: Candidate) -> None:
+        candidate.dex_boosted = candidate.dex_boosted or self.dex_boosted
         candidate.dex_paid = (
             candidate.dex_paid or self.dex_paid or candidate.source == "dexscreener_boosts"
         )
@@ -116,17 +120,24 @@ def pair_created_ms(value: Any) -> int:
 
 
 def orders_mark_paid(data: Any) -> bool:
-    """Dexscreener /orders/v1: approved profile or boost = they paid."""
+    """Dexscreener /orders/v1: approved profile. Boosts are a dump signal, not a listing."""
     if isinstance(data, list):
         rows = data
     elif isinstance(data, dict):
-        rows = list(data.get("orders") or []) + list(data.get("boosts") or [])
+        rows = list(data.get("orders") or [])
     else:
         return False
     return any(
-        isinstance(row, dict) and str(row.get("status") or "").lower() == "approved"
+        isinstance(row, dict)
+        and str(row.get("status") or "").lower() == "approved"
+        and str(row.get("type") or "").lower() != "tokenboost"
         for row in rows
     )
+
+
+def pair_is_boosted(pair: dict[str, Any]) -> bool:
+    boosts = pair.get("boosts") or {}
+    return _f(boosts.get("active")) > 0 or _f(boosts.get("amount")) > 0
 
 
 def pair_dex_flags(pair: dict[str, Any]) -> tuple[bool, bool, bool]:
@@ -241,6 +252,7 @@ def parse_pair(pair: dict[str, Any]) -> PairSnapshot | None:
     txns = (pair.get("txns") or {}).get("m5") or {}
     twitter, blurb = pair_socials(pair)
     paid, photo, aligned = pair_dex_flags(pair)
+    boosted = pair_is_boosted(pair)
     return PairSnapshot(
         chain=chain,
         pair_address=pair.get("pairAddress", ""),
@@ -264,6 +276,7 @@ def parse_pair(pair: dict[str, Any]) -> PairSnapshot | None:
         dex_paid=paid,
         dex_photo=photo,
         dex_aligned=aligned,
+        dex_boosted=boosted,
         raw=pair,
     )
 

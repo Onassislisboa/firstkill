@@ -172,6 +172,7 @@ def watch_row_to_candidate(row: dict[str, Any]) -> Candidate | None:
         dex_paid=bool(row.get("dex_paid")),
         dex_photo=bool(row.get("dex_photo")),
         dex_aligned=bool(row.get("dex_aligned")),
+        dex_boosted=bool(row.get("dex_boosted")) or str(row.get("source") or "") == "dexscreener_boosts",
         last_scored_ms=int(row.get("last_scored_ms") or 0),
         first_scored_ms=int(row.get("first_scored_ms") or 0),
         quoted_at_ms=int(row.get("quoted_at_ms") or 0),

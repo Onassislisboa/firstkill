@@ -7,7 +7,6 @@ convenient:
 
     pump.fun websocket   sub-second, push
     dexscreener profiles ~seconds, poll
-    dexscreener boosts   ~seconds, poll, and a signal about the promoter
     launchpad search     ~seconds, poll, one configured venue per round
     watchlist            whenever you say so
 
@@ -48,8 +47,8 @@ PROMO_POLL_MS = 5_000
 def launchpad_queries(settings: Settings, strategy: Config) -> list[str]:
     """One search term per configured launchpad, for the enabled chains.
 
-    The profiles/boosts feeds are chain-agnostic and promoter-driven, so a
-    launchpad nobody is paying to promote is invisible to them: four.meme never
+    The profiles feed is chain-agnostic and promoter-driven, so a
+    launchpad nobody is filling socials on is invisible to it: four.meme never
     showed up at all, which read as "BNB is quiet" rather than "BNB is unpolled".
     Searching each `dex_ids` entry covers every launchpad the config selects
     without a per-venue scraper; `_accept` still enforces the origin rule, so a
@@ -127,27 +126,17 @@ class Discovery:
         addresses: list[str] = []
         sources: dict[str, str] = {}
 
-        # Someone filling in socials or buying a boost is a human-speed event,
-        # so polling these on every 2s scan spent a 60/min budget for nothing -
-        # and the 429 came back on the next round as a gap, not as an error.
         if now_ms() - self._promo_at >= PROMO_POLL_MS:
             self._promo_at = now_ms()
-            fetched = await asyncio.gather(
-                self.dex.new_profiles(),
-                self.dex.boosted(),
-                return_exceptions=True,
-            )
-            for source, found in (
-                ("dexscreener_profiles", fetched[0]),
-                ("dexscreener_boosts", fetched[1]),
-            ):
-                if isinstance(found, Exception):
-                    log.warning("source failed", extra={"source": source, "error": str(found)})
-                    continue
-                for address in found:
-                    if address not in sources:
-                        sources[address] = source
-                        addresses.append(address)
+            try:
+                found = await self.dex.new_profiles()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("source failed", extra={"source": "dexscreener_profiles", "error": str(exc)})
+                found = []
+            for address in found:
+                if address not in sources:
+                    sources[address] = "dexscreener_profiles"
+                    addresses.append(address)
 
         for address in self._watchlist:
             if address and address not in sources:
@@ -176,7 +165,7 @@ class Discovery:
         addresses = [
             a
             for a in addresses
-            if sources.get(a) in {"dexscreener_boosts", "inspect"} or self._pair_unknown(a)
+            if sources.get(a) == "inspect" or self._pair_unknown(a)
         ]
         # token_pairs takes 30 addresses per call, so this is len/30 requests
         # rather than len.
@@ -316,7 +305,7 @@ class Discovery:
 
         eth_subscribe when the RPC actually speaks JSON-RPC over WebSocket
         (Alchemy/QuickNode). The public Hood RPC is HTTP-only (wss → 400), so
-        we poll eth_getLogs instead. Dexscreener profiles/boosts stay parallel.
+        we poll eth_getLogs instead. Dexscreener profiles stay parallel.
         """
         http_rpc = (self.settings.rpc_urls.get(Chain.ROBINHOOD_CHAIN) or "").strip()
         weth = (self.settings.rh_chain_weth or "").lower()

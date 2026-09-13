@@ -52,7 +52,7 @@ from alphahound.scoring import (  # noqa: E402
     payoff_from_config,
     watch_call,
 )
-from alphahound.settings import Config, apply_aggressive_learning, load_strategy, score_floors  # noqa: E402
+from alphahound.settings import Config, LEARN_EV_AFTER, apply_aggressive_learning, load_strategy, score_floors  # noqa: E402
 from alphahound.signals import Enrichment  # noqa: E402
 from alphahound.signals import chart, flow  # noqa: E402
 from alphahound.signals.distribution import Holder, analyze, gini  # noqa: E402
@@ -1058,23 +1058,30 @@ class TestAggressiveLearning(unittest.TestCase):
         cfg = apply_aggressive_learning(STRATEGY, self.store)
         self.assertTrue(cfg.get("aggressive_learning._active"))
         self.assertEqual(int(cfg.get("risk.max_concurrent_positions")), 4)
-        self.assertAlmostEqual(float(cfg.get("risk.max_position_pct")), 0.08, places=4)
-        self.assertGreaterEqual(float(cfg.get("risk.min_position_pct")), 0.05 - 1e-9)
+        self.assertAlmostEqual(
+            float(cfg.get("risk.max_position_pct")),
+            float(STRATEGY.get("risk.max_position_pct")),
+            places=4,
+        )
         self.store.set_param("scoring.min_expected_value", 0.048, "test")
         p, ev = score_floors(cfg, self.store)
-        self.assertAlmostEqual(p, 0.38, places=4)
-        self.assertAlmostEqual(ev, 0.03, places=4)
+        self.assertAlmostEqual(p, 0.28, places=4)
+        self.assertAlmostEqual(ev, 0.02, places=4)
 
     def test_graduates_back_to_production(self):
-        for _ in range(40):
+        need = int(STRATEGY.get("aggressive_learning.graduate_at_closes", 40))
+        for _ in range(need):
             self.store.record_trade(_trade(pnl=-1.0))
         cfg = apply_aggressive_learning(STRATEGY, self.store)
         self.assertFalse(cfg.get("aggressive_learning._active"))
-        self.assertEqual(int(cfg.get("risk.max_concurrent_positions")), 2)
+        self.assertEqual(
+            int(cfg.get("risk.max_concurrent_positions")),
+            int(STRATEGY.get("risk.max_concurrent_positions")),
+        )
         self.assertEqual(self.store.get_kv("aggressive_graduated"), "1")
 
     def test_tiny_bankroll_keeps_two_slots(self):
-        thin = STRATEGY.overlay({"risk": {"equity_usd": 40.0}})
+        thin = STRATEGY.overlay({"risk": {"equity_usd": 40.0, "max_concurrent_positions": 2}})
         cfg = apply_aggressive_learning(thin, self.store)
         self.assertEqual(int(cfg.get("risk.max_concurrent_positions")), 2)
 
@@ -1300,6 +1307,23 @@ class TestSelfTuning(unittest.TestCase):
             )
         report = learning.run_postmortem(self.store, STRATEGY)
         self.assertTrue(any("not costing money" in note for note in report.skipped))
+        self.assertEqual(self.store.all_params(), {})
+
+    def test_score_floors_ignore_ev_raise_until_enough_closes(self):
+        self.store.set_param("scoring.min_expected_value", 0.119, "test")
+        self.store.set_param("scoring.min_probability", 0.30, "test")
+        p, ev = score_floors(STRATEGY, self.store)
+        self.assertAlmostEqual(p, 0.30, places=4)
+        self.assertAlmostEqual(ev, float(STRATEGY["scoring.min_expected_value"]), places=4)
+
+    def test_no_edge_does_not_raise_ev_until_enough_closes(self):
+        for _ in range(12):
+            self.store.record_trade(
+                _trade(pnl=-8.0, exit_reason=ExitReason.TIME_STOP, error_class=ErrorClass.NO_EDGE)
+            )
+        self.assertLess(self.store.trade_count(), LEARN_EV_AFTER)
+        report = learning.run_postmortem(self.store, STRATEGY)
+        self.assertTrue(any("collect labels first" in note for note in report.skipped))
         self.assertEqual(self.store.all_params(), {})
 
     def test_postmortem_acts_on_a_dominant_expensive_class(self):
@@ -2235,6 +2259,25 @@ class TestPlaybook(unittest.TestCase):
         self.assertFalse(
             hide_from_visor(["chase: 5m ripped, wait dip", "volume: 2000 < 5000 (5m)"])
         )
+        from alphahound.engine import boosted_off_radar, bundle_off_wait, keep_on_radar
+
+        self.assertTrue(bundle_off_wait(["volume: 819 < 5000 (5m)", "bundle: launch bundle 45%"]))
+        self.assertFalse(bundle_off_wait(["volume: 819 < 5000 (5m)"]))
+        boosted = Candidate(
+            chain=Chain.SOLANA, address="boost", source="pumpfun_stream", mcap_usd=90_000, dex_paid=True, dex_boosted=True
+        )
+        self.assertTrue(boosted_off_radar(boosted))
+        self.assertFalse(keep_on_radar(boosted, {}, 50_000))
+        inspect = Candidate(
+            chain=Chain.SOLANA, address="boost", source="inspect", mcap_usd=90_000, dex_boosted=True
+        )
+        self.assertFalse(boosted_off_radar(inspect))
+        bundled = Candidate(
+            chain=Chain.SOLANA, address="bun", source="pumpfun_stream", mcap_usd=90_000, dex_paid=True
+        )
+        self.assertFalse(
+            keep_on_radar(bundled, {bundled.key: {"why": "bundle: launch bundle 41%"}}, 50_000)
+        )
         Engine._assert_loop_helpers(Engine)
 
     def test_public_hood_rpc_has_no_jsonrpc_websocket(self):
@@ -2305,6 +2348,7 @@ class TestPlaybook(unittest.TestCase):
         self.assertIsNotNone(c)
         self.assertEqual(c.symbol, "TRONK")
         self.assertTrue(c.dex_paid)
+        self.assertTrue(c.dex_boosted)
         self.assertGreater(c.created_at_ms, 0)
 
         stamped = watch_row_to_candidate(
@@ -2362,7 +2406,7 @@ class TestPlaybook(unittest.TestCase):
         dead = Candidate(chain=Chain.SOLANA, address="m1", source="pump_stream", mcap_usd=9_000)
         self.assertFalse(keep_on_radar(dead, {}, floor))
         unpaid = Candidate(
-            chain=Chain.SOLANA, address="m2", source="dexscreener_boosts", mcap_usd=90_000
+            chain=Chain.SOLANA, address="m2", source="dexscreener_profiles", mcap_usd=90_000
         )
         self.assertFalse(keep_on_radar(unpaid, {}, floor))
         unpaid.dex_paid = True
@@ -2378,7 +2422,7 @@ class TestPlaybook(unittest.TestCase):
         c = Candidate(
             chain=Chain.SOLANA,
             address="CTALnV64vd1dkMxvtsuBgoYVhzB8tZ1XyRQFNS3ppump",
-            source="dexscreener_boosts",
+            source="dexscreener_profiles",
             created_at_ms=now - 300 * 60_000,
             discovered_at_ms=now - 2 * 60_000,
             mcap_usd=1_200_000,
@@ -2677,6 +2721,7 @@ class TestTwitterSocials(unittest.TestCase):
         snap = parse_pair(pair)
         c = snap.to_candidate("dexscreener_boosts")
         self.assertTrue(c.dex_paid)
+        self.assertTrue(c.dex_boosted)
         self.assertGreaterEqual(c.dex_profile, 0.99)
         rug = pair_dex_flags({"info": {}, "boosts": {"active": 0}, "baseToken": {"symbol": "X"}})
         self.assertEqual(rug, (False, False, False))
@@ -2688,6 +2733,8 @@ class TestTwitterSocials(unittest.TestCase):
         self.assertTrue(orders_mark_paid({"orders": [{"status": "approved"}], "boosts": []}))
         self.assertFalse(orders_mark_paid({"orders": [], "boosts": []}))
         self.assertFalse(orders_mark_paid([{"type": "tokenBoost", "status": "pending"}]))
+        self.assertFalse(orders_mark_paid([{"type": "tokenBoost", "status": "approved"}]))
+        self.assertFalse(orders_mark_paid({"orders": [], "boosts": [{"status": "approved"}]}))
         self.assertFalse(orders_mark_paid(None))
 
 
@@ -2991,7 +3038,7 @@ class TestDeadMcap(unittest.TestCase):
         sol = Candidate(
             chain=Chain.SOLANA,
             address="CTALnV64vd1dkMxvtsuBgoYVhzB8tZ1XyRQFNS3ppump",
-            source="dexscreener_boosts",
+            source="dexscreener_profiles",
             mcap_usd=0.0,
             dex_paid=True,
         )
@@ -3024,7 +3071,7 @@ class TestDeadMcap(unittest.TestCase):
         sol = Candidate(
             chain=Chain.SOLANA,
             address="CTALnV64vd1dkMxvtsuBgoYVhzB8tZ1XyRQFNS3ppump",
-            source="dexscreener_boosts",
+            source="dexscreener_profiles",
             mcap_usd=1_200_000,
             dex_paid=True,
         )

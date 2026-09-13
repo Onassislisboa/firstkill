@@ -201,14 +201,14 @@ ignore_mcap_usd = 50000000
 # ---------------------------------------------------------------------------
 [scoring]
 # Minimum modeled win probability to consider a trade.
-min_probability = 0.42
+min_probability = 0.32
 # Minimum expected value, as a fraction of position size, AFTER subtracting
 # every cost we can predict. A positive score with negative EV is a losing
 # trade with good self-esteem.
-min_expected_value = 0.04
+min_expected_value = 0.03
 # Stage-2 0–10 composite. Weights: dist 20, crowd 25, flow 20, chart 25, narrative 10.
 # Below this the token is not a buy candidate even if EV looks fine.
-min_rubric = 4.0
+min_rubric = 3.0
 # Until this many closed trades exist, the model has no opinion worth acting
 # on and every feature contributes at its prior weight.
 min_trades_for_learned_weights = 40
@@ -222,13 +222,12 @@ prior_winner_ladder_reach = [[1, 0.60], [2, 0.25], [3, 0.15]]
 # ---------------------------------------------------------------------------
 # Aggressive learning. One `enabled` flip. Production [scoring]/[risk] above
 # stay the graduate-to values. Does not touch gates (LP, mint, bundle, cluster).
-# Floors from unique reject_score p/EV: 0.38/0.03 ≈ 3× vs 0.42/0.048.
 # ---------------------------------------------------------------------------
 [aggressive_learning]
 enabled = true
 graduate_at_closes = 40
-min_probability = 0.38
-min_expected_value = 0.03
+min_probability = 0.28
+min_expected_value = 0.02
 max_concurrent_positions = 4
 
 
@@ -247,9 +246,9 @@ max_position_pct = 0.16
 # At copy_min mcap this fraction of equity; interpolates up to max_position_pct at copy_max.
 min_position_pct = 0.06
 min_position_usd = 10.0
-# Two open at once so a weak bag cannot occupy the only slot.
-max_concurrent_positions = 2
-max_positions_per_chain = 2
+# Fill the book so paper learning gets more closes. Gates still skip rugs.
+max_concurrent_positions = 4
+max_positions_per_chain = 4
 # Hard cap on size as a fraction of pool liquidity. This binds long before the
 # equity cap does on a small pool, and it is the difference between a position
 # you can exit and a position you are.

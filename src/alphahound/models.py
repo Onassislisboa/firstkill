@@ -239,6 +239,7 @@ class Candidate:
     dex_paid: bool = False
     dex_photo: bool = False
     dex_aligned: bool = False
+    dex_boosted: bool = False
 
     @property
     def dex_profile(self) -> float:

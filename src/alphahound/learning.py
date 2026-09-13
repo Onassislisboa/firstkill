@@ -36,7 +36,7 @@ from .log import get
 from .models import Action, ErrorClass, ExitReason, TradeRecord
 from .portfolio import banked_from_peak
 from .scoring import PRIOR_BIAS, PRIOR_WEIGHTS, VISOR_WAIT_PREFIXES, Model, normalize
-from .settings import Config
+from .settings import Config, LEARN_EV_AFTER
 from .store import Store, episode_kind, features_from_json, unknown_from_json
 
 log = get("learning")
@@ -240,6 +240,7 @@ def run_postmortem(
     report.pnl_by_class = pnl
 
     total = len(trades)
+    closed = store.trade_count()
     for klass_value, count in counts.most_common():
         if klass_value == ErrorClass.WIN.value:
             continue
@@ -249,6 +250,11 @@ def run_postmortem(
             continue
         if pnl.get(klass_value, 0.0) >= 0:
             report.skipped.append(f"{klass_value}: frequent but not costing money")
+            continue
+        if klass_value == ErrorClass.NO_EDGE.value and closed < LEARN_EV_AFTER:
+            report.skipped.append(
+                f"no_edge: {closed} < {LEARN_EV_AFTER} closes, collect labels first"
+            )
             continue
         try:
             klass = ErrorClass(klass_value)
