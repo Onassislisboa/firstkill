@@ -279,7 +279,7 @@ take_profit_ladder = [[1.50, 0.20], [2.20, 0.20], [3.50, 0.20]]
 # Trailing stop, activated only after the first ladder rung fills. [auto]
 trailing_stop_pct = 0.18
 # Hard stop from entry. [auto]
-stop_loss_pct = 0.35
+stop_loss_pct = 0.50
 # A dead coin is capital with an opportunity cost. A working one is allowed
 # to sit: time stop only fires if it has not moved.
 time_stop_minutes = 240
