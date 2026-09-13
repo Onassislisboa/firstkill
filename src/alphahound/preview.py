@@ -964,7 +964,9 @@ function fillLive(el, w) {
 
 function laneOf(w) {
   const c = w.call || 'scan';
-  return (c === 'hold' || c === 'wait' || c === 'skip') ? c : 'scan';
+  if (c === 'hold') return 'hold';
+  if (c === 'wait' || c === 'skip') return 'wait';
+  return 'scan';
 }
 function paintWatch(list, running) {
   const groups = {hold:[], scan:[], wait:[], skip:[]};

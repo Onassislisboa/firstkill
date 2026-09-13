@@ -133,13 +133,11 @@ def visor_card(
 ) -> bool:
     """A card needs a paid listing and a quote at or above the floor.
 
-    Skip/bundle/LP never occupy a card; WAIT floors still do. Unquoted Pons
-    launches stay on the radar and get a card when Dexscreener prices them.
+    Skip stays if it already paid that rent — the pill is why we will not buy.
+    Unquoted Pons launches stay on the radar and get a card when priced.
     `dip_ok` is for a coin that was above the floor a moment ago: one stale or
     zero quote should not yank a card that comes straight back.
     """
-    if (reads.get(candidate.key) or {}).get("call") == "skip":
-        return False
     if candidate.source == "inspect":
         return True
     if unpaid_for_scan(candidate):
@@ -190,8 +188,6 @@ def keep_on_radar(candidate: Candidate, reads: dict, floor: float) -> bool:
     """
     if candidate.source == "inspect":
         return True
-    if (reads.get(candidate.key) or {}).get("call") == "skip":
-        return False
     if candidate.pack_role == "vamp":
         return False
     if drop_for_scan_mcap(candidate, floor):
@@ -1205,14 +1201,11 @@ class Engine:
                         free_vetoes[0],
                         cheap.unknown,
                     )
-                if hide_from_visor(free_vetoes):
-                    self._ban_skip(candidate, free_vetoes[0].split(":")[0])
-                    return None
-                # A buy-floor veto is patience, not a verdict. Enriching here
-                # would collect quality vetoes the coin cannot answer yet and
-                # `_ban_skip` would hide it for skip_ban_minutes, emptying the
-                # wait lane. Full chain reads start once it clears the floors.
-                call = "wait"
+                # A buy-floor veto is patience. A hard skip (bundle/LP/top10)
+                # used to `_ban_skip` here and empty the visor: every Solana
+                # mint that cleared $50k then vanished for skip_ban_minutes.
+                # The card stays; the pill says why we will not buy.
+                call = "skip" if hide_from_visor(free_vetoes) else "wait"
                 self._reads[candidate.key] = self._score_read(
                     candidate, cheap_score, call, free_vetoes[0], cheap
                 )
@@ -1244,12 +1237,6 @@ class Engine:
                 self._record(
                     candidate, enrichment.features, score, action, 0.0, why, enrichment.unknown
                 )
-                if hide_from_visor(score.veto_reasons) or call == "skip":
-                    self._ban_skip(
-                        candidate,
-                        (score.veto_reasons[0].split(":")[0] if score.veto_reasons else "skip"),
-                    )
-                    return None
                 return None
 
             sizing = self.risk.size(candidate, score, self.scorer.payoff, list(self.positions.values()))
@@ -1581,11 +1568,6 @@ class Engine:
         self.enricher.forget(candidate.key)
         self._tick_counts[tag] += 1
 
-    def _ban_skip(self, candidate: Candidate, tag: str) -> None:
-        if candidate.source != "inspect":
-            self._skip_ban[candidate.key] = now_ms()
-        self._drop_watch(candidate, tag)
-
     def _prune_watching(self) -> None:
         tags = self._retag()
         dying = dump_beta_keys(tags)
@@ -1610,9 +1592,6 @@ class Engine:
                 continue
             if unpaid_for_scan(candidate) and not keep_unpaid_watch(candidate):
                 self._drop_watch(candidate, "unpaid")
-                continue
-            if (self._reads.get(key) or {}).get("call") == "skip":
-                self._ban_skip(candidate, "skip")
                 continue
             if candidate.pack_role == "vamp":
                 del self.watching[key]

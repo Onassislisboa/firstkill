@@ -2241,7 +2241,7 @@ class TestPlaybook(unittest.TestCase):
         self.assertFalse(keep_on_radar(unpaid, {}, floor))
         unpaid.dex_paid = True
         self.assertTrue(keep_on_radar(unpaid, {}, floor))
-        self.assertFalse(keep_on_radar(unpaid, {unpaid.key: {"call": "skip"}}, floor))
+        self.assertTrue(keep_on_radar(unpaid, {unpaid.key: {"call": "skip"}}, floor))
         unpaid.pack_role = "vamp"
         self.assertFalse(keep_on_radar(unpaid, {}, floor))
 
@@ -2869,8 +2869,8 @@ class TestDeadMcap(unittest.TestCase):
         self.assertFalse(visor_card(hood, {}, 50_000))
         hood.dex_paid = True
         self.assertTrue(visor_card(hood, {}, 50_000))
-        # Skip still never occupies a card.
-        self.assertFalse(visor_card(hood, {hood.key: {"call": "skip"}}, 50_000))
+        # Skip after enrich still occupies the card; hiding it emptied the visor.
+        self.assertTrue(visor_card(hood, {hood.key: {"call": "skip"}}, 50_000))
 
     def test_overflow_keeps_visor_over_unpaid_hood(self):
         from alphahound.engine import watch_keep_key
@@ -2892,7 +2892,7 @@ class TestDeadMcap(unittest.TestCase):
         reads: dict = {}
         self.assertLess(watch_keep_key(sol, reads, 50_000), watch_keep_key(hood, reads, 50_000))
 
-    def test_skip_call_is_not_a_visor_card(self):
+    def test_skip_call_still_occupies_a_visor_card(self):
         from alphahound.engine import visor_card
 
         c = Candidate(
@@ -2903,8 +2903,6 @@ class TestDeadMcap(unittest.TestCase):
             dex_paid=True,
         )
         reads = {c.key: {"call": "skip", "why": "cluster: 40% linked supply"}}
-        self.assertFalse(visor_card(c, reads, 50_000))
-        reads[c.key]["call"] = "wait"
         self.assertTrue(visor_card(c, reads, 50_000))
 
     def test_absorb_watch_keeps_quoted_mcap_on_blank_reemit(self):
