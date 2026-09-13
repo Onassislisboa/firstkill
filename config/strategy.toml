@@ -259,8 +259,8 @@ max_entries_per_day = 0
 # Fractional Kelly. Full Kelly is correct only if your probabilities are
 # correct, and yours are not.
 kelly_fraction = 0.25
-# Realized loss in a single day that halts trading until manually resumed.
-daily_loss_limit_pct = 0.12
+# 0 = off. Paper learning phase — no daily loss halt.
+daily_loss_limit_pct = 0
 # Streak cooldown sits out the next runner. Off: wait on the coin instead.
 consecutive_loss_limit = 0
 cooldown_minutes_base = 0

@@ -560,6 +560,8 @@ HTML = """<!doctype html>
   #fault { display: none; padding: 8px 20px; background: #2a0008; color: #ff6b7a;
            border-bottom: 1px solid #ff3b4e; font-size: 12px; }
   #fault.on { display: block; }
+  #trade-rule { padding: 8px 20px; background: #1a1400; color: #ffd24a;
+                border-bottom: 1px solid #5a4a00; font-size: 12px; }
   @media (max-width: 900px) {
     main, .grid { grid-template-columns: 1fr; }
     section + section { border-left: 0; border-top: 1px solid var(--line); }
@@ -579,6 +581,7 @@ HTML = """<!doctype html>
   <div><h1>holding</h1><div class="n gold" id="holding">—</div></div>
   <div><h1>scanning</h1><div class="n cyan" id="watching">—</div></div>
 </header>
+<div id="trade-rule">Se não puder comprar e vender, o engine desliga — não fica pausado.</div>
 <div id="fault"></div>
 <div id="verdict" class="verdict wait"><span class="tag">WAITING</span><span class="muted" id="verdict-h">sem trades ainda</span></div>
 <nav class="tabs">
@@ -826,7 +829,9 @@ function needTxt(w) {
   if ((w.call||'scan') === 'hold') return 'HOLD · gerenciando a saída';
   if ((w.call||'scan') === 'scan' && w.p == null) return 'SCAN · lendo holders, chart e mcap';
   const l = needList(w);
-  return l.length ? 'ESPERA · '+l.join(' · ') : 'PRONTA · passa nos gates';
+  const core = l.length ? 'ESPERA · '+l.join(' · ') : 'PRONTA · passa nos gates';
+  if (w.reading && (w.call==='wait' || w.call==='skip')) return core.replace(/^ESPERA/, 'ESPERA · scan de novo');
+  return core;
 }
 function needCls(w) {
   return 'need' + (needList(w).length || (w.call||'scan')==='scan' && w.p == null ? '' : ' need-ok');
@@ -892,7 +897,7 @@ function setNode(n, t) {
 function cardFp(w) {
   const r = w.rubric || {};
   return [w.call, w.label, w.symbol, w.mcap, w.age_min, w.held_min, w.vol5m, w.ret_5m, w.p, w.ev, r.total,
-    w.why, w.cert, w.dex_paid, (w.kols||[]).join(), (w.fomo||[]).join(), w.whale_n,
+    w.why, w.cert, w.dex_paid, w.reading, (w.kols||[]).join(), (w.fomo||[]).join(), w.whale_n,
     (w.vetoes||[]).join(), w.found_lag_s, w.quote_lag_s, w.scan_lag_s, w.quote_age_s, w.read_age_s].join('|');
 }
 function fillLive(el, w) {
@@ -1287,7 +1292,7 @@ function paintVerdict(d) {
 }
 
 $('dump-all').addEventListener('click', () => {
-  if (!confirm('Vender todas as posições abertas agora?')) return;
+  if (!confirm('Vende todas as bags e DESLIGA o engine. Ele não fica pausado. Continuar?')) return;
   fetch('/api/flatten', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
     .then(r => r.json()).then(j => {
       $('status').textContent = j.ok ? 'vendendo tudo…' : (j.error || 'falhou vender');
@@ -1486,15 +1491,17 @@ async function tick() {
   // Blocks absent from the reply are the ones we already hold unchanged.
   heavySig = d.heavy_sig || '';
   const live = d.running ? (d.mode || 'run') : 'stopped';
-  const halt = d.halted ? (' · paused ' + (d.halt_reason || '')) : '';
+  const halt = d.halted ? (' · flatten+stop ' + (d.halt_reason || '')) : '';
   const learn = d.aggressive ? (' · aggressive ' + (d.aggressive_closes||0) + ' closes') : '';
   const dead = (d.dead_loops || []).length ? (' · loop dead ' + d.dead_loops.join(',')) : '';
   $('status').textContent = live + halt + learn + dead
     + ((d.watch_in||d.watch_out) ? (' · +'+(d.watch_in||0)+'/−'+(d.watch_out||0)) : '')
     + ' · ' + d.stale_s + 's';
-  $('status').className = (d.dead_loops || []).length ? 'dn' : 'muted';
+  $('status').className = (d.dead_loops || []).length || !d.running || d.halted ? 'dn' : 'muted';
   const fault = $('fault');
   const msgs = Object.entries(d.faults || {}).map(([k,v]) => k + ': ' + v);
+  if (!d.running) msgs.unshift('Engine parado. Sem comprar/vender ele desliga — alphahound resume e sobe de novo.');
+  else if (d.halted) msgs.unshift('Halt: vende as bags e DESLIGA. Não fica rodando sem operar. ' + (d.halt_reason||''));
   if (msgs.length) { fault.textContent = msgs.join(' · '); fault.className = 'on'; }
   else { fault.textContent = ''; fault.className = ''; }
   setText('equity', usd(d.equity_usd), 'n');
@@ -1543,13 +1550,19 @@ const OUT_LAB = {fumble:'fumble', rejeicao_correta:'rejeição correta', entrada
   entrada_errada:'entrada errada', tracking:'tracking'};
 const when = ms => new Date(ms).toLocaleString(undefined, {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
 let revBusy = false;
+let revSig = '';
 async function loadReview() {
   if (revBusy) return;
   revBusy = true;
   const out = $('rev-out').value;
   try {
     const j = await (await fetch('/api/review?outcome='+encodeURIComponent(out)+'&limit=250', {cache:'no-store'})).json();
-    $('rev-meta').textContent = (j.open_rows||0)+' shadows abertos · '+(j.open_keys||0)+' tokens no lote de 30 · fumble ≥ '+Math.round((j.fumble_pct||0.2)*100)+'% MFE';
+    const openN = j.open_rows||0;
+    $('rev-meta').textContent = openN+' shadows abertos · '+(j.open_keys||0)+' tokens · fumble ≥ '+Math.round((j.fumble_pct||0.2)*100)+'% MFE'
+      + (out==='' && openN ? ' · tracking no filtro “ainda tracking”' : '');
+    const sig = (j.rows||[]).map(r => [r.ts_ms,r.key,r.outcome,r.ticks,r.mfe,r.pnl_usd].join()).join('|') + '|' + out;
+    if (sig === revSig) { revBusy = false; return; }
+    revSig = sig;
     const body = (j.rows||[]).map((r,i) => {
       const ca = (r.key||'').split(':')[1]||'';
       const res = r.action==='enter'
@@ -1569,7 +1582,7 @@ async function loadReview() {
         <td>${res}${soldBits}</td>
         <td class="out-${esc(r.outcome)}">${OUT_LAB[r.outcome]||r.outcome}</td></tr>
         <tr class="rev-feat" data-rev-feat="${i}" hidden><td colspan="7">${esc(why ? why+' · ' : '')}${esc(feat)}</td></tr>`;
-    }).join('') || '<tr><td colspan="7" class="muted">vazio</td></tr>';
+    }).join('') || '<tr><td colspan="7" class="muted">'+(openN ? (openN+' ainda tracking — usa o filtro') : 'vazio')+'</td></tr>';
     $('review').querySelector('tbody').innerHTML = body;
   } catch (err) {
     $('rev-meta').textContent = 'falhou o review';

@@ -87,6 +87,11 @@ def loop_bug(exc: BaseException) -> bool:
     return isinstance(exc, LOOP_BUGS)
 
 
+def cannot_trade_idle(halted: bool, open_positions: int) -> bool:
+    """Halt with an empty book is a dead bot pretending to work."""
+    return halted and open_positions <= 0
+
+
 def enrich_due(last_scored_ms: int, now: int, ttl_ms: int) -> bool:
     """First look always; afterwards wait ttl so RPC isn't spent re-reading the same mint."""
     return last_scored_ms <= 0 or ttl_ms <= 0 or now - last_scored_ms >= ttl_ms
@@ -96,7 +101,19 @@ def score_ttl_ms(call: str, base_ttl_ms: int, skip_ttl_ms: int) -> int:
     """Skip already paid for a full chain read. Quote loop still prices the card."""
     if call == "skip":
         return max(base_ttl_ms, skip_ttl_ms)
+    if call == "wait":
+        return min(base_ttl_ms, 2_000)
     return base_ttl_ms
+
+
+def reread_keeps_lane(call: str) -> bool:
+    """Wait/skip stay in that lane while enrich reruns. First look is still scan."""
+    return call in ("wait", "skip")
+
+
+def rescan_closed_mint(source: str) -> bool:
+    """One shot per mint. Paste/inspect is the only way back onto the radar."""
+    return source == "inspect"
 
 
 def mcap_is_dead(mcap_usd: float, floor: float) -> bool:
@@ -263,6 +280,17 @@ def watch_latency(candidate: Candidate, now: int | None = None) -> dict:
 
 _FLOOR_KINDS = frozenset({"mcap", "volume", "liquidity"})
 
+
+def wait_floors_cleared(read: dict, floors: list[str]) -> bool:
+    """Quote crossed buy floors. Don't sit on rescore_seconds before enrich."""
+    if floors:
+        return False
+    if str(read.get("call") or "") not in ("wait", "scan"):
+        return False
+    kinds = {str(v).split(":", 1)[0] for v in (read.get("vetoes") or [])}
+    return bool(kinds) and kinds <= _FLOOR_KINDS
+
+
 # Dexscreener meters /orders at 60 req/min. A scan pass every 2s means anything
 # above ~2 probes per pass overdraws the budget, and the 429 it earns is paid
 # for by the quote loop sharing the retry queue. The 45s cache covers the rest.
@@ -423,6 +451,7 @@ class Engine:
         self._positions_path = settings.state_dir / "positions.json"
         self._closed_since_learn = 0
         self._resolved_since_learn = 0
+        self._closed_mints = self.store.closed_mint_keys()
         self._lock: IO[bytes] | None = None
         self._tick_counts: Counter[str] = Counter()
         self._last_heartbeat_ms = now_ms()
@@ -481,6 +510,9 @@ class Engine:
             },
         )
         self._write_preview()
+        halted, reason = self.risk.halted()
+        if cannot_trade_idle(halted, len(self.positions)):
+            raise SystemExit(f"halted with nothing to flatten: {reason}")
         if (
             not self.registry.attributable_labels
             and Chain.SOLANA in self.settings.enabled_chains
@@ -527,9 +559,10 @@ class Engine:
                 if loop_bug(exc):
                     self._loop_dead.add(label)
                     log.error(
-                        "loop dead",
+                        "loop dead, stopping",
                         extra={"loop": label, "error": self._loop_faults[label]},
                     )
+                    self.request_stop()
                     return
             elapsed = (now_ms() - started) / 1000.0
             with contextlib.suppress(asyncio.TimeoutError):
@@ -570,6 +603,9 @@ class Engine:
             dead_floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
             probed = 0
             for candidate in found:
+                if not rescan_closed_mint(candidate.source) and candidate.key in self._closed_mints:
+                    self._tick_counts["already_traded"] += 1
+                    continue
                 if unpaid_for_scan(candidate):
                     if probed >= PAID_PROBES_PER_PASS:
                         if not observe_early(candidate.source):
@@ -754,6 +790,10 @@ class Engine:
         self._drain_sells()
         if not self.positions:
             self._manual_sell.clear()
+            halted, reason = self.risk.halted()
+            if cannot_trade_idle(halted, 0):
+                log.error("halted and flat; stopping", extra={"reason": reason})
+                self.request_stop()
             return
         halted, reason = self.risk.halted()
         self._retag()
@@ -796,6 +836,10 @@ class Engine:
                 for p in self.positions.values()
             )
         }
+        halted, reason = self.risk.halted()
+        if cannot_trade_idle(halted, len(self.positions)):
+            log.error("halted and flat; stopping", extra={"reason": reason})
+            self.request_stop()
 
     async def _stage3(self, position: Position) -> ExitOrder | None:
         now = now_ms()
@@ -916,6 +960,8 @@ class Engine:
                 self.store.record_buyer_outcome(wallet, position.candidate.chain, trade.pnl_usd)
         self.enricher._smart_cache.pop(position.candidate.chain, None)
         self.positions.pop(position.candidate.key, None)
+        self._closed_mints.add(position.candidate.key)
+        self._drop_watch(position.candidate, "already_traded")
         self.enricher.forget(position.candidate.key)
         self.risk.note_trade_closed(trade.won)
         self._closed_since_learn += 1
@@ -1151,6 +1197,7 @@ class Engine:
             ),
             "tw": tw,
             "rubric": score.rubric or {},
+            "reading": False,
         }
 
     async def _score_one(
@@ -1234,13 +1281,15 @@ class Engine:
                 painted = True
                 return None
 
-            self._paint_watch(candidate, call="scan", why="enrich")
+            self._paint_watch(candidate, call="scan", why="enrich", reading=True)
             try:
                 enrichment = await self.enricher.enrich(candidate, probe_size)
             except Exception as exc:  # noqa: BLE001
                 self._tick_counts["enrich_failed"] += 1
                 log.debug("enrich failed", extra={"key": candidate.key, "error": str(exc)})
-                self._paint_watch(candidate, call="scan", why=f"enrich: {exc}"[:80])
+                self._paint_watch(
+                    candidate, call="scan", why=f"enrich: {exc}"[:80], reading=False
+                )
                 return None
 
             self._tick_counts["enriched"] += 1
@@ -1252,6 +1301,8 @@ class Engine:
             )
             painted = True
             if not ok:
+                if wait_on_visor(score.veto_reasons):
+                    return None
                 action = Action.REJECT_GATE if score.vetoed else Action.REJECT_SCORE
                 self._tick_counts[
                     f"veto:{score.veto_reasons[0].split(':')[0]}" if score.vetoed else "low_score"
@@ -1297,8 +1348,16 @@ class Engine:
         call: str,
         why: str,
         rubric: dict | None = None,
+        reading: bool = False,
     ) -> None:
         rec = dict(self._reads.get(candidate.key) or {})
+        rec["reading"] = reading
+        # ponytail: wait/skip stay put on reread (and on enrich fail). Visor shows "scan de novo".
+        if call == "scan" and reread_keeps_lane(str(rec.get("call") or "")):
+            if rubric is not None:
+                rec["rubric"] = rubric
+            self._reads[candidate.key] = rec
+            return
         rec["call"] = call
         rec["why"] = why
         if rubric is not None:
@@ -1483,6 +1542,9 @@ class Engine:
                     if not twitter_handle(str(tw.get("official") or "")):
                         tw["official"] = snap.twitter
                         rec["tw"] = tw
+            floors = early_observe_floors(candidate, self.strategy)
+            if wait_floors_cleared(self._reads.get(candidate.key) or {}, floors):
+                candidate.last_scored_ms = 0
             if not candidate.dex_paid:
                 unpaid.append(candidate)
             elif not was_paid:
@@ -1607,6 +1669,9 @@ class Engine:
                 if candidate.last_scored_ms and now - candidate.last_scored_ms > 180_000:
                     del self.watching[key]
                     self.enricher.forget(key)
+                continue
+            if key in self._closed_mints:
+                self._drop_watch(candidate, "already_traded")
                 continue
             if ignore_mcap > 0 and candidate.mcap_usd > ignore_mcap:
                 self._drop_watch(candidate, "fat_mcap")
@@ -1761,6 +1826,8 @@ class Engine:
             if candidate.chain not in self.settings.enabled_chains:
                 continue
             if candidate.key in self.watching:
+                continue
+            if candidate.key in self._closed_mints and not rescan_closed_mint(candidate.source):
                 continue
             call = str(row.get("call") or "scan")
             if call == "skip":

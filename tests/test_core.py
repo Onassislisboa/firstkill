@@ -40,7 +40,7 @@ from alphahound.models import (  # noqa: E402
     legs_for_display,
     now_ms,
 )
-from alphahound.engine import enrich_due, loop_bug, score_ttl_ms  # noqa: E402
+from alphahound.engine import cannot_trade_idle, enrich_due, loop_bug, reread_keeps_lane, rescan_closed_mint, score_ttl_ms, wait_floors_cleared  # noqa: E402
 from alphahound.portfolio import PositionManager, banked_from_peak  # noqa: E402
 from alphahound.risk import RiskEngine, kelly_fraction, mcap_position_pct  # noqa: E402
 from alphahound.scoring import (  # noqa: E402
@@ -79,7 +79,12 @@ class TestEnrichDue(unittest.TestCase):
     def test_skip_call_uses_longer_ttl(self):
         self.assertEqual(score_ttl_ms("skip", 8_000, 60_000), 60_000)
         self.assertEqual(score_ttl_ms("scan", 8_000, 60_000), 8_000)
-        self.assertEqual(score_ttl_ms("wait", 8_000, 60_000), 8_000)
+        self.assertEqual(score_ttl_ms("wait", 8_000, 60_000), 2_000)
+
+    def test_closed_mint_stays_off_scan_unless_inspect(self):
+        self.assertFalse(rescan_closed_mint("dexscreener_profiles"))
+        self.assertFalse(rescan_closed_mint("hood_stream"))
+        self.assertTrue(rescan_closed_mint("inspect"))
 
 
 class TestWalletAgeCache(unittest.TestCase):
@@ -110,6 +115,28 @@ class TestLoopBug(unittest.TestCase):
         self.assertTrue(loop_bug(AttributeError("x")))
         self.assertFalse(loop_bug(RuntimeError("rpc 429")))
         self.assertFalse(loop_bug(TimeoutError()))
+
+    def test_halt_with_empty_book_must_stop(self):
+        self.assertTrue(cannot_trade_idle(True, 0))
+        self.assertFalse(cannot_trade_idle(True, 1))
+        self.assertFalse(cannot_trade_idle(False, 0))
+
+    def test_wait_card_stays_in_wait_while_reread(self):
+        self.assertTrue(reread_keeps_lane("wait"))
+        self.assertTrue(reread_keeps_lane("skip"))
+        self.assertFalse(reread_keeps_lane("scan"))
+        self.assertFalse(reread_keeps_lane("trade"))
+
+    def test_wait_floors_cleared_promotes_to_enrich(self):
+        read = {"call": "wait", "vetoes": ["mcap: 48000 below 50000 floor"]}
+        self.assertTrue(wait_floors_cleared(read, []))
+        self.assertFalse(wait_floors_cleared(read, ["mcap: 48000 below 50000 floor"]))
+        self.assertFalse(
+            wait_floors_cleared(
+                {"call": "wait", "vetoes": ["lp_unlocked: 100%"]},
+                [],
+            )
+        )
 
 
 def make_store() -> tuple[Store, tempfile.TemporaryDirectory]:
@@ -1397,7 +1424,9 @@ class TestReviewHistory(unittest.TestCase):
         )
         self.store.record_decision(live)
         default = {r["symbol"]: r["outcome"] for r in self.store.review_history()["rows"]}
-        self.assertEqual(default["NOW"], "tracking")
+        self.assertNotIn("NOW", default)
+        tracking = {r["symbol"]: r["outcome"] for r in self.store.review_history(outcome="tracking")["rows"]}
+        self.assertEqual(tracking["NOW"], "tracking")
         self.assertNotIn("NOW", {r["symbol"] for r in self.store.review_history(outcome="rejeicao_correta")["rows"]})
 
     def test_review_keeps_first_sight_mcap(self):

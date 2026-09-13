@@ -244,6 +244,7 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
         # CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so a
         # column added later never appears in a database that already exists.
@@ -462,9 +463,9 @@ class Store:
             elif outcome == "tracking":
                 sql += " WHERE s.resolved = 0"
             else:
-                # Default "todos": live tracking + resolved. Resolved-only made
-                # the tab look frozen for `shadow_track_minutes` (3h).
-                sql += " WHERE 1=1"
+                # Default "todos" is resolved + entries. Live tracking drowned
+                # the tab (200+ wait/lp shadows) and looked frozen.
+                sql += " WHERE s.resolved = 1"
             sql += " ORDER BY d.ts_ms DESC LIMIT ?"
             params.append(limit)
             for r in self.conn.execute(sql, params):
@@ -664,6 +665,9 @@ class Store:
             (key, since_ms),
         ).fetchone()
         return row is not None
+
+    def closed_mint_keys(self) -> set[str]:
+        return {str(r["key"]) for r in self.conn.execute("SELECT DISTINCT key FROM trades")}
 
     def enter_count_since(self, since_ms: int) -> int:
         row = self.conn.execute(
