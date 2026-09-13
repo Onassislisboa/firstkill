@@ -218,6 +218,44 @@ def absorb_watch(dst: Candidate, src: Candidate) -> None:
         dst.ret_5m = src.ret_5m
     if src.created_at_ms and (not dst.created_at_ms or src.created_at_ms < dst.created_at_ms):
         dst.created_at_ms = src.created_at_ms
+    if src.mcap_usd > 0 and not dst.first_quoted_ms:
+        stamp_quote(dst)
+
+
+def stamp_quote(candidate: Candidate, now: int | None = None) -> None:
+    t = now_ms() if now is None else now
+    candidate.quoted_at_ms = t
+    if not candidate.first_quoted_ms:
+        candidate.first_quoted_ms = t
+
+
+def stamp_scored(candidate: Candidate, now: int | None = None) -> None:
+    t = now_ms() if now is None else now
+    candidate.last_scored_ms = t
+    if not candidate.first_scored_ms:
+        candidate.first_scored_ms = t
+
+
+def _lag_s(later: int, earlier: int) -> float | None:
+    if later and earlier and later >= earlier:
+        return round((later - earlier) / 1000.0, 1)
+    return None
+
+
+def watch_latency(candidate: Candidate, now: int | None = None) -> dict:
+    """Seconds the engine actually spent, not pair age."""
+    t = now_ms() if now is None else now
+    return {
+        "found_lag_s": _lag_s(candidate.discovered_at_ms, candidate.created_at_ms),
+        "quote_lag_s": _lag_s(candidate.first_quoted_ms, candidate.discovered_at_ms),
+        "scan_lag_s": _lag_s(candidate.first_scored_ms, candidate.discovered_at_ms),
+        "quote_age_s": _lag_s(t, candidate.quoted_at_ms),
+        "read_age_s": _lag_s(t, candidate.last_scored_ms),
+        "first_quoted_ms": candidate.first_quoted_ms,
+        "quoted_at_ms": candidate.quoted_at_ms,
+        "first_scored_ms": candidate.first_scored_ms,
+        "last_scored_ms": candidate.last_scored_ms,
+    }
 
 
 _FLOOR_KINDS = frozenset({"mcap", "volume", "liquidity"})
@@ -573,6 +611,8 @@ class Engine:
                             self._tick_counts[f"free_veto:{vetoes[0].split(':')[0]}"] += 1
                             continue
                 self.watching[candidate.key] = candidate
+                if candidate.mcap_usd > 0 and not candidate.first_quoted_ms:
+                    stamp_quote(candidate)
                 self._reads.setdefault(
                     candidate.key,
                     {"call": "wait" if observe_early(candidate.source) else "scan"},
@@ -1238,7 +1278,7 @@ class Engine:
             return decision, enrichment.buyers, _crowd_sponsors(enrichment.crowd)
         finally:
             if painted:
-                candidate.last_scored_ms = now_ms()
+                stamp_scored(candidate)
             self._inflight.discard(candidate.key)
 
     def _paint_watch(
@@ -1414,6 +1454,7 @@ class Engine:
                 candidate.liquidity_usd = snap.liquidity_usd
                 candidate.ret_5m = snap.price_change_m5
                 snap.stamp(candidate)
+                stamp_quote(candidate)
                 if observe_early(candidate.source) and was_mcap <= 0 and candidate.mcap_usd > 0:
                     log.info(
                         "hood indexed",
@@ -1687,6 +1728,7 @@ class Engine:
             "dex_photo": candidate.dex_photo,
             "dex_aligned": candidate.dex_aligned,
             "liq": round(candidate.liquidity_usd),
+            **watch_latency(candidate),
             **stamp_live_floors(
                 dict(self._reads.get(candidate.key) or {"call": "scan"}),
                 early_observe_floors(candidate, self.strategy),

@@ -31,7 +31,7 @@ max_watching = 12
 rescore_seconds = 8
 # Bundle/LP skip stays off the visor this long so it cannot steal a card again.
 skip_ban_minutes = 120
-# Below this, skip visor/enrich. Buy floor is playbook copy_min (100k), not this.
+# Below this, skip visor/enrich. Buy floor is playbook copy_min (50k), not this.
 dead_mcap_usd = 50000
 # Proof of life, with a breakdown of what rejected everything. 0 disables.
 heartbeat_seconds = 60.0
@@ -371,7 +371,7 @@ shadow_track_minutes = 180
 # Coins die in minutes and vamps are everywhere. Short window, tight cluster.
 max_age_minutes = 45
 copy_max_age_minutes = 30
-copy_min_mcap_usd = 100000
+copy_min_mcap_usd = 50000
 copy_max_mcap_usd = 2000000
 max_cluster_pct = 0.20
 max_unknown_top1_pct = 0.28
@@ -381,7 +381,7 @@ require_sponsor = false
 
 [playbooks.bnb]
 copy_max_age_minutes = 25
-copy_min_mcap_usd = 100000
+copy_min_mcap_usd = 50000
 copy_max_mcap_usd = 2000000
 max_cluster_pct = 0.45
 
@@ -389,7 +389,7 @@ max_cluster_pct = 0.45
 # Dip, hold, runner. Don't chase a 5m rip; first take later so the bag can reprice.
 max_age_minutes = 240
 copy_max_age_minutes = 90
-copy_min_mcap_usd = 100000
+copy_min_mcap_usd = 50000
 copy_max_mcap_usd = 2000000
 max_cluster_pct = 0.20
 max_bundle_pct = 0.20

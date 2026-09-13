@@ -172,6 +172,10 @@ def watch_row_to_candidate(row: dict[str, Any]) -> Candidate | None:
         dex_paid=bool(row.get("dex_paid")),
         dex_photo=bool(row.get("dex_photo")),
         dex_aligned=bool(row.get("dex_aligned")),
+        last_scored_ms=int(row.get("last_scored_ms") or 0),
+        first_scored_ms=int(row.get("first_scored_ms") or 0),
+        quoted_at_ms=int(row.get("quoted_at_ms") or 0),
+        first_quoted_ms=int(row.get("first_quoted_ms") or 0),
     )
 
 
@@ -474,7 +478,7 @@ HTML = """<!doctype html>
   .watch-bar button { font: inherit; background: #1a1a1a; color: #fff; border: 1px solid #333;
                       padding: 6px 12px; cursor: pointer; border-radius: 6px; }
   .watch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 6px; }
-  .lane { margin: 0 0 16px; padding: 10px 12px 12px; border: 1px solid var(--line); border-radius: 8px; }
+  .lane { margin: 0 0 16px; padding: 10px 12px 12px; border: 1px solid var(--line); border-radius: 8px; min-height: 88px; }
   .lane > h1 { margin: 0 0 8px; }
   .lane-hold { border-color: #5a4a18; background: #0c0a04; }
   .lane-hold > h1 { color: #ffd24a; }
@@ -482,8 +486,7 @@ HTML = """<!doctype html>
   .lane-scan > h1 { color: #3ad6ff; }
   .lane-wait { border-color: #4a3a10; background: #100c04; }
   .lane-wait > h1 { color: #ffb020; }
-  .lane-skip { border-color: #3a1518; background: #0c0406; }
-  .lane-skip > h1 { color: #ff6b7a; }
+  .lane-skip { display: none; }
   .wcard { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; background: #050505;
            cursor: pointer; min-height: 0; contain: layout; }
   .wcard.on { border-color: #555; background: #0c0c0c; }
@@ -493,6 +496,11 @@ HTML = """<!doctype html>
   .wcard .age { font-size: 12px; font-weight: 700; color: #ffd24a; font-variant-numeric: tabular-nums; }
   .wcard .meta { font-size: 10px; color: var(--muted); margin: 1px 0; }
   .wcard .kols { font-size: 10px; color: #c8c8c8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .wcard .buy-p { font-size: 18px; font-weight: 800; letter-spacing: -.03em; color: #fff;
+                  font-variant-numeric: tabular-nums; margin: 2px 0 0; }
+  .wcard .need { font-size: 12px; line-height: 1.35; margin: 4px 0 2px; padding: 4px 6px; border-radius: 4px;
+                 border: 1px solid #4a3a10; background: #100c04; color: #ffb020; font-weight: 700; }
+  .wcard .need-ok { border-color: #15512f; background: #04100a; color: #3dff9a; }
   .dex-paid { color: #3dff9a; font-weight: 800; letter-spacing: .08em; }
   .dex-no { color: #ff3b4e; font-weight: 800; letter-spacing: .08em; }
   a.xbtn { display: inline-block; margin: 4px 0 2px; padding: 2px 8px; border: 1px solid #333;
@@ -609,7 +617,7 @@ HTML = """<!doctype html>
       <h1>wait</h1>
       <div id="watch-wait" class="watch-grid"></div>
     </div>
-    <div class="lane lane-skip">
+    <div class="lane lane-skip" hidden>
       <h1>skip</h1>
       <div id="watch-skip" class="watch-grid"></div>
     </div>
@@ -787,6 +795,58 @@ let inflight = false;
 let queued = false;
 let heavySig = '';
 
+const secTxt = s => {
+  s = Number(s)||0;
+  if (s < 60) return (s < 10 ? (Math.round(s*10)/10) : Math.round(s)) + 's';
+  return ageTxt(s/60);
+};
+// What is still between this coin and a buy. Vetoes first; with none, the
+// score gaps; with neither, it is buyable and says so.
+function needList(w) {
+  if ((w.call||'scan') === 'hold') return [];
+  const v = (w.vetoes || []).filter(Boolean).map(String);
+  if (v.length) return v;
+  const n = x => Number(x);
+  const out = [];
+  if (w.p != null && w.min_p != null && n(w.p) < n(w.min_p)) {
+    out.push('probabilidade '+Math.round(n(w.p)*100)+'% < piso '+Math.round(n(w.min_p)*100)+'%');
+  }
+  if (w.ev != null && w.min_ev != null && n(w.ev) < n(w.min_ev)) {
+    out.push('EV '+n(w.ev).toFixed(3)+' < piso '+n(w.min_ev).toFixed(3));
+  }
+  const r = w.rubric || {};
+  if (r.total != null && w.min_rubric != null && n(r.total) < n(w.min_rubric)) {
+    out.push('rubric '+r.total+' < piso '+w.min_rubric);
+  }
+  if (!out.length && w.p == null) out.push('scan ainda não fechou');
+  return out;
+}
+function needTxt(w) {
+  if ((w.call||'scan') === 'hold') return 'HOLD · gerenciando a saída';
+  if ((w.call||'scan') === 'scan' && w.p == null) return 'SCAN · lendo holders, chart e mcap';
+  const l = needList(w);
+  return l.length ? 'ESPERA · '+l.join(' · ') : 'PRONTA · passa nos gates';
+}
+function needCls(w) {
+  return 'need' + (needList(w).length || (w.call||'scan')==='scan' && w.p == null ? '' : ' need-ok');
+}
+function pevTxt(w) {
+  if (w.p == null) return 'compra —';
+  const p = Math.round(Number(w.p)*100);
+  const mp = w.min_p == null ? '' : ' · piso '+Math.round(Number(w.min_p)*100)+'%';
+  return 'compra '+p+'%'+mp;
+}
+function latTxt(w) {
+  const bits = [];
+  if (w.found_lag_s != null) bits.push('descoberta '+secTxt(w.found_lag_s)+' após o pool');
+  if (w.quote_lag_s != null) bits.push('mcap em '+secTxt(w.quote_lag_s));
+  else bits.push('mcap ainda sem quote');
+  if (w.scan_lag_s != null) bits.push('scan em '+secTxt(w.scan_lag_s));
+  else bits.push('scan ainda aberto');
+  if (w.quote_age_s != null) bits.push('mcap há '+secTxt(w.quote_age_s));
+  if (w.read_age_s != null) bits.push('leitura há '+secTxt(w.read_age_s));
+  return bits.join(' · ');
+}
 function watchKey(w) { return w.chain+':'+w.address; }
 function watchBody(w) {
   const call = w.call || 'scan';
@@ -801,20 +861,21 @@ function watchBody(w) {
     + '</div>';
   const kols = (w.kols && w.kols.length) ? w.kols.join(', ') : '—';
   const fomo = (w.fomo && w.fomo.length) ? w.fomo.join(', ') : '—';
-  const pev = (w.p != null && Number(w.p) > 0)
-    ? '<div class="meta" data-f="pev">p '+Number(w.p).toFixed(3)+' · EV '+(Number(w.ev)>=0?'+':'')+Number(w.ev).toFixed(3)+'</div>'
-    : '<div class="meta" data-f="pev"></div>';
+  const pev = '<div class="buy-p" data-f="pev">'+pevTxt(w)+'</div>';
+  const need = '<div class="'+needCls(w)+'" data-f="need">'+needTxt(w)+'</div>';
+  const lat = '<div class="meta" data-f="lat">'+latTxt(w)+'</div>';
   return '<div class="wcard-h"><span class="sym" data-f="sym">'+(w.symbol || w.name || caHead(w.address))+'</span>'+copyBtn(w.address)+'</div>'
     + '<div class="wcard-h"><span class="chain">'+chainShort(w.chain)+'</span><span class="age" data-f="age">'+ageTxt(w.age_min)+'</span></div>'
     + '<div class="mcap" data-f="mcap">'+mcapTxt(w.mcap)+'</div>'
+    + pev
+    + need
+    + lat
     + certHtml(w.cert)+' '+pill+' '+role(w.role)
     + whales
     + '<div class="kols" data-f="kols">kols '+kols+'</div>'
     + '<div class="kols" data-f="fomo">fomo '+fomo+'</div>'
     + dexLine(w)
     + rubricLine(w.rubric || {})
-    + '<div class="meta" data-f="why">'+(w.why && w.why !== 'ok' ? w.why : '')+'</div>'
-    + pev
     + '<div data-f="tw" data-h="'+esc(xHandle(w.tw && w.tw.official)||'')+'">'+twLine(w.tw)+'</div>'
     + '<div data-f="ret" class="'+cls(w.ret_5m)+'">'+pct(w.ret_5m||0)+' · vol '+kM(w.vol5m)+'</div>';
 }
@@ -830,7 +891,8 @@ function setNode(n, t) {
 function cardFp(w) {
   const r = w.rubric || {};
   return [w.call, w.label, w.symbol, w.mcap, w.age_min, w.vol5m, w.ret_5m, w.p, w.ev, r.total,
-    w.why, w.cert, w.dex_paid, (w.kols||[]).join(), (w.fomo||[]).join(), w.whale_n].join('|');
+    w.why, w.cert, w.dex_paid, (w.kols||[]).join(), (w.fomo||[]).join(), w.whale_n,
+    (w.vetoes||[]).join(), w.found_lag_s, w.quote_lag_s, w.scan_lag_s, w.quote_age_s, w.read_age_s].join('|');
 }
 function fillLive(el, w) {
   const set = (f, t) => setNode(el.querySelector('[data-f="'+f+'"]'), t);
@@ -839,7 +901,11 @@ function fillLive(el, w) {
   set('sym', w.symbol || w.name || caHead(w.address));
   set('kols', 'kols '+((w.kols && w.kols.length) ? w.kols.join(', ') : '—'));
   set('fomo', 'fomo '+((w.fomo && w.fomo.length) ? w.fomo.join(', ') : '—'));
-  set('why', (w.why && w.why !== 'ok') ? w.why : '');
+  set('pev', pevTxt(w));
+  set('lat', latTxt(w));
+  set('need', needTxt(w));
+  const needEl = el.querySelector('[data-f="need"]');
+  if (needEl && needEl.className !== needCls(w)) needEl.className = needCls(w);
   set('whales', w.whale_n == null ? 'whales —' : ('whales '+w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0)));
   const cert = el.querySelector('[data-f="cert"]');
   if (cert) {
@@ -894,9 +960,6 @@ function fillLive(el, w) {
     if (ret.className !== rk) ret.className = rk;
     setNode(ret, pct(w.ret_5m||0)+' · vol '+kM(w.vol5m));
   }
-  if (w.p != null) {
-    set('pev', 'p '+Number(w.p).toFixed(3)+' · EV '+(Number(w.ev)>=0?'+':'')+Number(w.ev).toFixed(3));
-  }
 }
 
 function laneOf(w) {
@@ -907,19 +970,17 @@ function paintWatch(list, running) {
   const groups = {hold:[], scan:[], wait:[], skip:[]};
   list.forEach(w => groups[laneOf(w)].push(w));
   const keep = new Set(list.map(watchKey));
+  const titles = {hold:'hold', scan:'scanning', wait:'wait'};
   const emptyMsg = {
     hold: 'nenhum hold nestes cards',
     scan: running ? 'scanning…' : 'start the bot',
     wait: 'nenhum wait',
-    skip: 'nenhum skip',
   };
-  ['hold','scan','wait','skip'].forEach(lane => {
+  ['hold','scan','wait'].forEach(lane => {
     const box = $('watch-'+lane);
     if (!box) return;
     const items = groups[lane];
     if (!items.length) return;
-    const laneEl = box.closest('.lane');
-    if (laneEl) laneEl.hidden = false;
     if (box.dataset.empty) {
       box.dataset.empty = '';
       const muted = box.querySelector(':scope > .muted');
@@ -945,18 +1006,17 @@ function paintWatch(list, running) {
   document.querySelectorAll('#tab-watch .wcard').forEach(el => {
     if (!keep.has(el.dataset.pick)) el.remove();
   });
-  ['hold','scan','wait','skip'].forEach(lane => {
+  ['hold','scan','wait'].forEach(lane => {
     const box = $('watch-'+lane);
     if (!box) return;
-    const laneEl = box.closest('.lane');
+    const n = groups[lane].length;
+    const h = box.previousElementSibling;
+    if (h && h.tagName === 'H1') h.textContent = titles[lane]+' ('+n+')';
     const has = !!box.querySelector('.wcard');
-    if (laneEl && lane !== 'hold') laneEl.hidden = !has;
+    // Every lane stays on screen. A lane that vanishes when empty reads as a
+    // broken visor, and you cannot tell "no waits" from "wait lane gone".
     if (has) {
       box.dataset.empty = '';
-      return;
-    }
-    if (lane === 'hold') {
-      if (box.dataset.empty) { box.innerHTML = ''; box.dataset.empty = ''; }
       return;
     }
     const empty = emptyMsg[lane];
@@ -995,6 +1055,9 @@ function fillCoin(el, w) {
   const minEv = w.min_ev == null ? '—' : Number(w.min_ev).toFixed(4);
   set('pwin', (w.p == null ? '—' : Number(w.p).toFixed(4))+'  (piso '+minP+')');
   set('ev', (w.ev == null ? '—' : ((Number(w.ev)>=0?'+':'')+Number(w.ev).toFixed(4)))+'  (piso '+minEv+')');
+  set('need', needTxt(w));
+  set('pev', pevTxt(w));
+  set('lat', latTxt(w));
   set('why', w.explain || w.why || '');
   set('whales', w.whale_n==null?'—':(numFull(w.whale_n)+' · '+pctFull(w.whale_pct)+' · '+usdFull(w.whale_usd)));
   set('kols', (w.kols&&w.kols.length) ? w.kols.join(', ') : '—');
@@ -1064,6 +1127,10 @@ function paintCoin(opts) {
     + stat('dex paid', 'dexpaid', w.dex_paid ? 'yes' : 'no')
     + '</div>'
     + '<div class="buy-box score-'+tone+'">'
+    + '<h2>o que falta pra comprar</h2>'
+    + '<p data-f="need">'+esc(needTxt(w))+'</p>'
+    + '<div class="coin-h"><span class="score-n" data-f="pev">'+esc(pevTxt(w))+'</span></div>'
+    + '<p class="muted" data-f="lat">'+esc(latTxt(w))+'</p>'
     + '<h2>nota desta moeda</h2>'
     + '<p>Régua igual pra todas; os inputs (chart, crowd, chain, narrativa) são desta CA. WAITING no topo é PnL da conta, não nota.</p>'
     + '<div class="coin-h"><span class="score-n" data-f="c-score">'+(pending?'—':r.total)+'</span>'

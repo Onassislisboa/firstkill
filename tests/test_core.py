@@ -868,12 +868,15 @@ class TestRisk(unittest.TestCase):
         )
         score = Score(probability=0.90, expected_value=0.5)
         payoff = Payoff(avg_win=1.0, avg_loss=0.25, samples=50, from_history=True)
+        # Bottom of the band is the configured buy floor, not a literal: the
+        # smallest size is what a coin *at the floor* gets.
+        floor = float(STRATEGY.get("playbooks.solana.copy_min_mcap_usd", 50_000))
         lo = Candidate(
             chain=Chain.SOLANA,
             address="lo",
             liquidity_usd=10**7,
             price_usd=1.0,
-            mcap_usd=100_000.0,
+            mcap_usd=floor,
         )
         hi = Candidate(
             chain=Chain.SOLANA,
@@ -1924,7 +1927,8 @@ class TestPlaybook(unittest.TestCase):
         self.assertEqual(copy_signal(age_minutes=120, mcap_usd=150_000, **buying), 0.0)
         self.assertEqual(copy_signal(age_minutes=8, mcap_usd=5_000_000, **buying), 0.0)
         self.assertEqual(copy_signal(age_minutes=8, mcap_usd=51_000_000, **buying), 0.0)
-        self.assertEqual(copy_signal(age_minutes=8, mcap_usd=80_000, **buying), 0.0)
+        floor = float(STRATEGY.get("playbooks.solana.copy_min_mcap_usd", 50_000))
+        self.assertEqual(copy_signal(age_minutes=8, mcap_usd=floor - 1, **buying), 0.0)
         idle = dict(buying, smart_buys=0.0)
         self.assertEqual(copy_signal(age_minutes=8, mcap_usd=150_000, **idle), 0.0)
 
@@ -2182,6 +2186,36 @@ class TestPlaybook(unittest.TestCase):
         )
         self.assertEqual(stamped.created_at_ms, 1_700_000_000_000)
         self.assertEqual(stamped.discovered_at_ms, 1_700_000_100_000)
+
+    def test_watch_latency_is_engine_clock_not_pair_age(self):
+        from alphahound.engine import stamp_quote, stamp_scored, watch_latency
+        from alphahound.preview import watch_row_to_candidate
+
+        c = Candidate(
+            chain=Chain.SOLANA,
+            address="mint",
+            created_at_ms=1_000_000,
+            discovered_at_ms=1_008_000,
+        )
+        stamp_quote(c, now=1_011_000)
+        stamp_scored(c, now=1_020_000)
+        lat = watch_latency(c, now=1_021_000)
+        self.assertEqual(lat["found_lag_s"], 8.0)
+        self.assertEqual(lat["quote_lag_s"], 3.0)
+        self.assertEqual(lat["scan_lag_s"], 12.0)
+        self.assertEqual(lat["quote_age_s"], 10.0)
+        self.assertEqual(lat["read_age_s"], 1.0)
+        again = watch_row_to_candidate(
+            {
+                "chain": "solana",
+                "address": "mint",
+                "discovered_at_ms": 1_008_000,
+                "first_quoted_ms": 1_011_000,
+                "first_scored_ms": 1_020_000,
+            }
+        )
+        self.assertEqual(again.first_quoted_ms, 1_011_000)
+        self.assertEqual(again.first_scored_ms, 1_020_000)
 
     def test_restart_keeps_the_radar_not_just_the_cards(self):
         from alphahound.engine import keep_on_radar, visor_card
