@@ -45,6 +45,7 @@ from .models import (
     now_ms,
 )
 from .net import Http
+from .origin import launchpad_origin
 from .portfolio import ExitOrder, PositionManager
 from .playbook import gate as pb_gate
 from .playbook import section as pb_section
@@ -237,7 +238,9 @@ def keep_unpaid_watch(candidate: Candidate) -> bool:
     return candidate.source == "inspect" or observe_early(candidate.source)
 
 
-def keep_on_radar(candidate: Candidate, reads: dict, floor: float) -> bool:
+def keep_on_radar(
+    candidate: Candidate, reads: dict, floor: float, strategy: Config | None = None
+) -> bool:
     """Radar keep rule, mirroring `_prune_watching`'s drops.
 
     Wider than `visor_card` on purpose: an unquoted Pons launch has no card but
@@ -249,6 +252,8 @@ def keep_on_radar(candidate: Candidate, reads: dict, floor: float) -> bool:
     if candidate.pack_role == "vamp":
         return False
     if boosted_off_radar(candidate):
+        return False
+    if strategy is not None and not launchpad_origin(candidate, strategy)[0]:
         return False
     if drop_for_scan_mcap(candidate, floor):
         return False
@@ -679,6 +684,11 @@ class Engine:
                 if boosted_off_radar(candidate):
                     self._ban_skip(candidate, "dex_boost")
                     continue
+                if candidate.source != "inspect" and not launchpad_origin(
+                    candidate, self.strategy
+                )[0]:
+                    self._ban_skip(candidate, "launchpad")
+                    continue
                 if not await self._hood_pons_ok(candidate):
                     continue
                 if candidate.source != "inspect" and mcap_is_dead(candidate.mcap_usd, dead_floor):
@@ -708,6 +718,7 @@ class Engine:
             self._drop_below_scan_mcap()
             self._drop_unpaid()
             self._drop_boosted()
+            self._drop_off_launchpad()
             await self.score_and_enter()
             self._prune_watching()
             self._watch_in = sum(1 for k in self.watching if k not in before)
@@ -1372,6 +1383,12 @@ class Engine:
                 )
                 return None
 
+            if candidate.source != "inspect" and not launchpad_origin(
+                candidate, self.strategy
+            )[0]:
+                self._ban_skip(candidate, "launchpad")
+                return None
+
             self._tick_counts["enriched"] += 1
             score = self.scorer.score(enrichment)
             ok, why = self.scorer.passes(score)
@@ -1611,6 +1628,9 @@ class Engine:
                 candidate.volume_5m_usd = snap.volume_m5
                 candidate.liquidity_usd = snap.liquidity_usd
                 candidate.ret_5m = snap.price_change_m5
+                # ponytail: best Dexscreener pair is the venue; empty pump-stream dex becomes meteora here
+                if snap.dex_id and (candidate.dex_id or "").lower() != "pons":
+                    candidate.dex_id = snap.dex_id
                 snap.stamp(candidate)
                 stamp_quote(candidate)
                 if observe_early(candidate.source) and was_mcap <= 0 and candidate.mcap_usd > 0:
@@ -1671,6 +1691,7 @@ class Engine:
             if not candidate.symbol and not candidate.name:
                 self._label_fail.add(candidate.key)
         self._drop_boosted()
+        self._drop_off_launchpad()
 
     def _retag(self) -> dict:
         by_key = {c.key: c for c in self.watching.values()}
@@ -1741,6 +1762,13 @@ class Engine:
             if boosted_off_radar(candidate):
                 self._ban_skip(candidate, "dex_boost")
 
+    def _drop_off_launchpad(self) -> None:
+        for candidate in list(self.watching.values()):
+            if candidate.key in self.positions or candidate.source == "inspect":
+                continue
+            if not launchpad_origin(candidate, self.strategy)[0]:
+                self._ban_skip(candidate, "launchpad")
+
     def _ban_skip(self, candidate: Candidate, tag: str) -> None:
         if candidate.source != "inspect":
             self._skip_ban[candidate.key] = now_ms()
@@ -1785,6 +1813,11 @@ class Engine:
                 continue
             if boosted_off_radar(candidate):
                 self._ban_skip(candidate, "dex_boost")
+                continue
+            if candidate.source != "inspect" and not launchpad_origin(
+                candidate, self.strategy
+            )[0]:
+                self._ban_skip(candidate, "launchpad")
                 continue
             read = self._reads.get(key) or {}
             if bundle_off_wait(
@@ -1948,7 +1981,7 @@ class Engine:
                 call = "wait"
             rec = {k: v for k, v in row.items() if k not in {"chain", "address"}}
             rec["call"] = call
-            if not keep_on_radar(candidate, {candidate.key: rec}, floor):
+            if not keep_on_radar(candidate, {candidate.key: rec}, floor, self.strategy):
                 continue
             self.watching[candidate.key] = candidate
             self._reads.setdefault(candidate.key, rec)

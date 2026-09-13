@@ -106,7 +106,7 @@ lp_locker_addresses = []
 require_launchpad = true
 
 [launchpads.solana]
-# pump.fun only. Graduates keep the `pump` mint suffix even on PumpSwap.
+# pump.fun / PumpSwap only. A `pump` mint on Meteora or Raydium is not a pass.
 dex_ids = ["pumpfun", "pumpswap"]
 mint_suffixes = ["pump"]
 

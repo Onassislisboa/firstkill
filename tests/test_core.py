@@ -665,9 +665,40 @@ class TestGates(unittest.TestCase):
         pump = Candidate(
             chain=Chain.SOLANA,
             address="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxpump",
-            dex_id="raydium",
+            dex_id="pumpswap",
         )
         self.assertTrue(launchpad_origin(pump, STRATEGY)[0])
+
+        pump_unquoted = Candidate(
+            chain=Chain.SOLANA,
+            address="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxpump",
+        )
+        self.assertTrue(launchpad_origin(pump_unquoted, STRATEGY)[0])
+
+        meteora = Candidate(
+            chain=Chain.SOLANA,
+            address="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxpump",
+            dex_id="meteora",
+        )
+        self.assertFalse(launchpad_origin(meteora, STRATEGY)[0])
+
+        stream_meteora = Candidate(
+            chain=Chain.SOLANA,
+            address="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxpump",
+            source="pumpfun_stream",
+            dex_id="meteora",
+        )
+        self.assertFalse(launchpad_origin(stream_meteora, STRATEGY)[0])
+        from alphahound.engine import keep_on_radar
+
+        self.assertFalse(keep_on_radar(meteora, {}, 50_000, STRATEGY))
+
+        raydium_pump = Candidate(
+            chain=Chain.SOLANA,
+            address="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxpump",
+            dex_id="raydium",
+        )
+        self.assertFalse(launchpad_origin(raydium_pump, STRATEGY)[0])
 
         bonk = Candidate(
             chain=Chain.SOLANA,
