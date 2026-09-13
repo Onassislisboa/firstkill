@@ -662,7 +662,8 @@ class Engine:
                     "unrealized_pct": round(position.gain(mark), 4),
                     "remaining_pct": round(remaining, 4),
                     "ladder": position.ladder_filled,
-                    "age_min": int((now_ms() - position.opened_at_ms) / 60_000),
+                    "held_min": round((now_ms() - position.opened_at_ms) / 60_000.0, 1),
+                    "age_min": round((now_ms() - position.opened_at_ms) / 60_000.0, 1),
                     "role": position.candidate.pack_role or "",
                     "entry_rubric": round(position.entry_rubric, 1),
                     "hold_rubric": round(position.last_hold_rubric, 1),
@@ -1687,12 +1688,17 @@ class Engine:
             log.info("restored positions", extra={"count": len(self.positions)})
 
     def _watch_row(self, candidate: Candidate) -> dict:
+        pos = self.positions.get(candidate.key)
+        held = (
+            round((now_ms() - pos.opened_at_ms) / 60_000.0, 1) if pos is not None else None
+        )
         return {
             "symbol": candidate.symbol or "",
             "name": candidate.name or "",
             "chain": candidate.chain.value,
             "address": candidate.address,
             "age_min": round(candidate.age_minutes, 1),
+            "held_min": held,
             "created_at_ms": candidate.created_at_ms,
             "discovered_at_ms": candidate.discovered_at_ms,
             "mcap": round(candidate.mcap_usd),

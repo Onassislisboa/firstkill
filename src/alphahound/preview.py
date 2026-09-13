@@ -606,7 +606,7 @@ HTML = """<!doctype html>
       <h1>hold</h1>
       <div id="watch-hold" class="watch-grid"></div>
       <table id="holds" class="book"><thead><tr>
-        <th>token</th><th>held</th><th>pnl</th><th>left</th><th>age</th><th>mcap</th><th>stage 3</th>
+        <th>token</th><th>held</th><th>pnl</th><th>left</th><th>hold</th><th>mcap</th><th>stage 3</th>
       </tr></thead><tbody></tbody></table>
     </div>
     <div class="lane lane-scan">
@@ -717,6 +717,7 @@ const mcapTxt = n => {
 const pct = n => (n>=0?'+':'') + (Number(n)*100).toFixed(1) + '%';
 const cls = n => n>0?'up':n<0?'dn':'';
 const chainShort = c => ({solana:'SOL', bnb:'BNB', robinhood_chain:'HOOD'}[c] || (c||'').toUpperCase());
+const cardAge = w => ((w.call||'')==='hold' && w.held_min != null) ? ageTxt(w.held_min) : ageTxt(w.age_min);
 const ageTxt = m => {
   m = Number(m)||0;
   if (m >= 60) {
@@ -865,7 +866,7 @@ function watchBody(w) {
   const need = '<div class="'+needCls(w)+'" data-f="need">'+needTxt(w)+'</div>';
   const lat = '<div class="meta" data-f="lat">'+latTxt(w)+'</div>';
   return '<div class="wcard-h"><span class="sym" data-f="sym">'+(w.symbol || w.name || caHead(w.address))+'</span>'+copyBtn(w.address)+'</div>'
-    + '<div class="wcard-h"><span class="chain">'+chainShort(w.chain)+'</span><span class="age" data-f="age">'+ageTxt(w.age_min)+'</span></div>'
+    + '<div class="wcard-h"><span class="chain">'+chainShort(w.chain)+'</span><span class="age" data-f="age">'+cardAge(w)+'</span></div>'
     + '<div class="mcap" data-f="mcap">'+mcapTxt(w.mcap)+'</div>'
     + pev
     + need
@@ -890,14 +891,14 @@ function setNode(n, t) {
 }
 function cardFp(w) {
   const r = w.rubric || {};
-  return [w.call, w.label, w.symbol, w.mcap, w.age_min, w.vol5m, w.ret_5m, w.p, w.ev, r.total,
+  return [w.call, w.label, w.symbol, w.mcap, w.age_min, w.held_min, w.vol5m, w.ret_5m, w.p, w.ev, r.total,
     w.why, w.cert, w.dex_paid, (w.kols||[]).join(), (w.fomo||[]).join(), w.whale_n,
     (w.vetoes||[]).join(), w.found_lag_s, w.quote_lag_s, w.scan_lag_s, w.quote_age_s, w.read_age_s].join('|');
 }
 function fillLive(el, w) {
   const set = (f, t) => setNode(el.querySelector('[data-f="'+f+'"]'), t);
   set('mcap', mcapTxt(w.mcap));
-  set('age', ageTxt(w.age_min));
+  set('age', cardAge(w));
   set('sym', w.symbol || w.name || caHead(w.address));
   set('kols', 'kols '+((w.kols && w.kols.length) ? w.kols.join(', ') : '—'));
   set('fomo', 'fomo '+((w.fomo && w.fomo.length) ? w.fomo.join(', ') : '—'));
@@ -1036,7 +1037,7 @@ function fillCoin(el, w) {
   set('liq', usdFull(w.liq));
   set('vol5m', usdFull(w.vol5m));
   set('ret5m', pctFull(w.ret_5m));
-  set('age', ageTxt(w.age_min));
+  set('age', cardAge(w));
   set('holders', w.holders==null?'—':numFull(w.holders));
   set('rt', w.rt==null?'—':pctFull(w.rt));
   const pending = r.total == null;
@@ -1121,7 +1122,7 @@ function paintCoin(opts) {
     + stat('liquidity', 'liq', usdFull(w.liq))
     + stat('vol 5m', 'vol5m', usdFull(w.vol5m))
     + stat('ret 5m', 'ret5m', pctFull(w.ret_5m))
-    + stat('age', 'age', ageTxt(w.age_min))
+    + stat((w.call||'')==='hold' ? 'hold' : 'age', 'age', cardAge(w))
     + stat('holders', 'holders', w.holders==null?'—':numFull(w.holders))
     + stat('round trip', 'rt', w.rt==null?'—':pctFull(w.rt))
     + stat('dex', 'dexname', esc(w.dex||'—'))
@@ -1198,7 +1199,7 @@ function fillHoldRow(tr, h) {
   }
   set('held', usd(h.held_usd != null ? h.held_usd : h.size_usd));
   set('left', Math.round((h.remaining_pct||0)*100)+'%');
-  set('age', mins(h.age_min));
+  set('age', mins(h.held_min != null ? h.held_min : h.age_min));
   set('mcap', mcapPath(h.mcap_entry, h.mcap));
   const st = tr.querySelector('[data-f="stage"]');
   if (st) {
