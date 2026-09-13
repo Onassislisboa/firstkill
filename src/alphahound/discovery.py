@@ -8,6 +8,7 @@ convenient:
     pump.fun websocket   sub-second, push
     dexscreener profiles ~seconds, poll
     dexscreener boosts   ~seconds, poll, and a signal about the promoter
+    launchpad search     ~seconds, poll, one configured venue per round
     watchlist            whenever you say so
 
 Everything is deduplicated and thrown away after `max_candidate_age_minutes`,
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 from dataclasses import dataclass, field
 
@@ -36,6 +38,31 @@ from .providers import DEX_CHAIN_SLUG, Dexscreener
 from .settings import Config, Settings
 
 log = get("discovery")
+
+
+# Dexscreener meters the profile/boost feeds at 60 req/min, and they refresh at
+# human speed anyway. 5s is ~12/min per feed, well clear of the limit.
+PROMO_POLL_MS = 5_000
+
+
+def launchpad_queries(settings: Settings, strategy: Config) -> list[str]:
+    """One search term per configured launchpad, for the enabled chains.
+
+    The profiles/boosts feeds are chain-agnostic and promoter-driven, so a
+    launchpad nobody is paying to promote is invisible to them: four.meme never
+    showed up at all, which read as "BNB is quiet" rather than "BNB is unpolled".
+    Searching each `dex_ids` entry covers every launchpad the config selects
+    without a per-venue scraper; `_accept` still enforces the origin rule, so a
+    fuzzy search hit on the wrong venue is dropped.
+    """
+    out: list[str] = []
+    for chain in settings.enabled_chains:
+        cfg = strategy.section(f"launchpads.{chain.value}")
+        for dex_id in (cfg or {}).get("dex_ids") or []:
+            term = str(dex_id).strip().lower()
+            if term and term not in out:
+                out.append(term)
+    return out
 
 
 @dataclass(slots=True)
@@ -67,6 +94,9 @@ class Discovery:
         self._queue: asyncio.Queue[Candidate] = asyncio.Queue(maxsize=2000)
         self._tasks: list[asyncio.Task] = []
         self._watchlist: set[str] = set()
+        # cycle([]) is empty, so next(..., None) below is the no-launchpad case.
+        self._launchpads = itertools.cycle(launchpad_queries(settings, strategy))
+        self._promo_at = 0
 
     # -- lifecycle ---------------------------------------------------------
     async def start(self) -> None:
@@ -97,22 +127,27 @@ class Discovery:
         addresses: list[str] = []
         sources: dict[str, str] = {}
 
-        fetched = await asyncio.gather(
-            self.dex.new_profiles(),
-            self.dex.boosted(),
-            return_exceptions=True,
-        )
-        for source, found in (
-            ("dexscreener_profiles", fetched[0]),
-            ("dexscreener_boosts", fetched[1]),
-        ):
-            if isinstance(found, Exception):
-                log.warning("source failed", extra={"source": source, "error": str(found)})
-                continue
-            for address in found:
-                if address not in sources:
-                    sources[address] = source
-                    addresses.append(address)
+        # Someone filling in socials or buying a boost is a human-speed event,
+        # so polling these on every 2s scan spent a 60/min budget for nothing -
+        # and the 429 came back on the next round as a gap, not as an error.
+        if now_ms() - self._promo_at >= PROMO_POLL_MS:
+            self._promo_at = now_ms()
+            fetched = await asyncio.gather(
+                self.dex.new_profiles(),
+                self.dex.boosted(),
+                return_exceptions=True,
+            )
+            for source, found in (
+                ("dexscreener_profiles", fetched[0]),
+                ("dexscreener_boosts", fetched[1]),
+            ):
+                if isinstance(found, Exception):
+                    log.warning("source failed", extra={"source": source, "error": str(found)})
+                    continue
+                for address in found:
+                    if address not in sources:
+                        sources[address] = source
+                        addresses.append(address)
 
         for address in self._watchlist:
             if address and address not in sources:
@@ -120,6 +155,22 @@ class Discovery:
                 addresses.append(address)
 
         out: list[Candidate] = []
+
+        # One launchpad per round, round-robin: every configured venue gets
+        # polled within a few seconds, and the search endpoint shares the 300/min
+        # pairs budget rather than the 60/min profile one.
+        query = next(self._launchpads, None)
+        if query:
+            try:
+                for snap in await self.dex.search(query):
+                    if snap.chain not in self.settings.enabled_chains:
+                        continue
+                    candidate = snap.to_candidate("launchpad_search")
+                    if self._accept(candidate):
+                        out.append(candidate)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("launchpad search failed", extra={"query": query, "error": str(exc)})
+
         # Repeat profile CAs don't need token_pairs again this minute; that
         # call was starving the visor quote loop on the same Dexscreener bucket.
         addresses = [

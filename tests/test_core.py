@@ -1303,6 +1303,18 @@ class TestReviewHistory(unittest.TestCase):
         self.assertEqual(fumbles[0]["symbol"], "RUN")
         self.assertEqual(fumbles[0]["contrib"][0][0], "copy_signal")
 
+        live = Decision(
+            candidate=Candidate(chain=Chain.SOLANA, address="now", price_usd=1.0, symbol="NOW"),
+            features=Features(),
+            score=Score(probability=0.2, expected_value=0.0),
+            action=Action.REJECT_GATE,
+            reason="top10: 80%",
+        )
+        self.store.record_decision(live)
+        default = {r["symbol"]: r["outcome"] for r in self.store.review_history()["rows"]}
+        self.assertEqual(default["NOW"], "tracking")
+        self.assertNotIn("NOW", {r["symbol"] for r in self.store.review_history(outcome="rejeicao_correta")["rows"]})
+
     def test_review_keeps_first_sight_mcap(self):
         from alphahound.models import Score
 
@@ -1476,6 +1488,45 @@ class TestProviderCache(unittest.TestCase):
             self.assertEqual(second[0].mcap_usd, 90_000)
 
         asyncio.run(scenario())
+
+    def test_the_cheap_endpoint_cannot_spend_the_quote_budget(self):
+        from alphahound.net import Http
+
+        http = Http()
+        http.limit("api.dexscreener.com", rate_per_sec=5.0, burst=8)
+        http.limit("api.dexscreener.com/orders", rate_per_sec=0.8, burst=2)
+
+        pairs = http._bucket("https://api.dexscreener.com/latest/dex/tokens/mint")
+        orders = http._bucket("https://api.dexscreener.com/orders/v1/solana/mint")
+        self.assertIsNot(pairs, orders)
+        self.assertEqual(pairs.rate, 5.0)
+        self.assertEqual(orders.rate, 0.8)
+        # Same prefix, same bucket: the 60/min budget is shared across mints.
+        self.assertIs(orders, http._bucket("https://api.dexscreener.com/orders/v1/bsc/other"))
+
+    def test_every_configured_launchpad_gets_polled(self):
+        from alphahound.discovery import launchpad_queries
+        from alphahound.settings import Config
+
+        strategy = Config(
+            {
+                "launchpads": {
+                    "solana": {"dex_ids": ["pumpfun", "pumpswap"]},
+                    "bnb": {"dex_ids": ["fourmeme"]},
+                    "robinhood_chain": {"dex_ids": ["pons"]},
+                }
+            }
+        )
+
+        class FakeSettings:
+            enabled_chains = (Chain.SOLANA, Chain.BNB)
+
+        # BNB has no stream and no promoter feed, so if it is missing here it is
+        # not discovered at all.
+        self.assertEqual(
+            launchpad_queries(FakeSettings(), strategy),
+            ["pumpfun", "pumpswap", "fourmeme"],
+        )
 
     def test_stamp_uses_pair_birth_not_visor_arrival(self):
         from alphahound.providers import PairSnapshot, pair_created_ms

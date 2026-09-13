@@ -282,7 +282,15 @@ class Dexscreener:
         # Documented as 300 req/min for the pairs endpoints. Staying under it
         # deliberately, because being rate-limited during a launch is the one
         # moment the data is worth anything.
-        http.limit("api.dexscreener.com", rate_per_sec=5.0, burst=8)
+        # 300 req/min documented. A 5.0/s bucket with burst 8 can emit 308 in a
+        # minute, which is why the quote loop still collected 429s at "exactly
+        # the limit": the budget is per minute, the burst is not.
+        http.limit("api.dexscreener.com", rate_per_sec=4.5, burst=4)
+        # These three are metered at 60 req/min each, not 300. The paid check
+        # alone fires once per candidate per scan, which on a 2s scan is 4x the
+        # budget - and the retries it earned were stalling the quote loop.
+        for path in ("/orders", "/token-profiles", "/token-boosts"):
+            http.limit(f"api.dexscreener.com{path}", rate_per_sec=0.8, burst=2)
         self._paid: dict[str, tuple[float, bool]] = {}
 
     async def _get(self, path: str, **kw: Any) -> Any:

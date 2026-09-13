@@ -24,8 +24,8 @@ max_candidate_age_minutes = 240
 max_candidates_per_tick = 0
 # How many enrichments run at once. Sequential was one SCAN pill on the visor.
 enrich_concurrency = 4
-# Discovery dumps hundreds of pairs. Cap the visor so wait/skip cannot sit
-# for hours — oldest wait loses the slot, new paid mints get the look.
+# Discovery dumps hundreds of pairs. Cap visor *cards* at this N. Unquoted
+# Hood waits sit in a separate pool of the same size, so they cannot eat cards.
 max_watching = 12
 # Full enrich this often. Quotes still tick; new coins jump the queue.
 rescore_seconds = 8

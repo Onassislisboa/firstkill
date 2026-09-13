@@ -418,8 +418,8 @@ class Store:
     ) -> dict[str, Any]:
         """Decisions + shadow MFE + closed trades, classified for the visor.
 
-        One row per reject decision (or closed trade). Does not write. Unresolved
-        shadows are omitted unless outcome=tracking — they are not 'correct rejects'.
+        One row per reject decision (or closed trade). Does not write.
+        Default includes unresolved shadows as tracking so the tab matches the session.
         """
         outcome = (outcome or "").strip().lower()
         fumble_pct = float(fumble_pct)
@@ -462,7 +462,9 @@ class Store:
             elif outcome == "tracking":
                 sql += " WHERE s.resolved = 0"
             else:
-                sql += " WHERE s.resolved = 1"
+                # Default "todos": live tracking + resolved. Resolved-only made
+                # the tab look frozen for `shadow_track_minutes` (3h).
+                sql += " WHERE 1=1"
             sql += " ORDER BY d.ts_ms DESC LIMIT ?"
             params.append(limit)
             for r in self.conn.execute(sql, params):

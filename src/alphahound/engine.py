@@ -222,6 +222,11 @@ def absorb_watch(dst: Candidate, src: Candidate) -> None:
 
 _FLOOR_KINDS = frozenset({"mcap", "volume", "liquidity"})
 
+# Dexscreener meters /orders at 60 req/min. A scan pass every 2s means anything
+# above ~2 probes per pass overdraws the budget, and the 429 it earns is paid
+# for by the quote loop sharing the retry queue. The 45s cache covers the rest.
+PAID_PROBES_PER_PASS = 2
+
 
 def stamp_live_floors(read: dict, floors: list[str]) -> dict:
     """Keep cluster/etc vetoes; rewrite mcap/vol/liq from the live quote."""
@@ -524,7 +529,7 @@ class Engine:
             probed = 0
             for candidate in found:
                 if unpaid_for_scan(candidate):
-                    if probed >= 8:
+                    if probed >= PAID_PROBES_PER_PASS:
                         if not observe_early(candidate.source):
                             continue
                     else:
@@ -690,6 +695,9 @@ class Engine:
                 "open": len(self.positions),
                 "equity_usd": round(self.risk.equity(), 2),
                 "since_last": dict(self._tick_counts),
+                # A launchpad that stops emitting reads as a quiet market unless
+                # you can see the per-source counts. BNB was silent for weeks.
+                "sources": dict(self.discovery.stats.by_source),
                 "best_probability": round(best_setup_p(self._reads, [c.key for c in visor]), 3),
                 "dead_loops": sorted(self._loop_dead),
             },
@@ -1144,7 +1152,10 @@ class Engine:
                     expected_value=0.0,
                     veto_reasons=free_vetoes,
                 )
-                if not candidate.last_scored_ms:
+                if not candidate.last_scored_ms and not wait_on_visor(free_vetoes):
+                    # Patience (mcap/volume/chase) is a visor WAIT, not a
+                    # review reject. Recording it opened a shadow that aged
+                    # into "rejeição correta" and drowned the tab.
                     self._record(
                         candidate,
                         cheap.features,
@@ -1168,6 +1179,7 @@ class Engine:
                 painted = True
                 return None
 
+            self._paint_watch(candidate, call="scan", why="enrich")
             try:
                 enrichment = await self.enricher.enrich(candidate, probe_size)
             except Exception as exc:  # noqa: BLE001
@@ -1427,7 +1439,7 @@ class Engine:
             if not candidate.symbol and not candidate.name and candidate.key not in self._label_fail:
                 unlabeled.append(candidate)
         if probe_paid:
-            for candidate in unpaid[:8]:
+            for candidate in unpaid[:PAID_PROBES_PER_PASS]:
                 try:
                     paid = await self.dex.token_is_paid(candidate.chain, candidate.address)
                 except Exception:  # noqa: BLE001
@@ -1577,10 +1589,23 @@ class Engine:
 
         overflow = [c for c in self.watching.values() if c.key not in self.positions]
         floor = float(self.strategy.get("loop.dead_mcap_usd", 50_000))
-        if len(self.watching) > cap:
-            overflow.sort(key=lambda c: watch_keep_key(c, self._reads, floor))
-            slots = max(0, cap - len(self.positions))
-            for key in {c.key for c in overflow[slots:]}:
+        cards = [
+            c
+            for c in overflow
+            if visor_card(c, self._reads, floor, dip_ok=self._floor_dip_ok(c, floor))
+            or c.source == "inspect"
+        ]
+        extras = [c for c in overflow if c.key not in {x.key for x in cards}]
+        # Two pools, same N. Mixing them let unpaid Hood eat visor slots so
+        # the page showed 4 cards against a "max 12" that was the radar.
+        if len(cards) > cap:
+            cards.sort(key=lambda c: watch_keep_key(c, self._reads, floor))
+            for key in {c.key for c in cards[cap:]}:
+                del self.watching[key]
+                self.enricher.forget(key)
+        if len(extras) > cap:
+            extras.sort(key=lambda c: watch_keep_key(c, self._reads, floor))
+            for key in {c.key for c in extras[cap:]}:
                 del self.watching[key]
                 self.enricher.forget(key)
         self._reads = {k: v for k, v in self._reads.items() if k in self.watching}

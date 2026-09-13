@@ -1509,6 +1509,14 @@ async function loadReview() {
 $('rev-out').addEventListener('change', loadReview);
 tick();
 setInterval(tick, 400);
+let lastRev = 0;
+setInterval(() => {
+  const tab = $('tab-review');
+  if (!tab || !tab.classList.contains('on')) return;
+  if (Date.now() - lastRev < 2000) return;
+  lastRev = Date.now();
+  loadReview();
+}, 2000);
 </script>
 </body>
 </html>
