@@ -702,14 +702,25 @@ class TestGates(unittest.TestCase):
 
         rug = self.enrichment(top10_pct=0.70, top1_pct=0.70, known_holder_pct=0.0)
         rug.mint = _FakeMint(None, None)
+        rug.crowd = {}
         vetoes, _ = evaluate_gates(rug, STRATEGY, self.store, live=True)
         self.assertTrue(any("unknown_whale" in v for v in vetoes))
 
     def test_unknown_top10_is_a_hard_veto(self):
         enr = self.enrichment(top10_pct=0.62, top1_pct=0.12, known_holder_pct=0.0)
         enr.mint = _FakeMint(None, None)
+        enr.crowd = {}
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
         self.assertTrue(any(v.startswith("top10:") for v in vetoes), vetoes)
+
+    def test_fomo_kols_excuse_concentration(self):
+        enr = self.enrichment(top10_pct=0.65, top1_pct=0.40, known_holder_pct=0.0)
+        enr.mint = _FakeMint(None, None)
+        enr.crowd = {"whale_n": 0, "kols": [], "fomo": ["DRK", "pe__lu"]}
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertFalse(any(v.startswith("top10:") for v in vetoes), vetoes)
+        self.assertFalse(any("unknown_whale" in v for v in vetoes), vetoes)
+        self.assertFalse(any(v.startswith("cabaled:") for v in vetoes), vetoes)
 
     def test_unmeasured_twitter_is_not_a_live_veto(self):
         enr = self.enrichment()

@@ -410,8 +410,12 @@ def evaluate_gates(
     # top-10 was well above 55% and it was still a real market. The exception
     # is UNKNOWN wallets stacking circulating supply: that is a rug. LP and
     # burn are already excluded from top1/top10 in distribution.analyze.
+    # Labeled Fomo/KOL inside is the explanation the top10 check is looking for.
+    # Without this, a coin stuffed with fomo.json wallets still dies as "unknown".
+    covered = _sponsored(enr)
     unknown_whale = (
-        f.top1_pct > p("max_unknown_top1_pct", 0.50)
+        not covered
+        and f.top1_pct > p("max_unknown_top1_pct", 0.50)
         and f.known_holder_pct < f.top1_pct * 0.6
     )
     check(
@@ -421,7 +425,8 @@ def evaluate_gates(
         f"top holder {f.top1_pct:.0%} is not a known KOL/whale",
     )
     unknown_top10 = (
-        f.top10_pct > p("max_top10_pct", 0.50)
+        not covered
+        and f.top10_pct > p("max_top10_pct", 0.50)
         and f.known_holder_pct < f.top10_pct * 0.6
     )
     check(
@@ -510,6 +515,8 @@ def evaluate_gates(
             classify(f, unknown, age_minutes=enr.candidate.age_minutes),
             chain.value,
         )
+        if extra and extra.startswith("cabaled:") and _sponsored(enr):
+            extra = None
         if extra and not (
             extra.startswith("unverified:") and enr.candidate.dex_paid
         ):
@@ -551,10 +558,14 @@ def watch_call(*, vetoed: bool, ok: bool, reasons: list[str]) -> str:
 
 def _sponsored(enr: Enrichment) -> bool:
     crowd = getattr(enr, "crowd", None) or {}
-    if crowd.get("kols") or int(crowd.get("whale_n") or 0) >= 1:
+    if crowd.get("kols") or crowd.get("fomo"):
+        return True
+    if int(crowd.get("whale_n") or 0) >= 1:
         return True
     f = enr.features
     unknown = enr.unknown
+    if "fomo_inside" not in unknown and f.fomo_inside >= 1:
+        return True
     if "copy_signal" not in unknown and f.copy_signal >= 1.0:
         return True
     if "whale_net_flow" not in unknown and f.whale_net_flow > 0:
