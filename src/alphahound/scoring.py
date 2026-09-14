@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 from .log import get
 from .models import Features, Position, Score, TradeRecord, now_ms
-from .verdict import bot_veto, classify
+from .verdict import FRESH_MIN_AGE_MIN, bot_veto, classify
 from .portfolio import banked_from_peak
 from .settings import Config, score_floors
 from .origin import launchpad_origin
@@ -458,10 +458,13 @@ def evaluate_gates(
             free_lp > max_free_lp,
             f"{free_lp:.0%} da liquidez livre (não burn/locker)",
         )
+    # Launchpad mints are 100% fresh by definition. Verdict already ignores
+    # that until FRESH_MIN_AGE_MIN; the gate was skipping every young pump.
     check(
         "fresh_wallets",
         ("fresh_wallet_pct",),
-        f.fresh_wallet_pct > p("max_fresh_wallet_pct", 0.70),
+        enr.candidate.age_minutes >= FRESH_MIN_AGE_MIN
+        and f.fresh_wallet_pct > p("max_fresh_wallet_pct", 0.70),
         f"{f.fresh_wallet_pct:.0%} fresh wallets",
     )
     check(

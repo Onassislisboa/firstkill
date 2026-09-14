@@ -135,9 +135,16 @@ def drop_for_scan_mcap(candidate: Candidate, floor: float) -> bool:
     return below_scan_mcap(candidate.mcap_usd, floor)
 
 
+LAUNCHPAD_SOURCES = frozenset(
+    {"pumpfun_stream", "pump.fun", "hood_stream", "launchpad_search"}
+)
+
+
 def unpaid_for_scan(candidate: Candidate) -> bool:
-    """No visor/enrich/watch without a paid Dexscreener listing. Inspect still goes through."""
-    return candidate.source != "inspect" and not candidate.dex_paid
+    """Dexscreener profiles need a paid listing. Launchpad feeds already paid the rent."""
+    if candidate.source in {"inspect"} | LAUNCHPAD_SOURCES:
+        return False
+    return not candidate.dex_paid
 
 
 def boosted_off_radar(candidate: Candidate) -> bool:
@@ -167,10 +174,10 @@ def floor_dip_ok(last_above_ms: int, grace_seconds: float, now: int) -> bool:
 def visor_card(
     candidate: Candidate, reads: dict, floor: float, *, dip_ok: bool = False
 ) -> bool:
-    """A card needs a paid listing and a quote at or above the floor.
+    """A card needs a quote at or above the floor.
 
-    Skip stays if it already paid that rent — the pill is why we will not buy.
-    Unquoted Pons launches stay on the radar and get a card when priced.
+    Launchpad feeds (pump / Pons / search) show without a Dexscreener invoice.
+    Profiles still need paid. Unquoted Pons stays on the radar until priced.
     `dip_ok` is for a coin that was above the floor a moment ago: one stale or
     zero quote should not yank a card that comes straight back.
     """

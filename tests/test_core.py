@@ -588,7 +588,7 @@ class TestGates(unittest.TestCase):
         enr.mint = _FakeMint(None, None)
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
         self.assertFalse(any(v.startswith("twitter:") for v in vetoes), vetoes)
-        enr.candidate.ret_5m = 0.28
+        enr.candidate.ret_5m = 0.40
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
         self.assertTrue(any("chase" in v for v in vetoes), vetoes)
         enr.twitter = {"official": "hotdogcoin", "official_age_min": 18}
@@ -798,6 +798,14 @@ class TestGates(unittest.TestCase):
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
         self.assertTrue(any(v.startswith("top10:") for v in vetoes), vetoes)
 
+    def test_typical_pump_top10_55_is_not_a_veto(self):
+        enr = self.enrichment(top10_pct=0.55, top1_pct=0.12, known_holder_pct=0.0)
+        enr.mint = _FakeMint(None, None)
+        enr.crowd = {}
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertFalse(any(v.startswith("top10:") for v in vetoes), vetoes)
+        self.assertFalse(any(v.startswith("cabaled:") for v in vetoes), vetoes)
+
     def test_size_whale_flow_does_not_excuse_unknown_top10(self):
         # mikedyson: top10 61%, known 0, copy_signal from unlabeled size-whales.
         enr = self.enrichment(
@@ -868,21 +876,32 @@ class TestGates(unittest.TestCase):
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=False)
         self.assertTrue(any(v.startswith("bundle:") for v in vetoes), vetoes)
 
-    def test_hood_free_lp_nft_is_a_hard_veto(self):
+    def test_hood_pons_lp_nft_is_not_a_veto(self):
         enr = self.enrichment(lp_locked_pct=0.0)
         enr.mint = _FakeMint(None, None)
         enr.candidate.chain = Chain.ROBINHOOD_CHAIN
-        enr.candidate.dex_id = "uniswap"
+        enr.candidate.dex_id = "pons"
         enr.candidate.address = "0xabc"
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=False)
-        self.assertTrue(any(v.startswith("lp_unlocked:") for v in vetoes), vetoes)
-        locked = self.enrichment(lp_locked_pct=1.0)
-        locked.mint = _FakeMint(None, None)
-        locked.candidate.chain = Chain.ROBINHOOD_CHAIN
-        locked.candidate.dex_id = "uniswap"
-        locked.candidate.address = "0xabc"
-        vetoes, _ = evaluate_gates(locked, STRATEGY, self.store, live=False)
         self.assertFalse(any(v.startswith("lp_unlocked:") for v in vetoes), vetoes)
+
+    def test_bnb_free_lp_is_a_hard_veto(self):
+        enr = self.enrichment(lp_locked_pct=0.0)
+        enr.mint = _FakeMint(None, None)
+        enr.candidate.chain = Chain.BNB
+        enr.candidate.dex_id = "fourmeme"
+        enr.candidate.address = "0xdef"
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=False)
+        self.assertTrue(any(v.startswith("lp_unlocked:") for v in vetoes), vetoes)
+
+    def test_young_mint_fresh_wallets_are_not_a_veto(self):
+        enr = self.enrichment(fresh_wallet_pct=1.0)
+        enr.mint = _FakeMint(None, None)
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertFalse(any(v.startswith("fresh_wallets:") for v in vetoes), vetoes)
+        enr.candidate.created_at_ms = now_ms() - 4 * 60 * 60_000
+        old, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertTrue(any(v.startswith("fresh_wallets:") for v in old), old)
 
     def test_solana_does_not_use_the_lp_nft_gate(self):
         enr = self.enrichment(lp_locked_pct=0.0)
@@ -2607,7 +2626,7 @@ class TestVerdict(unittest.TestCase):
         self.assertEqual(read.label, "cabaled")
         self.assertEqual(read.risk, 0)
         self.assertIsNotNone(bot_veto(read, "solana"))
-        self.assertIsNotNone(bot_veto(read, "robinhood_chain"))
+        self.assertIsNone(bot_veto(read, "robinhood_chain"))
 
     def test_organic_is_not_a_buy(self):
         from alphahound.verdict import bot_veto, classify
@@ -3034,12 +3053,17 @@ class TestDeadMcap(unittest.TestCase):
             source="hood_stream",
             mcap_usd=80_000,
         )
-        self.assertTrue(unpaid_for_scan(raw))
-        self.assertFalse(on_scan_visor(raw, 50_000))
-        self.assertTrue(keep_unpaid_watch(raw))
-        raw.dex_paid = True
         self.assertFalse(unpaid_for_scan(raw))
         self.assertTrue(on_scan_visor(raw, 50_000))
+        self.assertTrue(keep_unpaid_watch(raw))
+        pump = Candidate(
+            chain=Chain.SOLANA,
+            address="mintpump",
+            source="pumpfun_stream",
+            mcap_usd=80_000,
+        )
+        self.assertFalse(unpaid_for_scan(pump))
+        self.assertTrue(on_scan_visor(pump, 50_000))
         inspect = Candidate(
             chain=Chain.ROBINHOOD_CHAIN,
             address="0xdef",
@@ -3054,7 +3078,12 @@ class TestDeadMcap(unittest.TestCase):
             source="dexscreener_profiles",
             mcap_usd=80_000,
         )
+        self.assertTrue(unpaid_for_scan(ds))
+        self.assertFalse(on_scan_visor(ds, 50_000))
         self.assertFalse(keep_unpaid_watch(ds))
+        ds.dex_paid = True
+        self.assertFalse(unpaid_for_scan(ds))
+        self.assertTrue(on_scan_visor(ds, 50_000))
 
     def test_stale_quote_keeps_the_card_but_a_small_mint_never_gets_one(self):
         from alphahound.engine import floor_dip_ok, visor_card
@@ -3090,8 +3119,6 @@ class TestDeadMcap(unittest.TestCase):
         hood.mcap_usd = 26_000
         self.assertFalse(visor_card(hood, {}, 50_000))
         hood.mcap_usd = 74_000
-        self.assertFalse(visor_card(hood, {}, 50_000))
-        hood.dex_paid = True
         self.assertTrue(visor_card(hood, {}, 50_000))
         # Skip after enrich still occupies the card; hiding it emptied the visor.
         self.assertTrue(visor_card(hood, {hood.key: {"call": "skip"}}, 50_000))
