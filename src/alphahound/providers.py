@@ -63,9 +63,11 @@ class PairSnapshot:
     dex_paid: bool = False
     dex_photo: bool = False
     dex_aligned: bool = False
+    dex_boosted: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
 
     def to_candidate(self, source: str) -> Candidate:
+        boosted = self.dex_boosted or source == "dexscreener_boosts"
         return Candidate(
             chain=self.chain,
             address=self.token_address,
@@ -81,12 +83,14 @@ class PairSnapshot:
             source=source,
             dex_id=self.dex_id,
             ret_5m=self.price_change_m5,
-            dex_paid=self.dex_paid or source == "dexscreener_boosts",
+            dex_paid=self.dex_paid or boosted,
             dex_photo=self.dex_photo,
             dex_aligned=self.dex_aligned,
+            dex_boosted=boosted,
         )
 
     def stamp(self, candidate: Candidate) -> None:
+        candidate.dex_boosted = candidate.dex_boosted or self.dex_boosted
         candidate.dex_paid = (
             candidate.dex_paid or self.dex_paid or candidate.source == "dexscreener_boosts"
         )
@@ -116,17 +120,24 @@ def pair_created_ms(value: Any) -> int:
 
 
 def orders_mark_paid(data: Any) -> bool:
-    """Dexscreener /orders/v1: approved profile or boost = they paid."""
+    """Dexscreener /orders/v1: approved profile. Boosts are a dump signal, not a listing."""
     if isinstance(data, list):
         rows = data
     elif isinstance(data, dict):
-        rows = list(data.get("orders") or []) + list(data.get("boosts") or [])
+        rows = list(data.get("orders") or [])
     else:
         return False
     return any(
-        isinstance(row, dict) and str(row.get("status") or "").lower() == "approved"
+        isinstance(row, dict)
+        and str(row.get("status") or "").lower() == "approved"
+        and str(row.get("type") or "").lower() != "tokenboost"
         for row in rows
     )
+
+
+def pair_is_boosted(pair: dict[str, Any]) -> bool:
+    boosts = pair.get("boosts") or {}
+    return _f(boosts.get("active")) > 0 or _f(boosts.get("amount")) > 0
 
 
 def pair_dex_flags(pair: dict[str, Any]) -> tuple[bool, bool, bool]:
@@ -241,6 +252,7 @@ def parse_pair(pair: dict[str, Any]) -> PairSnapshot | None:
     txns = (pair.get("txns") or {}).get("m5") or {}
     twitter, blurb = pair_socials(pair)
     paid, photo, aligned = pair_dex_flags(pair)
+    boosted = pair_is_boosted(pair)
     return PairSnapshot(
         chain=chain,
         pair_address=pair.get("pairAddress", ""),
@@ -264,6 +276,7 @@ def parse_pair(pair: dict[str, Any]) -> PairSnapshot | None:
         dex_paid=paid,
         dex_photo=photo,
         dex_aligned=aligned,
+        dex_boosted=boosted,
         raw=pair,
     )
 
@@ -282,7 +295,15 @@ class Dexscreener:
         # Documented as 300 req/min for the pairs endpoints. Staying under it
         # deliberately, because being rate-limited during a launch is the one
         # moment the data is worth anything.
-        http.limit("api.dexscreener.com", rate_per_sec=5.0, burst=8)
+        # 300 req/min documented. A 5.0/s bucket with burst 8 can emit 308 in a
+        # minute, which is why the quote loop still collected 429s at "exactly
+        # the limit": the budget is per minute, the burst is not.
+        http.limit("api.dexscreener.com", rate_per_sec=4.5, burst=4)
+        # These three are metered at 60 req/min each, not 300. The paid check
+        # alone fires once per candidate per scan, which on a 2s scan is 4x the
+        # budget - and the retries it earned were stalling the quote loop.
+        for path in ("/orders", "/token-profiles", "/token-boosts"):
+            http.limit(f"api.dexscreener.com{path}", rate_per_sec=0.8, burst=2)
         self._paid: dict[str, tuple[float, bool]] = {}
 
     async def _get(self, path: str, **kw: Any) -> Any:
@@ -299,32 +320,45 @@ class Dexscreener:
         now = time.monotonic()
         out: dict[str, PairSnapshot] = {}
         missing: list[str] = []
-        for address in addresses[:30]:
+        want: list[str] = []
+        seen: set[str] = set()
+        for raw in addresses[:30]:
+            address = (raw or "").lower()
+            if not address or address in seen:
+                continue
+            seen.add(address)
+            want.append(address)
             cached = self._cache.get(address)
             if cached is not None and now - cached[0] < self.cache_seconds:
                 out[address] = cached[1]
             else:
                 missing.append(address)
 
+        data: Any = None
         if missing:
             data = await self._get("/latest/dex/tokens/" + ",".join(missing))
             for raw in (data or {}).get("pairs") or []:
                 snap = parse_pair(raw)
                 if snap is None or not snap.token_address:
                     continue
-                current = out.get(snap.token_address)
+                key = snap.token_address.lower()
+                current = out.get(key)
                 if current is None or snap.liquidity_usd > current.liquidity_usd:
-                    out[snap.token_address] = snap
+                    out[key] = snap
             for address in missing:
                 snap = out.get(address)
                 if snap is not None:
                     self._cache[address] = (now, snap)
+                elif data is None:
+                    stale = self._cache.get(address)
+                    if stale is not None:
+                        out[address] = stale[1]
 
         if len(self._cache) > 1024:
             self._cache = {
-                k: v for k, v in self._cache.items() if now - v[0] < self.cache_seconds
+                k: v for k, v in self._cache.items() if now - v[0] < self.cache_seconds * 8
             }
-        return list(out.values())
+        return [out[a] for a in want if a in out]
 
     async def search(self, query: str) -> list[PairSnapshot]:
         data = await self._get("/latest/dex/search", params={"q": query})
@@ -348,17 +382,18 @@ class Dexscreener:
     async def token_is_paid(self, chain: Chain, address: str) -> bool:
         """Profile/boost order, cached. Pair.boosts.active misses paid listings."""
         now = time.monotonic()
-        hit = self._paid.get(address)
+        key = (address or "").lower()
+        hit = self._paid.get(key)
         if hit is not None and now - hit[0] < 45:
             return hit[1]
         slug = DEX_CHAIN_SLUG.get(chain)
-        if not slug or not address:
+        if not slug or not key:
             return False
-        data = await self._get(f"/orders/v1/{slug}/{address}")
+        data = await self._get(f"/orders/v1/{slug}/{key}")
         if data is None:
-            return False
+            return hit[1] if hit is not None else False
         paid = orders_mark_paid(data)
-        self._paid[address] = (now, paid)
+        self._paid[key] = (now, paid)
         return paid
 
     async def boosted(self) -> list[str]:
@@ -381,9 +416,25 @@ class Dexscreener:
         return parse_pair(pairs[0]) if pairs else None
 
 
+def das_owners(rows: list, *, decimals: int = 0) -> dict[str, float]:
+    """Unique wallets from a DAS `token_accounts` page. `total` on that payload
+    is the page size, not the holder count."""
+    scale = 10 ** decimals if decimals else 1.0
+    out: dict[str, float] = {}
+    for row in rows:
+        owner = str((row or {}).get("owner") or "")
+        raw = (row or {}).get("amount") or 0
+        try:
+            amt = float(raw) / scale
+        except (TypeError, ValueError):
+            continue
+        if owner and amt > 0:
+            out[owner] = out.get(owner, 0.0) + amt
+    return out
+
+
 class Helius:
-    """Optional. Used for the one number nothing else gives away for free: the
-    exact holder count."""
+    """DAS token accounts: unique holders and wallets to match KOL/fomo."""
 
     def __init__(self, http: Http, api_key: str) -> None:
         self.http = http
@@ -394,25 +445,49 @@ class Helius:
     def enabled(self) -> bool:
         return bool(self.api_key)
 
+    async def token_accounts(
+        self, mint: str, *, max_pages: int = 4, limit: int = 1000
+    ) -> tuple[list[dict], bool]:
+        """Page DAS `getTokenAccounts`. complete=False means we hit the cap."""
+        if not self.enabled or not mint:
+            return [], False
+        rows: list[dict] = []
+        complete = False
+        for page in range(1, max_pages + 1):
+            try:
+                data = await self.http.post(
+                    self.url,
+                    json_body={
+                        "jsonrpc": "2.0",
+                        "id": "holders",
+                        "method": "getTokenAccounts",
+                        "params": {
+                            "mint": mint,
+                            "page": page,
+                            "limit": limit,
+                            "options": {"showZeroBalance": False},
+                        },
+                    },
+                )
+            except HttpError as exc:
+                log.debug("helius token_accounts failed", extra={"status": exc.status})
+                break
+            result = (data or {}).get("result") or {}
+            batch = result.get("token_accounts") if isinstance(result, dict) else None
+            if not isinstance(batch, list):
+                break
+            rows.extend(row for row in batch if isinstance(row, dict))
+            if len(batch) < limit:
+                complete = True
+                break
+        else:
+            complete = False
+        return rows, complete
+
     async def holder_count(self, mint: str) -> int | None:
-        if not self.enabled:
-            return None
-        try:
-            data = await self.http.post(
-                self.url,
-                json_body={
-                    "jsonrpc": "2.0",
-                    "id": "holders",
-                    "method": "getTokenAccounts",
-                    "params": {"mint": mint, "limit": 1, "options": {"showZeroBalance": False}},
-                },
-            )
-        except HttpError as exc:
-            log.debug("helius holder_count failed", extra={"status": exc.status})
-            return None
-        result = (data or {}).get("result") or {}
-        total = result.get("total")
-        return int(total) if isinstance(total, (int, float)) else None
+        rows, _complete = await self.token_accounts(mint)
+        n = len(das_owners(rows))
+        return n if n else None
 
 
 class Birdeye:

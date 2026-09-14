@@ -7,6 +7,7 @@ stays current without another data API.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .models import Chain, now_ms, describe_error, describe_exit, legs_for_display
+from .models import Candidate, Chain, now_ms, describe_error, describe_exit, legs_for_display
 from .playbook import max_age_minutes
 from .risk import RiskEngine, utc_day_start_ms
 from .settings import (
@@ -30,6 +31,11 @@ from .settings import (
 from .store import Store
 
 PREVIEW_NAME = "preview.json"
+WATCHING_NAME = "watching.json"
+# Closed trades and the wallet lists are ~50 of the 60 KB /api used to resend
+# 2.5x a second while only `watch` moved. The client echoes back the hash it
+# already holds and these are dropped from the reply when they still match.
+HEAVY_KEYS = ("sold", "fomo", "kols", "universe", "pnl_chart", "pnl_windows")
 SELL_QUEUE = "sell.json"
 POSITIONS_FILE = "positions.json"
 
@@ -82,28 +88,107 @@ def enqueue_manual_sell(state_dir: Path, needle: str) -> dict[str, Any]:
     return {"ok": True, "queued": True, "key": key, "symbol": hit["symbol"]}
 
 
-def write_preview(state_dir: Path, payload: dict[str, Any]) -> None:
-    path = state_dir / PREVIEW_NAME
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     blob = json.dumps(payload, separators=(",", ":"))
     tmp = path.with_suffix(".tmp")
     tmp.write_text(blob, encoding="utf-8")
-    try:
-        tmp.replace(path)
-    except PermissionError:
-        # ponytail: Windows holds preview.json while the HTTP handler reads it.
-        path.write_text(blob, encoding="utf-8")
-        tmp.unlink(missing_ok=True)
+    for attempt in range(4):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            # Windows blocks the rename while a reader holds the file. Wait it
+            # out: the non-atomic fallback below is what readers see as torn
+            # JSON, and a torn read used to blank the visor.
+            time.sleep(0.02 * (attempt + 1))
+    path.write_text(blob, encoding="utf-8")
+    tmp.unlink(missing_ok=True)
+
+
+def write_preview(state_dir: Path, payload: dict[str, Any]) -> None:
+    _atomic_json(state_dir / PREVIEW_NAME, payload)
+
+
+def write_watching(state_dir: Path, payload: dict[str, Any]) -> None:
+    """Full radar, not visor-filtered. preview.json watch can be empty while these stay."""
+    _atomic_json(state_dir / WATCHING_NAME, payload)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    """One retry: a half-written snapshot is transient, an empty dict is not."""
+    for attempt in range(2):
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            if attempt == 0:
+                time.sleep(0.03)
+                continue
+            return {}
+        return data if isinstance(data, dict) else {}
+    return {}
 
 
 def read_preview(state_dir: Path) -> dict[str, Any]:
-    path = state_dir / PREVIEW_NAME
-    if not path.exists():
-        return {}
+    return _read_json(state_dir / PREVIEW_NAME)
+
+
+def read_watching(state_dir: Path) -> dict[str, Any]:
+    return _read_json(state_dir / WATCHING_NAME)
+
+
+def watch_row_to_candidate(row: dict[str, Any]) -> Candidate | None:
+    """Rebuild a visor card after an engine restart."""
+    chain_s = str(row.get("chain") or "")
+    address = str(row.get("address") or "")
+    if not chain_s or not address:
+        return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (ValueError, OSError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        chain = Chain(chain_s)
+    except ValueError:
+        return None
+    age_min = float(row.get("age_min") or 0.0)
+    created = int(row.get("created_at_ms") or 0)
+    if not created and age_min > 0:
+        created = now_ms() - int(age_min * 60_000)
+    discovered = int(row.get("discovered_at_ms") or 0) or now_ms()
+    return Candidate(
+        chain=chain,
+        address=address,
+        symbol=str(row.get("symbol") or ""),
+        name=str(row.get("name") or ""),
+        created_at_ms=created,
+        discovered_at_ms=discovered,
+        mcap_usd=float(row.get("mcap") or 0.0),
+        volume_5m_usd=float(row.get("vol5m") or 0.0),
+        liquidity_usd=float(row.get("liq") or 0.0),
+        ret_5m=float(row.get("ret_5m") or 0.0),
+        source=str(row.get("source") or "dexscreener"),
+        dex_id=str(row.get("dex") or ""),
+        pack_role=str(row.get("role") or ""),
+        pack_stem=str(row.get("stem") or ""),
+        pack_size=int(row.get("pack") or 1),
+        dex_paid=bool(row.get("dex_paid")),
+        dex_photo=bool(row.get("dex_photo")),
+        dex_aligned=bool(row.get("dex_aligned")),
+        dex_boosted=bool(row.get("dex_boosted")) or str(row.get("source") or "") == "dexscreener_boosts",
+        last_scored_ms=int(row.get("last_scored_ms") or 0),
+        first_scored_ms=int(row.get("first_scored_ms") or 0),
+        quoted_at_ms=int(row.get("quoted_at_ms") or 0),
+        first_quoted_ms=int(row.get("first_quoted_ms") or 0),
+    )
+
+
+def heavy_sig(payload: dict[str, Any]) -> str:
+    """Fingerprint of the slow-moving blocks, so a client can say it has them."""
+    blob = json.dumps(
+        {k: payload.get(k) for k in HEAVY_KEYS},
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.blake2s(blob.encode(), digest_size=8).hexdigest()
 
 
 def universe(settings: Settings | None, strategy: Config | None) -> dict[str, Any]:
@@ -171,13 +256,16 @@ def pnl_windows(store: Store, now: int | None = None) -> dict[str, Any]:
             "history_days": hist_days if partial else (min(hist_days, span_days) if span_days else hist_days),
         }
 
+    # Quantized: a boundary that slides every millisecond makes this block look
+    # new on every /api poll, which is how a static 14 KB got resent 2.5x a second.
+    edge = now - now % 60_000
     return {
         "history_days": hist_days,
         "windows": [
             pack("hoje", utc_day_start_ms(now / 1000.0)),
-            pack("7d", now - 7 * _DAY_MS, 7),
-            pack("15d", now - 15 * _DAY_MS, 15),
-            pack("30d", now - 30 * _DAY_MS, 30),
+            pack("7d", edge - 7 * _DAY_MS, 7),
+            pack("15d", edge - 15 * _DAY_MS, 15),
+            pack("30d", edge - 30 * _DAY_MS, 30),
         ],
     }
 
@@ -363,6 +451,8 @@ HTML = """<!doctype html>
   tr.pick { cursor: pointer; }
   tr.pick.on td { background: #0c0c0c; }
   .coin-panel { margin: 0 0 14px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; }
+  #coin[hidden] { display: none !important; margin: 0; padding: 0; border: 0; }
+  .lane[hidden] { display: none !important; }
   .coin-h { display: flex; gap: 14px; flex-wrap: wrap; align-items: baseline; }
   .coin-h .fit { font-size: 28px; font-weight: 800; color: #fff; }
   .coin-h .mcap { font-size: 22px; font-weight: 800; color: #fff; font-variant-numeric: tabular-nums; }
@@ -388,26 +478,42 @@ HTML = """<!doctype html>
                      padding: 6px 10px; border-radius: 6px; min-width: 220px; flex: 1; }
   .watch-bar button { font: inherit; background: #1a1a1a; color: #fff; border: 1px solid #333;
                       padding: 6px 12px; cursor: pointer; border-radius: 6px; }
-  .watch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; }
-  .wcard { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #050505;
-           cursor: pointer; min-height: 186px; contain: layout; }
+  .watch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 6px; }
+  .lane { margin: 0 0 16px; padding: 10px 12px 12px; border: 1px solid var(--line); border-radius: 8px; min-height: 88px; }
+  .lane > h1 { margin: 0 0 8px; }
+  .lane-hold { border-color: #5a4a18; background: #0c0a04; }
+  .lane-hold > h1 { color: #ffd24a; }
+  .lane-scan { border-color: #1a3a4a; background: #040a10; }
+  .lane-scan > h1 { color: #3ad6ff; }
+  .lane-wait { border-color: #4a3a10; background: #100c04; }
+  .lane-wait > h1 { color: #ffb020; }
+  .lane-skip { display: none; }
+  .wcard { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; background: #050505;
+           cursor: pointer; min-height: 0; contain: layout; }
   .wcard.on { border-color: #555; background: #0c0c0c; }
-  .wcard-h { display: flex; justify-content: space-between; align-items: center; gap: 6px; margin-bottom: 4px; }
-  .wcard .mcap { font-size: 22px; font-weight: 800; color: #fff; letter-spacing: -.03em; line-height: 1.1;
-                 font-variant-numeric: tabular-nums; min-width: 6ch; }
-  .wcard .age { font-size: 15px; font-weight: 700; color: #ffd24a; font-variant-numeric: tabular-nums; }
-  .wcard .meta { font-size: 11px; color: var(--muted); margin: 2px 0; }
-  .wcard .kols { font-size: 11px; color: #c8c8c8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .wcard-h { display: flex; justify-content: space-between; align-items: center; gap: 6px; margin-bottom: 2px; }
+  .wcard .mcap { font-size: 16px; font-weight: 800; color: #fff; letter-spacing: -.03em; line-height: 1.1;
+                 font-variant-numeric: tabular-nums; min-width: 5ch; }
+  .wcard .age { font-size: 12px; font-weight: 700; color: #ffd24a; font-variant-numeric: tabular-nums; }
+  .wcard .meta { font-size: 10px; color: var(--muted); margin: 1px 0; }
+  .wcard .kols { font-size: 10px; color: #c8c8c8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .wcard .buy-p { font-size: 18px; font-weight: 800; letter-spacing: -.03em; color: #fff;
+                  font-variant-numeric: tabular-nums; margin: 2px 0 0; }
+  .wcard .need { font-size: 12px; line-height: 1.35; margin: 4px 0 2px; padding: 4px 6px; border-radius: 4px;
+                 border: 1px solid #4a3a10; background: #100c04; color: #ffb020; font-weight: 700; }
+  .wcard .need-ok { border-color: #15512f; background: #04100a; color: #3dff9a; }
   .dex-paid { color: #3dff9a; font-weight: 800; letter-spacing: .08em; }
   .dex-no { color: #ff3b4e; font-weight: 800; letter-spacing: .08em; }
   a.xbtn { display: inline-block; margin: 4px 0 2px; padding: 2px 8px; border: 1px solid #333;
            border-radius: 99px; color: #3ad6ff; text-decoration: none; font-size: 11px; font-weight: 700; }
   a.xbtn:hover { border-color: #3ad6ff; color: #fff; }
-  .score { display: flex; align-items: center; gap: 10px; margin: 6px 0 4px; }
-  .score-n { font-size: 28px; font-weight: 800; letter-spacing: -.04em; line-height: 1;
+  .score { display: flex; align-items: center; gap: 8px; margin: 3px 0 2px; }
+  .score-n { font-size: 18px; font-weight: 800; letter-spacing: -.04em; line-height: 1;
              font-variant-numeric: tabular-nums; min-width: 2.2ch; }
   .score-hi .score-n { color: #3dff9a; } .score-mid .score-n { color: #ffd24a; }
   .score-lo .score-n { color: #ff3b4e; }
+  .score-q .score-n { color: #6a6a6a; font-size: 13px; font-weight: 600; letter-spacing: 0; min-width: 0; }
+  .score-q .score-bars { display: none; }
   .score-bars { flex: 1; display: grid; gap: 2px; }
   .score-bars b { display: flex; align-items: center; gap: 4px; font-size: 9px; color: #6a6a6a;
                   font-weight: 600; letter-spacing: .04em; }
@@ -436,6 +542,8 @@ HTML = """<!doctype html>
   .out-tracking { color: #5b8cff; }
   main { display: grid; grid-template-columns: 1fr 1fr; }
   main > section:first-child { grid-column: 1 / -1; }
+  #tab-watch main { grid-template-columns: 1fr; }
+  #tab-watch main > section + section { border-left: 0; border-top: 1px solid var(--line); }
   section { padding: 14px 20px; }
   section + section { border-left: 1px solid var(--line); }
   .full { grid-column: 1 / -1; border-top: 1px solid var(--line); border-left: 0 !important; }
@@ -453,6 +561,8 @@ HTML = """<!doctype html>
   #fault { display: none; padding: 8px 20px; background: #2a0008; color: #ff6b7a;
            border-bottom: 1px solid #ff3b4e; font-size: 12px; }
   #fault.on { display: block; }
+  #trade-rule { padding: 8px 20px; background: #1a1400; color: #ffd24a;
+                border-bottom: 1px solid #5a4a00; font-size: 12px; }
   @media (max-width: 900px) {
     main, .grid { grid-template-columns: 1fr; }
     section + section { border-left: 0; border-top: 1px solid var(--line); }
@@ -472,6 +582,7 @@ HTML = """<!doctype html>
   <div><h1>holding</h1><div class="n gold" id="holding">—</div></div>
   <div><h1>scanning</h1><div class="n cyan" id="watching">—</div></div>
 </header>
+<div id="trade-rule">Se não puder comprar e vender, o engine desliga — não fica pausado.</div>
 <div id="fault"></div>
 <div id="verdict" class="verdict wait"><span class="tag">WAITING</span><span class="muted" id="verdict-h">sem trades ainda</span></div>
 <nav class="tabs">
@@ -490,19 +601,33 @@ HTML = """<!doctype html>
 <main>
   <section>
     <div class="watch-bar">
-      <h1>scanning</h1>
+      <h1>inspect</h1>
       <input id="ca-in" placeholder="colar CA" autocomplete="off" spellcheck="false"/>
       <button type="button" id="paste-ca">colar</button>
     </div>
     <div id="coin" class="coin-panel" hidden></div>
-    <div id="watch" class="watch-grid"></div>
+    <div class="lane lane-hold">
+      <h1>hold</h1>
+      <div id="watch-hold" class="watch-grid"></div>
+      <table id="holds" class="book"><thead><tr>
+        <th>token</th><th>held</th><th>pnl</th><th>left</th><th>hold</th><th>mcap</th><th>stage 3</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+    <div class="lane lane-wait">
+      <h1>wait</h1>
+      <div id="watch-wait" class="watch-grid"></div>
+    </div>
+    <div class="lane lane-scan">
+      <h1>scanning</h1>
+      <div id="watch-scan" class="watch-grid"></div>
+    </div>
+    <div class="lane lane-skip" hidden>
+      <h1>skip</h1>
+      <div id="watch-skip" class="watch-grid"></div>
+    </div>
   </section>
   <section>
-    <h1>holds</h1>
-    <table id="holds" class="book"><thead><tr>
-      <th>token</th><th>held</th><th>pnl</th><th>left</th><th>age</th><th>mcap</th><th>stage 3</th>
-    </tr></thead><tbody></tbody></table>
-    <h1 style="margin-top:22px">sold</h1>
+    <h1>sold</h1>
     <table id="sold" class="book"><thead><tr>
       <th>token</th><th>size</th><th>pnl</th><th>mcap</th><th>hold</th><th>exit</th>
     </tr></thead><tbody></tbody></table>
@@ -552,7 +677,7 @@ HTML = """<!doctype html>
   <p class="muted" style="padding:8px 20px 0">MFE do shadow é o pico na janela, não o close. Dump e flat parecem iguais se não bombou. Clique a linha pras features.</p>
   <section>
     <table id="review" class="book"><thead><tr>
-      <th>quando</th><th>token</th><th>decisão</th><th>p / ev</th><th>resultado</th><th>outcome</th>
+      <th>quando</th><th>token</th><th>1st mcap</th><th>decisão</th><th>p / ev</th><th>resultado</th><th>outcome</th>
     </tr></thead><tbody></tbody></table>
   </section>
 </div>
@@ -596,6 +721,7 @@ const mcapTxt = n => {
 const pct = n => (n>=0?'+':'') + (Number(n)*100).toFixed(1) + '%';
 const cls = n => n>0?'up':n<0?'dn':'';
 const chainShort = c => ({solana:'SOL', bnb:'BNB', robinhood_chain:'HOOD'}[c] || (c||'').toUpperCase());
+const cardAge = w => ((w.call||'')==='hold' && w.held_min != null) ? ageTxt(w.held_min) : ageTxt(w.age_min);
 const ageTxt = m => {
   m = Number(m)||0;
   if (m >= 60) {
@@ -638,12 +764,21 @@ function dexLine(w) {
     : '<div class="meta"><span class="dex-no" data-f="dex">NOT DEX</span></div>';
 }
 function rubricLine(r) {
-  r = r || {};
-  const total = r.total == null ? '—' : r.total;
-  const tone = (r.total||0) >= 7 ? 'hi' : (r.total||0) >= 5.5 ? 'mid' : 'lo';
+  if (r == null || r.total == null) {
+    return '<div class="score score-q" data-f="score">'
+      + '<span class="score-n" data-f="score-n">—</span>'
+      + '<div class="score-bars">'
+      + '<b>D<em><i data-k="D" style="width:0%"></i></em></b>'
+      + '<b>C<em><i data-k="C" style="width:0%"></i></em></b>'
+      + '<b>F<em><i data-k="F" style="width:0%"></i></em></b>'
+      + '<b>G<em><i data-k="G" style="width:0%"></i></em></b>'
+      + '<b>N<em><i data-k="N" style="width:0%"></i></em></b>'
+      + '</div></div>';
+  }
+  const tone = r.total >= 7 ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo';
   const row = (k, v) => '<b>'+k+'<em><i data-k="'+k+'" style="width:'+Math.max(0,Math.min(100,Math.round(((v||0)/10)*100)))+'%"></i></em></b>';
   return '<div class="score score-'+tone+'" data-f="score">'
-    + '<span class="score-n" data-f="score-n">'+total+'</span>'
+    + '<span class="score-n" data-f="score-n">'+r.total+'</span>'
     + '<div class="score-bars">'
     + row('D', r.dist)+row('C', r.crowd)+row('F', r.flow)+row('G', r.chart)+row('N', r.narrative)
     + '</div></div>';
@@ -663,7 +798,62 @@ let picked = '';
 let lastWatch = [];
 let inflight = false;
 let queued = false;
+let heavySig = '';
 
+const secTxt = s => {
+  s = Number(s)||0;
+  if (s < 60) return (s < 10 ? (Math.round(s*10)/10) : Math.round(s)) + 's';
+  return ageTxt(s/60);
+};
+// What is still between this coin and a buy. Vetoes first; with none, the
+// score gaps; with neither, it is buyable and says so.
+function needList(w) {
+  if ((w.call||'scan') === 'hold') return [];
+  const v = (w.vetoes || []).filter(Boolean).map(String);
+  if (v.length) return v;
+  const n = x => Number(x);
+  const out = [];
+  if (w.p != null && w.min_p != null && n(w.p) < n(w.min_p)) {
+    out.push('probabilidade '+Math.round(n(w.p)*100)+'% < piso '+Math.round(n(w.min_p)*100)+'%');
+  }
+  if (w.ev != null && w.min_ev != null && n(w.ev) < n(w.min_ev)) {
+    out.push('EV '+n(w.ev).toFixed(3)+' < piso '+n(w.min_ev).toFixed(3));
+  }
+  const r = w.rubric || {};
+  if (r.total != null && w.min_rubric != null && n(r.total) < n(w.min_rubric)) {
+    out.push('rubric '+r.total+' < piso '+w.min_rubric);
+  }
+  if (!out.length && w.p == null) out.push('scan ainda não fechou');
+  return out;
+}
+function needTxt(w) {
+  if ((w.call||'scan') === 'hold') return 'HOLD · gerenciando a saída';
+  if ((w.call||'scan') === 'scan' && w.p == null) return 'SCAN · lendo holders, chart e mcap';
+  const l = needList(w);
+  const core = l.length ? 'ESPERA · '+l.join(' · ') : 'PRONTA · passa nos gates';
+  if (w.reading && (w.call==='wait' || w.call==='skip')) return core.replace(/^ESPERA/, 'ESPERA · scan de novo');
+  return core;
+}
+function needCls(w) {
+  return 'need' + (needList(w).length || (w.call||'scan')==='scan' && w.p == null ? '' : ' need-ok');
+}
+function pevTxt(w) {
+  if (w.p == null) return 'compra —';
+  const p = Math.round(Number(w.p)*100);
+  const mp = w.min_p == null ? '' : ' · piso '+Math.round(Number(w.min_p)*100)+'%';
+  return 'compra '+p+'%'+mp;
+}
+function latTxt(w) {
+  const bits = [];
+  if (w.found_lag_s != null) bits.push('descoberta '+secTxt(w.found_lag_s)+' após o pool');
+  if (w.quote_lag_s != null) bits.push('mcap em '+secTxt(w.quote_lag_s));
+  else bits.push('mcap ainda sem quote');
+  if (w.scan_lag_s != null) bits.push('scan em '+secTxt(w.scan_lag_s));
+  else bits.push('scan ainda aberto');
+  if (w.quote_age_s != null) bits.push('mcap há '+secTxt(w.quote_age_s));
+  if (w.read_age_s != null) bits.push('leitura há '+secTxt(w.read_age_s));
+  return bits.join(' · ');
+}
 function watchKey(w) { return w.chain+':'+w.address; }
 function watchBody(w) {
   const call = w.call || 'scan';
@@ -674,21 +864,25 @@ function watchBody(w) {
     ? '<span class="pill v-'+w.label+'" data-f="pill"'+(skipHint?' title="'+skipHint+'"':'')+'>'+call.toUpperCase()+' '+w.label+'</span>'
     : '<span class="pill st-'+call+'" data-f="pill">'+call.toUpperCase()+'</span>';
   const whales = '<div class="meta" data-f="whales">'
-    + (w.whale_n == null ? '' : ('whales '+w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0)))
+    + (w.whale_n == null ? 'whales —' : ('whales '+w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0)))
     + '</div>';
   const kols = (w.kols && w.kols.length) ? w.kols.join(', ') : '—';
   const fomo = (w.fomo && w.fomo.length) ? w.fomo.join(', ') : '—';
+  const pev = '<div class="buy-p" data-f="pev">'+pevTxt(w)+'</div>';
+  const need = '<div class="'+needCls(w)+'" data-f="need">'+needTxt(w)+'</div>';
+  const lat = '<div class="meta" data-f="lat">'+latTxt(w)+'</div>';
   return '<div class="wcard-h"><span class="sym" data-f="sym">'+(w.symbol || w.name || caHead(w.address))+'</span>'+copyBtn(w.address)+'</div>'
-    + '<div class="wcard-h"><span class="chain">'+chainShort(w.chain)+'</span><span class="age" data-f="age">'+ageTxt(w.age_min)+'</span></div>'
+    + '<div class="wcard-h"><span class="chain">'+chainShort(w.chain)+'</span><span class="age" data-f="age">'+cardAge(w)+'</span></div>'
     + '<div class="mcap" data-f="mcap">'+mcapTxt(w.mcap)+'</div>'
+    + pev
+    + need
+    + lat
     + certHtml(w.cert)+' '+pill+' '+role(w.role)
     + whales
     + '<div class="kols" data-f="kols">kols '+kols+'</div>'
     + '<div class="kols" data-f="fomo">fomo '+fomo+'</div>'
     + dexLine(w)
     + rubricLine(w.rubric || {})
-    + '<div class="meta" data-f="why">'+(w.why && w.why !== 'ok' ? w.why : '')+'</div>'
-    + '<div class="meta" data-f="pev">'+(w.p != null ? ('p '+Number(w.p).toFixed(3)+' · EV '+(Number(w.ev)>=0?'+':'')+Number(w.ev).toFixed(3)) : '')+'</div>'
     + '<div data-f="tw" data-h="'+esc(xHandle(w.tw && w.tw.official)||'')+'">'+twLine(w.tw)+'</div>'
     + '<div data-f="ret" class="'+cls(w.ret_5m)+'">'+pct(w.ret_5m||0)+' · vol '+kM(w.vol5m)+'</div>';
 }
@@ -701,15 +895,25 @@ function setNode(n, t) {
   }
   if (n.textContent !== t) n.textContent = t;
 }
+function cardFp(w) {
+  const r = w.rubric || {};
+  return [w.call, w.label, w.symbol, w.mcap, w.age_min, w.held_min, w.vol5m, w.ret_5m, w.p, w.ev, r.total,
+    w.why, w.cert, w.dex_paid, w.reading, (w.kols||[]).join(), (w.fomo||[]).join(), w.whale_n,
+    (w.vetoes||[]).join(), w.found_lag_s, w.quote_lag_s, w.scan_lag_s, w.quote_age_s, w.read_age_s].join('|');
+}
 function fillLive(el, w) {
   const set = (f, t) => setNode(el.querySelector('[data-f="'+f+'"]'), t);
   set('mcap', mcapTxt(w.mcap));
-  set('age', ageTxt(w.age_min));
+  set('age', cardAge(w));
   set('sym', w.symbol || w.name || caHead(w.address));
   set('kols', 'kols '+((w.kols && w.kols.length) ? w.kols.join(', ') : '—'));
   set('fomo', 'fomo '+((w.fomo && w.fomo.length) ? w.fomo.join(', ') : '—'));
-  set('why', (w.why && w.why !== 'ok') ? w.why : '');
-  set('whales', w.whale_n == null ? '' : ('whales '+w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0)));
+  set('pev', pevTxt(w));
+  set('lat', latTxt(w));
+  set('need', needTxt(w));
+  const needEl = el.querySelector('[data-f="need"]');
+  if (needEl && needEl.className !== needCls(w)) needEl.className = needCls(w);
+  set('whales', w.whale_n == null ? 'whales —' : ('whales '+w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0)));
   const cert = el.querySelector('[data-f="cert"]');
   if (cert) {
     const ck = w.cert==='ok'?'cert-ok':w.cert==='no'?'cert-no':'cert-q';
@@ -739,15 +943,23 @@ function fillLive(el, w) {
   }
   const r = w.rubric || {};
   const score = el.querySelector('[data-f="score"]');
-  if (r.total != null && score) {
-    const tone = 'score score-' + (r.total >= 7 ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo');
-    if (score.className !== tone) score.className = tone;
-    set('score-n', String(r.total));
-    const wmap = {D:r.dist, C:r.crowd, F:r.flow, G:r.chart, N:r.narrative};
-    score.querySelectorAll('i[data-k]').forEach(i => {
-      const pctw = Math.max(0, Math.min(100, Math.round(((wmap[i.dataset.k]||0)/10)*100)));
-      if (i.style.width !== pctw+'%') i.style.width = pctw+'%';
-    });
+  if (score) {
+    if (r.total == null) {
+      if (score.className !== 'score score-q') score.className = 'score score-q';
+      set('score-n', '—');
+      score.querySelectorAll('i[data-k]').forEach(i => {
+        if (i.style.width !== '0%') i.style.width = '0%';
+      });
+    } else {
+      const tone = 'score score-' + (r.total >= 7 ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo');
+      if (score.className !== tone) score.className = tone;
+      set('score-n', String(r.total));
+      const wmap = {D:r.dist, C:r.crowd, F:r.flow, G:r.chart, N:r.narrative};
+      score.querySelectorAll('i[data-k]').forEach(i => {
+        const pctw = Math.max(0, Math.min(100, Math.round(((wmap[i.dataset.k]||0)/10)*100)));
+        if (i.style.width !== pctw+'%') i.style.width = pctw+'%';
+      });
+    }
   }
   const ret = el.querySelector('[data-f="ret"]');
   if (ret) {
@@ -755,36 +967,73 @@ function fillLive(el, w) {
     if (ret.className !== rk) ret.className = rk;
     setNode(ret, pct(w.ret_5m||0)+' · vol '+kM(w.vol5m));
   }
-  if (w.p != null) {
-    set('pev', 'p '+Number(w.p).toFixed(3)+' · EV '+(Number(w.ev)>=0?'+':'')+Number(w.ev).toFixed(3));
-  }
 }
 
+function laneOf(w) {
+  const c = w.call || 'scan';
+  if (c === 'hold') return 'hold';
+  if (c === 'wait' || c === 'skip') return 'wait';
+  return 'scan';
+}
 function paintWatch(list, running) {
-  const box = $('watch');
-  if (!box) return;
-  if (!list.length) {
-    const msg = running ? 'scanning…' : 'start the bot';
-    box.innerHTML = '<div class="muted">'+msg+'</div>';
-    return;
-  }
-  if (box.querySelector('.muted') && !box.querySelector('.wcard')) box.innerHTML = '';
-  const have = new Map([...box.querySelectorAll('.wcard')].map(el => [el.dataset.pick, el]));
-  const keep = new Set();
-  list.forEach(w => {
-    const key = watchKey(w);
-    keep.add(key);
-    let el = have.get(key);
-    if (!el) {
-      el = document.createElement('div');
-      el.className = 'wcard pick';
-      el.dataset.pick = key;
-      el.innerHTML = watchBody(w);
-      box.appendChild(el);
+  const groups = {hold:[], scan:[], wait:[], skip:[]};
+  list.forEach(w => groups[laneOf(w)].push(w));
+  const keep = new Set(list.map(watchKey));
+  const titles = {hold:'hold', scan:'scanning', wait:'wait'};
+  const emptyMsg = {
+    hold: 'nenhum hold nestes cards',
+    scan: running ? 'scanning…' : 'start the bot',
+    wait: 'nenhum wait',
+  };
+  ['hold','wait','scan'].forEach(lane => {
+    const box = $('watch-'+lane);
+    if (!box) return;
+    const items = groups[lane];
+    if (!items.length) return;
+    if (box.dataset.empty) {
+      box.dataset.empty = '';
+      const muted = box.querySelector(':scope > .muted');
+      if (muted) muted.remove();
     }
-    fillLive(el, w);
+    items.forEach(w => {
+      const key = watchKey(w);
+      let el = [...document.querySelectorAll('#tab-watch .wcard')].find(n => n.dataset.pick === key);
+      const fp = cardFp(w);
+      if (!el) {
+        el = document.createElement('div');
+        el.className = 'wcard pick';
+        el.dataset.pick = key;
+        el.innerHTML = watchBody(w);
+        el.dataset.fp = fp;
+        box.appendChild(el);
+      } else {
+        if (el.parentNode !== box) box.appendChild(el);
+        if (el.dataset.fp !== fp) { fillLive(el, w); el.dataset.fp = fp; }
+      }
+    });
   });
-  have.forEach((el, key) => { if (!keep.has(key)) el.remove(); });
+  document.querySelectorAll('#tab-watch .wcard').forEach(el => {
+    if (!keep.has(el.dataset.pick)) el.remove();
+  });
+  ['hold','wait','scan'].forEach(lane => {
+    const box = $('watch-'+lane);
+    if (!box) return;
+    const n = groups[lane].length;
+    const h = box.previousElementSibling;
+    if (h && h.tagName === 'H1') h.textContent = titles[lane]+' ('+n+')';
+    const has = !!box.querySelector('.wcard');
+    // Every lane stays on screen. A lane that vanishes when empty reads as a
+    // broken visor, and you cannot tell "no waits" from "wait lane gone".
+    if (has) {
+      box.dataset.empty = '';
+      return;
+    }
+    const empty = emptyMsg[lane];
+    if (box.dataset.empty !== empty) {
+      box.dataset.empty = empty;
+      box.innerHTML = '<div class="muted">'+empty+'</div>';
+    }
+  });
 }
 
 function fillCoin(el, w) {
@@ -794,19 +1043,30 @@ function fillCoin(el, w) {
   set('liq', usdFull(w.liq));
   set('vol5m', usdFull(w.vol5m));
   set('ret5m', pctFull(w.ret_5m));
-  set('age', ageTxt(w.age_min));
+  set('age', cardAge(w));
   set('holders', w.holders==null?'—':numFull(w.holders));
   set('rt', w.rt==null?'—':pctFull(w.rt));
-  set('c-score', r.total==null?'—':String(r.total));
-  set('cat-dist', (r.dist==null?'—':r.dist)+' / 10');
-  set('cat-crowd', (r.crowd==null?'—':r.crowd)+' / 10');
-  set('cat-flow', (r.flow==null?'—':r.flow)+' / 10');
-  set('cat-chart', (r.chart==null?'—':r.chart)+' / 10');
-  set('cat-narr', (r.narrative==null?'—':r.narrative)+' / 10');
+  const pending = r.total == null;
+  set('c-score', pending ? '—' : String(r.total));
+  set('cat-dist', pending ? '—' : r.dist+' / 10');
+  set('cat-crowd', pending ? '—' : r.crowd+' / 10');
+  set('cat-flow', pending ? '—' : r.flow+' / 10');
+  set('cat-chart', pending ? '—' : r.chart+' / 10');
+  set('cat-narr', pending ? '—' : r.narrative+' / 10');
+  const buy = el.querySelector('.buy-box');
+  if (buy) {
+    const tone = pending ? 'q' : (r.total >= (w.min_rubric||7) ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo');
+    const want = 'buy-box score-'+tone;
+    if (buy.className !== want) buy.className = want;
+  }
+  set('r-cap', pending ? 'sem avaliação ainda' : ('rubric / '+(w.min_rubric==null?'—':w.min_rubric)+' pra passar o piso'));
   const minP = w.min_p == null ? '—' : Number(w.min_p).toFixed(4);
   const minEv = w.min_ev == null ? '—' : Number(w.min_ev).toFixed(4);
   set('pwin', (w.p == null ? '—' : Number(w.p).toFixed(4))+'  (piso '+minP+')');
   set('ev', (w.ev == null ? '—' : ((Number(w.ev)>=0?'+':'')+Number(w.ev).toFixed(4)))+'  (piso '+minEv+')');
+  set('need', needTxt(w));
+  set('pev', pevTxt(w));
+  set('lat', latTxt(w));
   set('why', w.explain || w.why || '');
   set('whales', w.whale_n==null?'—':(numFull(w.whale_n)+' · '+pctFull(w.whale_pct)+' · '+usdFull(w.whale_usd)));
   set('kols', (w.kols&&w.kols.length) ? w.kols.join(', ') : '—');
@@ -830,7 +1090,7 @@ function paintCoin(opts) {
   const box = $('coin');
   if (!box) return;
   const w = lastWatch.find(x => watchKey(x) === picked);
-  document.querySelectorAll('#watch .pick').forEach(r => r.classList.toggle('on', r.dataset.pick === picked));
+  document.querySelectorAll('#tab-watch .pick').forEach(r => r.classList.toggle('on', r.dataset.pick === picked));
   if (!w) { box.hidden = true; box.innerHTML = ''; box.dataset.pick = ''; return; }
   box.hidden = false;
   const struct = [picked, w.call, w.cert, w.label, w.address, (w.vetoes||[]).join(), w.explain||'', String(w.dex_paid), String(w.holders)].join('|');
@@ -847,8 +1107,8 @@ function paintCoin(opts) {
   const evTxt = w.ev == null ? '—' : ((Number(w.ev)>=0?'+':'')+Number(w.ev).toFixed(4));
   const minP = w.min_p == null ? '—' : Number(w.min_p).toFixed(4);
   const minEv = w.min_ev == null ? '—' : Number(w.min_ev).toFixed(4);
-  const minR = w.min_rubric == null ? '—' : String(w.min_rubric);
-  const tone = r.total >= (w.min_rubric||7) ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo';
+  const pending = r.total == null;
+  const tone = pending ? 'q' : (r.total >= (w.min_rubric||7) ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo');
   const wallets = (w.wallets||[]).join(', ') || '—';
   const kols = (w.kols&&w.kols.length) ? w.kols.join(', ') : '—';
   const fomo = (w.fomo&&w.fomo.length) ? w.fomo.join(', ') : '—';
@@ -868,7 +1128,7 @@ function paintCoin(opts) {
     + stat('liquidity', 'liq', usdFull(w.liq))
     + stat('vol 5m', 'vol5m', usdFull(w.vol5m))
     + stat('ret 5m', 'ret5m', pctFull(w.ret_5m))
-    + stat('age', 'age', ageTxt(w.age_min))
+    + stat((w.call||'')==='hold' ? 'hold' : 'age', 'age', cardAge(w))
     + stat('holders', 'holders', w.holders==null?'—':numFull(w.holders))
     + stat('round trip', 'rt', w.rt==null?'—':pctFull(w.rt))
     + stat('dex', 'dexname', esc(w.dex||'—'))
@@ -876,16 +1136,20 @@ function paintCoin(opts) {
     + stat('dex paid', 'dexpaid', w.dex_paid ? 'yes' : 'no')
     + '</div>'
     + '<div class="buy-box score-'+tone+'">'
+    + '<h2>o que falta pra comprar</h2>'
+    + '<p data-f="need">'+esc(needTxt(w))+'</p>'
+    + '<div class="coin-h"><span class="score-n" data-f="pev">'+esc(pevTxt(w))+'</span></div>'
+    + '<p class="muted" data-f="lat">'+esc(latTxt(w))+'</p>'
     + '<h2>nota desta moeda</h2>'
     + '<p>Régua igual pra todas; os inputs (chart, crowd, chain, narrativa) são desta CA. WAITING no topo é PnL da conta, não nota.</p>'
-    + '<div class="coin-h"><span class="score-n" data-f="c-score">'+(r.total==null?'—':r.total)+'</span>'
-    + '<span class="muted">rubric / '+minR+' pra passar o piso</span></div>'
+    + '<div class="coin-h"><span class="score-n" data-f="c-score">'+(pending?'—':r.total)+'</span>'
+    + '<span class="muted" data-f="r-cap">'+(pending?'sem avaliação ainda':('rubric / '+(w.min_rubric==null?'—':w.min_rubric)+' pra passar o piso'))+'</span></div>'
     + '<div class="cat-list">'
-    + '<div><span>distribution</span><span data-f="cat-dist">'+(r.dist==null?'—':r.dist)+' / 10</span></div>'
-    + '<div><span>crowd</span><span data-f="cat-crowd">'+(r.crowd==null?'—':r.crowd)+' / 10</span></div>'
-    + '<div><span>flow</span><span data-f="cat-flow">'+(r.flow==null?'—':r.flow)+' / 10</span></div>'
-    + '<div><span>chart</span><span data-f="cat-chart">'+(r.chart==null?'—':r.chart)+' / 10</span></div>'
-    + '<div><span>narrative</span><span data-f="cat-narr">'+(r.narrative==null?'—':r.narrative)+' / 10</span></div>'
+    + '<div><span>distribution (D)</span><span data-f="cat-dist">'+(pending?'—':r.dist+' / 10')+'</span></div>'
+    + '<div><span>crowd (C)</span><span data-f="cat-crowd">'+(pending?'—':r.crowd+' / 10')+'</span></div>'
+    + '<div><span>flow (F)</span><span data-f="cat-flow">'+(pending?'—':r.flow+' / 10')+'</span></div>'
+    + '<div><span>chart (G)</span><span data-f="cat-chart">'+(pending?'—':r.chart+' / 10')+'</span></div>'
+    + '<div><span>narrative (N)</span><span data-f="cat-narr">'+(pending?'—':r.narrative+' / 10')+'</span></div>'
     + '</div>'
     + '<div class="coin-stats">'
     + stat('p (win)', 'pwin', pTxt+'  (piso '+minP+')')
@@ -918,6 +1182,67 @@ function mcapPath(a, b) {
   return '$'+(a?kM(a):'—')+' → $'+(b?kM(b):'—');
 }
 
+function holdRowHtml(h) {
+  const addr = h.address || (h.key||'').split(':')[1];
+  return '<td><div class="sym" data-f="sym">'+esc(h.symbol || caHead(addr))+' '+role(h.role)+'</div>'
+    + '<div class="ca">'+chainShort(h.chain||'')+' · '+caHead(addr)+' '+copyBtn(addr)+' '+sellBtn(h.key, h.symbol)+'</div></td>'
+    + '<td class="gold" data-f="held"></td>'
+    + '<td class="pnl" data-f="pnl"></td>'
+    + '<td data-f="left"></td>'
+    + '<td data-f="age"></td>'
+    + '<td class="mcap-path" data-f="mcap"></td>'
+    + '<td data-f="stage"></td>';
+}
+function fillHoldRow(tr, h) {
+  const set = (f, t) => setNode(tr.querySelector('[data-f="'+f+'"]'), t);
+  const pnl = tr.querySelector('[data-f="pnl"]');
+  const u = h.unrealized_usd != null ? h.unrealized_usd : h.unrealized_pct;
+  if (pnl) {
+    const want = 'pnl '+cls(u);
+    if (pnl.className !== want) pnl.className = want;
+    if (pnl.innerHTML !== (usd(h.unrealized_usd||0)+' <span class="muted">'+pct(h.unrealized_pct)+'</span>'))
+      pnl.innerHTML = usd(h.unrealized_usd||0)+' <span class="muted">'+pct(h.unrealized_pct)+'</span>';
+  }
+  set('held', usd(h.held_usd != null ? h.held_usd : h.size_usd));
+  set('left', Math.round((h.remaining_pct||0)*100)+'%');
+  set('age', mins(h.held_min != null ? h.held_min : h.age_min));
+  set('mcap', mcapPath(h.mcap_entry, h.mcap));
+  const st = tr.querySelector('[data-f="stage"]');
+  if (st) {
+    const why = (h.hold_why||'')+(h.hold_strikes?(' · '+h.hold_strikes+' strike'):'');
+    const next = (h.entry_rubric ? (h.entry_rubric+' → '+(h.hold_rubric||'—')) : '—')
+      + (why ? '<div class="meta">'+esc(why)+'</div>' : '');
+    if (st.innerHTML !== next) st.innerHTML = next;
+  }
+}
+function paintHoldTable(items) {
+  const body = $('holds').querySelector('tbody');
+  if (!body) return;
+  const lane = body.closest('.lane');
+  if (lane) lane.hidden = false;
+  if (!items.length) {
+    const empty = '<tr class="empty"><td class="muted" colspan="7">none open</td></tr>';
+    if (body.innerHTML !== empty) body.innerHTML = empty;
+    return;
+  }
+  const z = body.querySelector('tr.empty');
+  if (z) z.remove();
+  const have = new Map([...body.querySelectorAll('tr[data-k]')].map(el => [el.dataset.k, el]));
+  const keep = new Set();
+  items.forEach(h => {
+    const k = String(h.key || '');
+    keep.add(k);
+    let tr = have.get(k);
+    if (!tr) {
+      tr = document.createElement('tr');
+      tr.dataset.k = k;
+      tr.innerHTML = holdRowHtml(h);
+      body.appendChild(tr);
+    }
+    fillHoldRow(tr, h);
+  });
+  have.forEach((el, k) => { if (!keep.has(k)) el.remove(); });
+}
 function rows(el, items, html, empty, cols) {
   const body = el.querySelector('tbody');
   const next = items.length ? items.map(html).join('')
@@ -968,7 +1293,7 @@ function paintVerdict(d) {
 }
 
 $('dump-all').addEventListener('click', () => {
-  if (!confirm('Vender todas as posições abertas agora?')) return;
+  if (!confirm('Vende todas as bags e DESLIGA o engine. Ele não fica pausado. Continuar?')) return;
   fetch('/api/flatten', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
     .then(r => r.json()).then(j => {
       $('status').textContent = j.ok ? 'vendendo tudo…' : (j.error || 'falhou vender');
@@ -1102,6 +1427,9 @@ function paintPnlWindows(w) {
   const el = $('pnl-windows');
   if (!el) return;
   const wins = (w && w.windows) || [];
+  const sig = wins.map(x => x.label+':'+(x.pnl_usd||0)+':'+(x.partial?'1':'0')).join('|');
+  if (el.dataset.sig === sig) return;
+  el.dataset.sig = sig;
   el.innerHTML = wins.map(x => {
     const lab = x.partial
       ? x.label+' (parcial, '+x.history_days+' dias de histórico)'
@@ -1159,18 +1487,22 @@ async function tick() {
   if (inflight) { queued = true; return; }
   inflight = true;
   let d;
-  try { d = await (await fetch('/api?'+Date.now(), {cache:'no-store'})).json(); }
+  try { d = await (await fetch('/api?h='+heavySig+'&_='+Date.now(), {cache:'no-store'})).json(); }
   catch (err) { $('status').textContent = 'offline'; inflight = false; queued = false; return; }
+  // Blocks absent from the reply are the ones we already hold unchanged.
+  heavySig = d.heavy_sig || '';
   const live = d.running ? (d.mode || 'run') : 'stopped';
-  const halt = d.halted ? (' · paused ' + (d.halt_reason || '')) : '';
+  const halt = d.halted ? (' · flatten+stop ' + (d.halt_reason || '')) : '';
   const learn = d.aggressive ? (' · aggressive ' + (d.aggressive_closes||0) + ' closes') : '';
   const dead = (d.dead_loops || []).length ? (' · loop dead ' + d.dead_loops.join(',')) : '';
   $('status').textContent = live + halt + learn + dead
     + ((d.watch_in||d.watch_out) ? (' · +'+(d.watch_in||0)+'/−'+(d.watch_out||0)) : '')
     + ' · ' + d.stale_s + 's';
-  $('status').className = (d.dead_loops || []).length ? 'dn' : 'muted';
+  $('status').className = (d.dead_loops || []).length || !d.running || d.halted ? 'dn' : 'muted';
   const fault = $('fault');
   const msgs = Object.entries(d.faults || {}).map(([k,v]) => k + ': ' + v);
+  if (!d.running) msgs.unshift('Engine parado. Sem comprar/vender ele desliga — alphahound resume e sobe de novo.');
+  else if (d.halted) msgs.unshift('Halt: vende as bags e DESLIGA. Não fica rodando sem operar. ' + (d.halt_reason||''));
   if (msgs.length) { fault.textContent = msgs.join(' · '); fault.className = 'on'; }
   else { fault.textContent = ''; fault.className = ''; }
   setText('equity', usd(d.equity_usd), 'n');
@@ -1181,22 +1513,19 @@ async function tick() {
   setText('holding', (d.holding||0) + (d.holding ? '  '+usd(d.holding_usd) : ''), 'n gold');
   setText('watching', String(d.watching||0), 'n cyan');
   paintVerdict(d);
-  $('universe').innerHTML = (d.universe.chains||[]).map(chainCard).join('');
-  lastWatch = d.watch || [];
+  if (d.universe) {
+    const uni = $('universe');
+    const uniHtml = (d.universe.chains||[]).map(chainCard).join('');
+    if (uni.innerHTML !== uniHtml) uni.innerHTML = uniHtml;
+  }
+  const incoming = d.watch || [];
+  // Keep the last non-empty paint. Empty watch + watching=0 is Hood unpaid on
+  // radar / a torn file — wiping lastWatch blanks Sol cards the operator still has.
+  if (incoming.length) lastWatch = incoming;
   paintWatch(lastWatch, d.running);
   paintCoin();
-  rows($('holds'), d.holds||[], h => `<tr>
-    <td>
-      <div class="sym">${h.symbol || caHead(h.address||h.key)} ${role(h.role)}</div>
-      <div class="ca">${chainShort(h.chain||'')} · ${caHead(h.address || (h.key||'').split(':')[1])} ${copyBtn(h.address || (h.key||'').split(':')[1])} ${sellBtn(h.key, h.symbol)}</div>
-    </td>
-    <td class="gold">${usd(h.held_usd != null ? h.held_usd : h.size_usd)}</td>
-    <td class="pnl ${cls(h.unrealized_usd != null ? h.unrealized_usd : h.unrealized_pct)}">${usd(h.unrealized_usd||0)} <span class="muted">${pct(h.unrealized_pct)}</span></td>
-    <td>${Math.round((h.remaining_pct||0)*100)}%</td>
-    <td>${mins(h.age_min)}</td>
-    <td class="mcap-path">${mcapPath(h.mcap_entry, h.mcap)}</td>
-    <td>${h.entry_rubric ? (h.entry_rubric+' → '+(h.hold_rubric||'—')) : '—'}<div class="meta">${h.hold_why||''}${h.hold_strikes?(' · '+h.hold_strikes+' strike'):''}</div></td></tr>`, 'none open', 7);
-  rows($('sold'), d.sold||[], t => `<tr>
+  paintHoldTable(d.holds||[]);
+  if (d.sold) rows($('sold'), d.sold, t => `<tr>
     <td>
       <div class="sym">${t.symbol || caHead((t.key||'').split(':')[1])}</div>
       <div class="ca">${chainShort(t.chain||'')} · ${caHead((t.key||'').split(':')[1])} ${copyBtn((t.key||'').split(':')[1])}</div>
@@ -1211,10 +1540,10 @@ async function tick() {
       <div class="meta">${clock(t.closed_at_ms)}</div>
       ${exitLegsHtml(t.exit_legs)}
     </td></tr>`, 'none closed', 6);
-  paintKols(d.kols);
-  paintFomo(d.fomo);
-  paintPnl(d.pnl_chart);
-  paintPnlWindows(d.pnl_windows);
+  if (d.kols) paintKols(d.kols);
+  if (d.fomo) paintFomo(d.fomo);
+  if (d.pnl_chart) paintPnl(d.pnl_chart);
+  if (d.pnl_windows) paintPnlWindows(d.pnl_windows);
   inflight = false;
   if (queued) { queued = false; tick(); }
 }
@@ -1222,13 +1551,19 @@ const OUT_LAB = {fumble:'fumble', rejeicao_correta:'rejeição correta', entrada
   entrada_errada:'entrada errada', tracking:'tracking'};
 const when = ms => new Date(ms).toLocaleString(undefined, {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
 let revBusy = false;
+let revSig = '';
 async function loadReview() {
   if (revBusy) return;
   revBusy = true;
   const out = $('rev-out').value;
   try {
     const j = await (await fetch('/api/review?outcome='+encodeURIComponent(out)+'&limit=250', {cache:'no-store'})).json();
-    $('rev-meta').textContent = (j.open_rows||0)+' shadows abertos · '+(j.open_keys||0)+' tokens no lote de 30 · fumble ≥ '+Math.round((j.fumble_pct||0.2)*100)+'% MFE';
+    const openN = j.open_rows||0;
+    $('rev-meta').textContent = openN+' shadows abertos · '+(j.open_keys||0)+' tokens · fumble ≥ '+Math.round((j.fumble_pct||0.2)*100)+'% MFE'
+      + (out==='' && openN ? ' · tracking no filtro “ainda tracking”' : '');
+    const sig = (j.rows||[]).map(r => [r.ts_ms,r.key,r.outcome,r.ticks,r.mfe,r.pnl_usd].join()).join('|') + '|' + out;
+    if (sig === revSig) { revBusy = false; return; }
+    revSig = sig;
     const body = (j.rows||[]).map((r,i) => {
       const ca = (r.key||'').split(':')[1]||'';
       const res = r.action==='enter'
@@ -1239,14 +1574,16 @@ async function loadReview() {
       const soldBits = r.action==='enter'
         ? ('<div class="meta">'+clock(r.closed_at_ms || r.ts_ms)+'</div>'+exitLegsHtml(r.exit_legs))
         : '';
+      const firstM = Number(r.mcap_first)||0;
       return `<tr class="rev-row" data-rev="${i}"><td>${when(r.ts_ms)}</td>
         <td><div class="sym">${esc(r.symbol||caHead(ca))}</div><div class="ca">${chainShort(r.chain||'')} ${esc(caHead(ca))} ${copyBtn(ca)}</div></td>
+        <td>${firstM ? mcapTxt(firstM) : '—'}</td>
         <td>${esc(r.action)}<div class="meta">${esc(r.reason||'')}${r.ticks>1 ? (' · '+r.ticks+' ticks') : ''}</div></td>
         <td>${pct(r.p)} / ${pct(r.ev)}</td>
         <td>${res}${soldBits}</td>
         <td class="out-${esc(r.outcome)}">${OUT_LAB[r.outcome]||r.outcome}</td></tr>
-        <tr class="rev-feat" data-rev-feat="${i}" hidden><td colspan="6">${esc(why ? why+' · ' : '')}${esc(feat)}</td></tr>`;
-    }).join('') || '<tr><td colspan="6" class="muted">vazio</td></tr>';
+        <tr class="rev-feat" data-rev-feat="${i}" hidden><td colspan="7">${esc(why ? why+' · ' : '')}${esc(feat)}</td></tr>`;
+    }).join('') || '<tr><td colspan="7" class="muted">'+(openN ? (openN+' ainda tracking — usa o filtro') : 'vazio')+'</td></tr>';
     $('review').querySelector('tbody').innerHTML = body;
   } catch (err) {
     $('rev-meta').textContent = 'falhou o review';
@@ -1256,6 +1593,14 @@ async function loadReview() {
 $('rev-out').addEventListener('change', loadReview);
 tick();
 setInterval(tick, 400);
+let lastRev = 0;
+setInterval(() => {
+  const tab = $('tab-review');
+  if (!tab || !tab.classList.contains('on')) return;
+  if (Date.now() - lastRev < 2000) return;
+  lastRev = Date.now();
+  loadReview();
+}, 2000);
 </script>
 </body>
 </html>
@@ -1270,10 +1615,15 @@ def serve(
     settings: Settings | None = None,
     strategy: Config | None = None,
 ) -> None:
-    def snapshot() -> bytes:
+    def snapshot(client_sig: str = "") -> bytes:
         # Reuse the process Store. Opening sqlite on every /api poll made the
         # visor hitch and fight the engine for preview.json.
-        return json.dumps(assemble(state_dir, store, equity, settings, strategy)).encode()
+        payload = assemble(state_dir, store, equity, settings, strategy)
+        payload["heavy_sig"] = sig = heavy_sig(payload)
+        if client_sig and client_sig == sig:
+            for key in HEAVY_KEYS:
+                payload.pop(key, None)
+        return json.dumps(payload).encode()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:
@@ -1305,7 +1655,7 @@ def serve(
                 return
             if parsed.path == "/api":
                 try:
-                    body = snapshot()
+                    body = snapshot((parse_qs(parsed.query).get("h") or [""])[0])
                 except Exception as exc:  # noqa: BLE001
                     body = json.dumps({"error": str(exc)}).encode()
                     self.send_response(500)

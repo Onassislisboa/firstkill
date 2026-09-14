@@ -33,10 +33,11 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 from .log import get
-from .models import ErrorClass, ExitReason, Features, TradeRecord
-from .scoring import PRIOR_BIAS, PRIOR_WEIGHTS, Model, normalize
-from .settings import Config
-from .store import Store
+from .models import Action, ErrorClass, ExitReason, TradeRecord
+from .portfolio import banked_from_peak
+from .scoring import PRIOR_BIAS, PRIOR_WEIGHTS, VISOR_WAIT_PREFIXES, Model, normalize
+from .settings import Config, LEARN_EV_AFTER
+from .store import Store, episode_kind, features_from_json, unknown_from_json
 
 log = get("learning")
 
@@ -239,6 +240,7 @@ def run_postmortem(
     report.pnl_by_class = pnl
 
     total = len(trades)
+    closed = store.trade_count()
     for klass_value, count in counts.most_common():
         if klass_value == ErrorClass.WIN.value:
             continue
@@ -248,6 +250,11 @@ def run_postmortem(
             continue
         if pnl.get(klass_value, 0.0) >= 0:
             report.skipped.append(f"{klass_value}: frequent but not costing money")
+            continue
+        if klass_value == ErrorClass.NO_EDGE.value and closed < LEARN_EV_AFTER:
+            report.skipped.append(
+                f"no_edge: {closed} < {LEARN_EV_AFTER} closes, collect labels first"
+            )
             continue
         try:
             klass = ErrorClass(klass_value)
@@ -310,8 +317,10 @@ def filter_cost(store: Store, *, win_threshold: float = 0.20) -> list[FilterCost
     rows = store.filter_cost_report(limit=1000)
     buckets: dict[str, list[float]] = {}
     for row in rows:
-        reason = (row["reason"] or "unknown").split(":")[0].strip() or "unknown"
-        buckets.setdefault(reason, []).append(float(row["counterfactual_pct"] or 0.0))
+        _action, gate = episode_kind(row["action"] or "", row["reason"] or "unknown")
+        buckets.setdefault(gate or "unknown", []).append(
+            float(row["counterfactual_pct"] or 0.0)
+        )
 
     out: list[FilterCost] = []
     for gate, values in buckets.items():
@@ -351,6 +360,10 @@ def relax_costly_gates(
         "fresh_wallets": ("gates.max_fresh_wallet_pct", 0.10),
         "crowd_already_here": ("terminals.max_retail_terminal_share", 0.10),
         "round_trip_cost": ("gates.max_round_trip_cost_pct", 0.10),
+        # Score floors are global. Playbook chase/volume/mcap are per-chain —
+        # a Hood volume fumble must not loosen Solana's copy floor.
+        "probability": ("scoring.min_probability", -0.08),
+        "ev": ("scoring.min_expected_value", -0.08),
     }
     notes: list[str] = []
     for cost in filter_cost(store):
@@ -404,7 +417,7 @@ def _logloss(model: Model, samples: list[tuple[dict[str, float], int, float]]) -
     return total / weight_sum if weight_sum else float("inf")
 
 
-def _samples_from_trades(trades: list[TradeRecord]) -> list[tuple[dict[str, float], int, float]]:
+def _samples_from_trades(trades: list[TradeRecord]) -> list[tuple[int, dict[str, float], int, float]]:
     out = []
     for trade in trades:
         normalized = normalize(trade.features, trade.unknown)
@@ -412,7 +425,39 @@ def _samples_from_trades(trades: list[TradeRecord]) -> list[tuple[dict[str, floa
         # Magnitude matters: a +300% winner and a +3% scratch are not equally
         # informative, and unweighted logistic regression treats them as such.
         weight = 1.0 + min(2.0, abs(trade.pnl_pct) / 0.30)
-        out.append((normalized, label, weight))
+        out.append((trade.closed_at_ms, normalized, label, weight))
+    return out
+
+
+def shadow_teaches_score(action: str, reason: str) -> bool:
+    """Safety vetoes stay out of the trainer. Score/patience rejects are the lesson."""
+    if action == Action.REJECT_SCORE.value:
+        return True
+    if action != Action.REJECT_GATE.value:
+        return False
+    return any((reason or "").startswith(p) for p in VISOR_WAIT_PREFIXES)
+
+
+def _samples_from_shadows(
+    store: Store, strategy: Config
+) -> list[tuple[int, dict[str, float], int, float]]:
+    rows = store.conn.execute(
+        """SELECT d.ts_ms, d.action, d.reason, d.features, d.unknown, s.counterfactual_pct
+           FROM shadow s JOIN decisions d ON d.id = s.decision_id
+           WHERE s.resolved = 1"""
+    ).fetchall()
+    out = []
+    for row in rows:
+        if not shadow_teaches_score(row["action"] or "", row["reason"] or ""):
+            continue
+        peak = float(row["counterfactual_pct"] or 0.0)
+        # ponytail: MFE is a peak, not a fill. Same ladder the backtest uses.
+        banked = banked_from_peak(peak, strategy, store)
+        feats = features_from_json(row["features"] or "{}")
+        unknown = unknown_from_json(row["unknown"])
+        label = 1 if banked > 0 else 0
+        weight = 0.4 * (1.0 + min(2.0, abs(banked) / 0.30))
+        out.append((int(row["ts_ms"] or 0), normalize(feats, unknown), label, weight))
     return out
 
 
@@ -420,13 +465,19 @@ def train(store: Store, strategy: Config, *, seed: int = 7) -> TrainResult:
     cfg = strategy.section("learning")
     min_trades = int(strategy.get("scoring.min_trades_for_learned_weights", 40))
     trades = store.trades()
-    result = TrainResult(samples=len(trades))
+    dated = _samples_from_trades(trades) + _samples_from_shadows(store, strategy)
+    dated.sort(key=lambda row: row[0])
+    samples = [(norm, label, weight) for _ts, norm, label, weight in dated]
+    result = TrainResult(samples=len(samples))
 
-    if len(trades) < min_trades:
-        result.note = f"{len(trades)}/{min_trades} closed trades; keeping prior weights"
+    if len(samples) < min_trades:
+        result.note = (
+            f"{len(samples)}/{min_trades} outcomes "
+            f"({len(trades)} closed, {len(samples) - len(trades)} score-shadows); "
+            "keeping prior weights"
+        )
         return result
 
-    samples = _samples_from_trades(trades)
     # Time-ordered holdout. Random splits leak the future into the past on a
     # regime-dependent series and produce a model that looks great and is not.
     split = max(int(len(samples) * 0.8), min_trades // 2)

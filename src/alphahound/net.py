@@ -72,16 +72,27 @@ class Http:
         self._overrides: dict[str, tuple[float, int]] = {}
 
     def limit(self, host: str, rate_per_sec: float, burst: int) -> None:
+        """Meter a host, or a path prefix under it ("host/orders")."""
         self._overrides[host] = (rate_per_sec, burst)
         self._buckets.pop(host, None)
 
     def _bucket(self, url: str) -> TokenBucket:
-        host = urlsplit(url).netloc
-        bucket = self._buckets.get(host)
+        parts = urlsplit(url)
+        target = parts.netloc + parts.path
+        # Longest registered prefix wins, so one host can hold several buckets.
+        # Dexscreener meters /latest/dex at 300/min but /orders and /token-*
+        # at 60/min; on a shared bucket the cheap endpoints spend the budget
+        # and the quote loop is the one that gets the 429.
+        key = max(
+            (k for k in self._overrides if target.startswith(k)),
+            key=len,
+            default=parts.netloc,
+        )
+        bucket = self._buckets.get(key)
         if bucket is None:
-            rate, burst = self._overrides.get(host, self._default)
+            rate, burst = self._overrides.get(key, self._default)
             bucket = TokenBucket(rate, burst)
-            self._buckets[host] = bucket
+            self._buckets[key] = bucket
         return bucket
 
     async def request(

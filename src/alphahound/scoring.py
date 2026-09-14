@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 from .log import get
 from .models import Features, Position, Score, TradeRecord, now_ms
-from .verdict import bot_veto, classify
+from .verdict import FRESH_MIN_AGE_MIN, bot_veto, classify
 from .portfolio import banked_from_peak
 from .settings import Config, score_floors
 from .origin import launchpad_origin
@@ -410,8 +410,13 @@ def evaluate_gates(
     # top-10 was well above 55% and it was still a real market. The exception
     # is UNKNOWN wallets stacking circulating supply: that is a rug. LP and
     # burn are already excluded from top1/top10 in distribution.analyze.
+    # Labeled Fomo/KOL inside is the explanation the top10 check is looking for.
+    # Size-whales and copy_signal from their flow do NOT count: mikedyson
+    # bought at top10 61% because unlabeled whale_net_flow set covered=True.
+    covered = _labeled_inside(enr)
     unknown_whale = (
-        f.top1_pct > p("max_unknown_top1_pct", 0.50)
+        not covered
+        and f.top1_pct > p("max_unknown_top1_pct", 0.50)
         and f.known_holder_pct < f.top1_pct * 0.6
     )
     check(
@@ -421,7 +426,8 @@ def evaluate_gates(
         f"top holder {f.top1_pct:.0%} is not a known KOL/whale",
     )
     unknown_top10 = (
-        f.top10_pct > p("max_top10_pct", 0.50)
+        not covered
+        and f.top10_pct > p("max_top10_pct", 0.50)
         and f.known_holder_pct < f.top10_pct * 0.6
     )
     check(
@@ -452,10 +458,13 @@ def evaluate_gates(
             free_lp > max_free_lp,
             f"{free_lp:.0%} da liquidez livre (não burn/locker)",
         )
+    # Launchpad mints are 100% fresh by definition. Verdict already ignores
+    # that until FRESH_MIN_AGE_MIN; the gate was skipping every young pump.
     check(
         "fresh_wallets",
         ("fresh_wallet_pct",),
-        f.fresh_wallet_pct > p("max_fresh_wallet_pct", 0.70),
+        enr.candidate.age_minutes >= FRESH_MIN_AGE_MIN
+        and f.fresh_wallet_pct > p("max_fresh_wallet_pct", 0.70),
         f"{f.fresh_wallet_pct:.0%} fresh wallets",
     )
     check(
@@ -510,6 +519,8 @@ def evaluate_gates(
             classify(f, unknown, age_minutes=enr.candidate.age_minutes),
             chain.value,
         )
+        if extra and extra.startswith("cabaled:") and _labeled_inside(enr):
+            extra = None
         if extra and not (
             extra.startswith("unverified:") and enr.candidate.dex_paid
         ):
@@ -549,9 +560,23 @@ def watch_call(*, vetoed: bool, ok: bool, reasons: list[str]) -> str:
     return "wait"
 
 
+def _labeled_inside(enr: Enrichment) -> bool:
+    """KOL/Fomo we named. Size-whales are not a sponsor — they are often the rug."""
+    crowd = getattr(enr, "crowd", None) or {}
+    if crowd.get("kols") or crowd.get("fomo"):
+        return True
+    f = enr.features
+    unknown = enr.unknown
+    if "fomo_inside" not in unknown and f.fomo_inside >= 1:
+        return True
+    return False
+
+
 def _sponsored(enr: Enrichment) -> bool:
     crowd = getattr(enr, "crowd", None) or {}
-    if crowd.get("kols") or int(crowd.get("whale_n") or 0) >= 1:
+    if _labeled_inside(enr):
+        return True
+    if int(crowd.get("whale_n") or 0) >= 1:
         return True
     f = enr.features
     unknown = enr.unknown

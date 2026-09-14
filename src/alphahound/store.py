@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     unknown TEXT NOT NULL DEFAULT '[]',
     first_ts_ms INTEGER,
     last_ts_ms INTEGER,
-    ticks INTEGER NOT NULL DEFAULT 1
+    ticks INTEGER NOT NULL DEFAULT 1,
+    first_mcap_usd REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_key ON decisions(key);
 CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts_ms);
@@ -184,6 +185,17 @@ def lock_state_dir(state_dir: Path) -> IO[bytes]:
     return handle
 
 
+def mcap_from_reason(reason: str) -> float:
+    """Parse 'mcap: 71695 below …' from a gate. 0 if that isn't the reason."""
+    parts = (reason or "").split()
+    if len(parts) < 2 or not parts[0].startswith("mcap"):
+        return 0.0
+    try:
+        return float(parts[1].replace(",", ""))
+    except ValueError:
+        return 0.0
+
+
 def episode_kind(action: str, reason: str) -> tuple[str, str]:
     """Gate/score class, not the floats in the message.
 
@@ -232,6 +244,7 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
         # CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so a
         # column added later never appears in a database that already exists.
@@ -240,6 +253,7 @@ class Store:
             ("decisions", "first_ts_ms", "INTEGER"),
             ("decisions", "last_ts_ms", "INTEGER"),
             ("decisions", "ticks", "INTEGER NOT NULL DEFAULT 1"),
+            ("decisions", "first_mcap_usd", "REAL NOT NULL DEFAULT 0"),
             ("trades", "unknown", "TEXT NOT NULL DEFAULT '[]'"),
             ("trades", "symbol", "TEXT NOT NULL DEFAULT ''"),
             ("trades", "mcap_entry_usd", "REAL NOT NULL DEFAULT 0"),
@@ -271,6 +285,7 @@ class Store:
         key = decision.candidate.key
         action = decision.action.value
         reason = decision.reason or ""
+        first_mcap = self._first_seen_mcap(key, decision.candidate.mcap_usd)
         if decision.action is not Action.ENTER:
             prev = self.conn.execute(
                 """SELECT id, action, IFNULL(reason,'') AS reason,
@@ -297,8 +312,9 @@ class Store:
         cur = self.conn.execute(
             """INSERT INTO decisions (ts_ms, key, chain, symbol, action, probability,
                    expected_value, size_usd, signal_price, features, contributions,
-                   weights_version, reason, unknown, first_ts_ms, last_ts_ms, ticks)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   weights_version, reason, unknown, first_ts_ms, last_ts_ms, ticks,
+                   first_mcap_usd)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 ts,
                 key,
@@ -317,12 +333,38 @@ class Store:
                 ts,
                 ts,
                 1,
+                first_mcap,
             ),
         )
         decision_id = int(cur.lastrowid or 0)
         if decision.action is not Action.ENTER and decision.candidate.price_usd > 0:
             self.open_shadow(decision_id, key, decision.candidate.price_usd)
         return decision_id
+
+    def _first_seen_mcap(self, key: str, live: float) -> float:
+        """Mcap on first visor sight of this mint. Later episodes keep that number."""
+        row = self.conn.execute(
+            "SELECT first_mcap_usd, reason FROM decisions WHERE key = ? ORDER BY id ASC LIMIT 1",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return float(live or 0.0)
+        stored = float(row["first_mcap_usd"] or 0.0)
+        if stored > 0:
+            return stored
+        return mcap_from_reason(row["reason"] or "")
+
+    def _first_mcap_by_key(self) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for r in self.conn.execute(
+            "SELECT key, first_mcap_usd, reason FROM decisions ORDER BY id"
+        ):
+            k = r["key"]
+            if k in out:
+                continue
+            m = float(r["first_mcap_usd"] or 0.0) or mcap_from_reason(r["reason"] or "")
+            out[k] = m
+        return out
 
     def recent_decision_keys(self, since_ms: int) -> set[str]:
         rows = self.conn.execute(
@@ -377,8 +419,8 @@ class Store:
     ) -> dict[str, Any]:
         """Decisions + shadow MFE + closed trades, classified for the visor.
 
-        One row per reject decision (or closed trade). Does not write. Unresolved
-        shadows are omitted unless outcome=tracking — they are not 'correct rejects'.
+        One row per reject decision (or closed trade). Does not write.
+        Default includes unresolved shadows as tracking so the tab matches the session.
         """
         outcome = (outcome or "").strip().lower()
         fumble_pct = float(fumble_pct)
@@ -398,6 +440,7 @@ class Store:
             items.sort(key=lambda kv: -abs(kv[1]))
             return [[k, round(v, 4)] for k, v in items[:24]]
 
+        first_mcap = self._first_mcap_by_key()
         rows: list[dict[str, Any]] = []
         want_rej = outcome in ("", "fumble", "rejeicao_correta", "tracking")
         want_ent = outcome in ("", "entrada_correta", "entrada_errada")
@@ -420,6 +463,8 @@ class Store:
             elif outcome == "tracking":
                 sql += " WHERE s.resolved = 0"
             else:
+                # Default "todos" is resolved + entries. Live tracking drowned
+                # the tab (200+ wait/lp shadows) and looked frozen.
                 sql += " WHERE s.resolved = 1"
             sql += " ORDER BY d.ts_ms DESC LIMIT ?"
             params.append(limit)
@@ -449,6 +494,7 @@ class Store:
                         "pnl_usd": None,
                         "outcome": kind,
                         "contrib": contribs(r["contributions"]),
+                        "mcap_first": round(first_mcap.get(r["key"], 0.0)),
                     }
                 )
 
@@ -487,6 +533,7 @@ class Store:
                         "outcome": kind,
                         "contrib": contribs(d["contributions"] if d else "{}"),
                         "closed_at_ms": int(t.closed_at_ms),
+                        "mcap_first": round(first_mcap.get(t.key, 0.0)),
                         "mcap_entry": round(t.mcap_entry_usd),
                         "mcap_exit": round(t.mcap_exit_usd),
                         "exit_legs": legs_for_display(t),
@@ -618,6 +665,9 @@ class Store:
             (key, since_ms),
         ).fetchone()
         return row is not None
+
+    def closed_mint_keys(self) -> set[str]:
+        return {str(r["key"]) for r in self.conn.execute("SELECT DISTINCT key FROM trades")}
 
     def enter_count_since(self, since_ms: int) -> int:
         row = self.conn.execute(

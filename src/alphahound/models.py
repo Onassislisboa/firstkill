@@ -228,6 +228,9 @@ class Candidate:
     discovered_at_ms: int = field(default_factory=now_ms)
     ret_5m: float = 0.0
     last_scored_ms: int = 0
+    first_scored_ms: int = 0
+    quoted_at_ms: int = 0
+    first_quoted_ms: int = 0
     pack_role: str = ""
     pack_stem: str = ""
     main_key: str = ""
@@ -236,6 +239,7 @@ class Candidate:
     dex_paid: bool = False
     dex_photo: bool = False
     dex_aligned: bool = False
+    dex_boosted: bool = False
 
     @property
     def dex_profile(self) -> float:

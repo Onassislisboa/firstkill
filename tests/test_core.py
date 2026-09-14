@@ -40,7 +40,7 @@ from alphahound.models import (  # noqa: E402
     legs_for_display,
     now_ms,
 )
-from alphahound.engine import enrich_due, loop_bug  # noqa: E402
+from alphahound.engine import cannot_trade_idle, enrich_due, loop_bug, reread_keeps_lane, rescan_closed_mint, score_ttl_ms, wait_floors_cleared  # noqa: E402
 from alphahound.portfolio import PositionManager, banked_from_peak  # noqa: E402
 from alphahound.risk import RiskEngine, kelly_fraction, mcap_position_pct  # noqa: E402
 from alphahound.scoring import (  # noqa: E402
@@ -52,7 +52,7 @@ from alphahound.scoring import (  # noqa: E402
     payoff_from_config,
     watch_call,
 )
-from alphahound.settings import Config, apply_aggressive_learning, load_strategy, score_floors  # noqa: E402
+from alphahound.settings import Config, LEARN_EV_AFTER, apply_aggressive_learning, load_strategy, score_floors  # noqa: E402
 from alphahound.signals import Enrichment  # noqa: E402
 from alphahound.signals import chart, flow  # noqa: E402
 from alphahound.signals.distribution import Holder, analyze, gini  # noqa: E402
@@ -76,6 +76,38 @@ class TestEnrichDue(unittest.TestCase):
         self.assertFalse(enrich_due(1_000, 10_000, 15_000))
         self.assertTrue(enrich_due(1_000, 20_000, 15_000))
 
+    def test_skip_call_uses_longer_ttl(self):
+        self.assertEqual(score_ttl_ms("skip", 8_000, 60_000), 60_000)
+        self.assertEqual(score_ttl_ms("scan", 8_000, 60_000), 8_000)
+        self.assertEqual(score_ttl_ms("wait", 8_000, 60_000), 2_000)
+
+    def test_closed_mint_stays_off_scan_unless_inspect(self):
+        self.assertFalse(rescan_closed_mint("dexscreener_profiles"))
+        self.assertFalse(rescan_closed_mint("hood_stream"))
+        self.assertTrue(rescan_closed_mint("inspect"))
+
+
+class TestWalletAgeCache(unittest.TestCase):
+    def test_second_fill_does_not_rpc(self):
+        from alphahound.signals.solana import SolanaReader
+
+        reader = SolanaReader.__new__(SolanaReader)
+        reader.commitment = "confirmed"
+        reader._first_seen = {}
+        calls: list[str] = []
+
+        async def rpc(method, _params):
+            calls.append(method)
+            return [{"blockTime": 1_700_000_000}]
+
+        reader._rpc = rpc
+        first = Holder("Wallet111111111111111111111111111111111", 1.0)
+        asyncio.run(reader._fill_wallet_ages([first]))
+        again = Holder("Wallet111111111111111111111111111111111", 2.0)
+        asyncio.run(reader._fill_wallet_ages([again]))
+        self.assertEqual(calls, ["getSignaturesForAddress"])
+        self.assertEqual(again.first_seen_ms, 1_700_000_000_000)
+
 
 class TestLoopBug(unittest.TestCase):
     def test_name_error_is_fatal_timeout_is_not(self):
@@ -83,6 +115,28 @@ class TestLoopBug(unittest.TestCase):
         self.assertTrue(loop_bug(AttributeError("x")))
         self.assertFalse(loop_bug(RuntimeError("rpc 429")))
         self.assertFalse(loop_bug(TimeoutError()))
+
+    def test_halt_with_empty_book_must_stop(self):
+        self.assertTrue(cannot_trade_idle(True, 0))
+        self.assertFalse(cannot_trade_idle(True, 1))
+        self.assertFalse(cannot_trade_idle(False, 0))
+
+    def test_wait_card_stays_in_wait_while_reread(self):
+        self.assertTrue(reread_keeps_lane("wait"))
+        self.assertTrue(reread_keeps_lane("skip"))
+        self.assertFalse(reread_keeps_lane("scan"))
+        self.assertFalse(reread_keeps_lane("trade"))
+
+    def test_wait_floors_cleared_promotes_to_enrich(self):
+        read = {"call": "wait", "vetoes": ["mcap: 48000 below 50000 floor"]}
+        self.assertTrue(wait_floors_cleared(read, []))
+        self.assertFalse(wait_floors_cleared(read, ["mcap: 48000 below 50000 floor"]))
+        self.assertFalse(
+            wait_floors_cleared(
+                {"call": "wait", "vetoes": ["lp_unlocked: 100%"]},
+                [],
+            )
+        )
 
 
 def make_store() -> tuple[Store, tempfile.TemporaryDirectory]:
@@ -534,7 +588,7 @@ class TestGates(unittest.TestCase):
         enr.mint = _FakeMint(None, None)
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
         self.assertFalse(any(v.startswith("twitter:") for v in vetoes), vetoes)
-        enr.candidate.ret_5m = 0.28
+        enr.candidate.ret_5m = 0.40
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
         self.assertTrue(any("chase" in v for v in vetoes), vetoes)
         enr.twitter = {"official": "hotdogcoin", "official_age_min": 18}
@@ -611,9 +665,40 @@ class TestGates(unittest.TestCase):
         pump = Candidate(
             chain=Chain.SOLANA,
             address="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxpump",
-            dex_id="raydium",
+            dex_id="pumpswap",
         )
         self.assertTrue(launchpad_origin(pump, STRATEGY)[0])
+
+        pump_unquoted = Candidate(
+            chain=Chain.SOLANA,
+            address="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxpump",
+        )
+        self.assertTrue(launchpad_origin(pump_unquoted, STRATEGY)[0])
+
+        meteora = Candidate(
+            chain=Chain.SOLANA,
+            address="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxpump",
+            dex_id="meteora",
+        )
+        self.assertFalse(launchpad_origin(meteora, STRATEGY)[0])
+
+        stream_meteora = Candidate(
+            chain=Chain.SOLANA,
+            address="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxpump",
+            source="pumpfun_stream",
+            dex_id="meteora",
+        )
+        self.assertFalse(launchpad_origin(stream_meteora, STRATEGY)[0])
+        from alphahound.engine import keep_on_radar
+
+        self.assertFalse(keep_on_radar(meteora, {}, 50_000, STRATEGY))
+
+        raydium_pump = Candidate(
+            chain=Chain.SOLANA,
+            address="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxpump",
+            dex_id="raydium",
+        )
+        self.assertFalse(launchpad_origin(raydium_pump, STRATEGY)[0])
 
         bonk = Candidate(
             chain=Chain.SOLANA,
@@ -629,17 +714,23 @@ class TestGates(unittest.TestCase):
         )
         self.assertFalse(launchpad_origin(trump, STRATEGY)[0])
 
-        pons = Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0xabc", dex_id="uniswap")
+        uni = Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0xabc", dex_id="uniswap")
+        self.assertTrue(launchpad_origin(uni, STRATEGY)[0])
+        pons = Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0xabc", dex_id="pons")
         self.assertTrue(launchpad_origin(pons, STRATEGY)[0])
         stream = Candidate(
-            chain=Chain.ROBINHOOD_CHAIN, address="0xabc", source="hood_stream", dex_id=""
+            chain=Chain.ROBINHOOD_CHAIN, address="0xabc", source="hood_stream", dex_id="pons"
         )
         self.assertTrue(launchpad_origin(stream, STRATEGY)[0])
+        handmade_stream = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN, address="0xabc", source="hood_stream", dex_id="uniswap"
+        )
+        self.assertFalse(launchpad_origin(handmade_stream, STRATEGY)[0])
         baby = Candidate(
             chain=Chain.ROBINHOOD_CHAIN,
             address="0xabc",
             source="hood_stream",
-            dex_id="uniswap",
+            dex_id="pons",
             mcap_usd=12_000,
             volume_5m_usd=100,
             liquidity_usd=4_000,
@@ -696,14 +787,48 @@ class TestGates(unittest.TestCase):
 
         rug = self.enrichment(top10_pct=0.70, top1_pct=0.70, known_holder_pct=0.0)
         rug.mint = _FakeMint(None, None)
+        rug.crowd = {}
         vetoes, _ = evaluate_gates(rug, STRATEGY, self.store, live=True)
         self.assertTrue(any("unknown_whale" in v for v in vetoes))
 
     def test_unknown_top10_is_a_hard_veto(self):
         enr = self.enrichment(top10_pct=0.62, top1_pct=0.12, known_holder_pct=0.0)
         enr.mint = _FakeMint(None, None)
+        enr.crowd = {}
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
         self.assertTrue(any(v.startswith("top10:") for v in vetoes), vetoes)
+
+    def test_typical_pump_top10_55_is_not_a_veto(self):
+        enr = self.enrichment(top10_pct=0.55, top1_pct=0.12, known_holder_pct=0.0)
+        enr.mint = _FakeMint(None, None)
+        enr.crowd = {}
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertFalse(any(v.startswith("top10:") for v in vetoes), vetoes)
+        self.assertFalse(any(v.startswith("cabaled:") for v in vetoes), vetoes)
+
+    def test_size_whale_flow_does_not_excuse_unknown_top10(self):
+        # mikedyson: top10 61%, known 0, copy_signal from unlabeled size-whales.
+        enr = self.enrichment(
+            top10_pct=0.61,
+            top1_pct=0.07,
+            known_holder_pct=0.0,
+            copy_signal=1.0,
+            whale_net_flow=1.0,
+            whale_hold_pct=0.17,
+        )
+        enr.mint = _FakeMint(None, None)
+        enr.crowd = {"whale_n": 3, "kols": [], "fomo": []}
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertTrue(any(v.startswith("top10:") for v in vetoes), vetoes)
+
+    def test_fomo_kols_excuse_concentration(self):
+        enr = self.enrichment(top10_pct=0.65, top1_pct=0.40, known_holder_pct=0.0)
+        enr.mint = _FakeMint(None, None)
+        enr.crowd = {"whale_n": 0, "kols": [], "fomo": ["DRK", "pe__lu"]}
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertFalse(any(v.startswith("top10:") for v in vetoes), vetoes)
+        self.assertFalse(any("unknown_whale" in v for v in vetoes), vetoes)
+        self.assertFalse(any(v.startswith("cabaled:") for v in vetoes), vetoes)
 
     def test_unmeasured_twitter_is_not_a_live_veto(self):
         enr = self.enrichment()
@@ -751,21 +876,32 @@ class TestGates(unittest.TestCase):
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=False)
         self.assertTrue(any(v.startswith("bundle:") for v in vetoes), vetoes)
 
-    def test_hood_free_lp_nft_is_a_hard_veto(self):
+    def test_hood_pons_lp_nft_is_not_a_veto(self):
         enr = self.enrichment(lp_locked_pct=0.0)
         enr.mint = _FakeMint(None, None)
         enr.candidate.chain = Chain.ROBINHOOD_CHAIN
-        enr.candidate.dex_id = "uniswap"
+        enr.candidate.dex_id = "pons"
         enr.candidate.address = "0xabc"
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=False)
-        self.assertTrue(any(v.startswith("lp_unlocked:") for v in vetoes), vetoes)
-        locked = self.enrichment(lp_locked_pct=1.0)
-        locked.mint = _FakeMint(None, None)
-        locked.candidate.chain = Chain.ROBINHOOD_CHAIN
-        locked.candidate.dex_id = "uniswap"
-        locked.candidate.address = "0xabc"
-        vetoes, _ = evaluate_gates(locked, STRATEGY, self.store, live=False)
         self.assertFalse(any(v.startswith("lp_unlocked:") for v in vetoes), vetoes)
+
+    def test_bnb_free_lp_is_a_hard_veto(self):
+        enr = self.enrichment(lp_locked_pct=0.0)
+        enr.mint = _FakeMint(None, None)
+        enr.candidate.chain = Chain.BNB
+        enr.candidate.dex_id = "fourmeme"
+        enr.candidate.address = "0xdef"
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=False)
+        self.assertTrue(any(v.startswith("lp_unlocked:") for v in vetoes), vetoes)
+
+    def test_young_mint_fresh_wallets_are_not_a_veto(self):
+        enr = self.enrichment(fresh_wallet_pct=1.0)
+        enr.mint = _FakeMint(None, None)
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertFalse(any(v.startswith("fresh_wallets:") for v in vetoes), vetoes)
+        enr.candidate.created_at_ms = now_ms() - 4 * 60 * 60_000
+        old, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertTrue(any(v.startswith("fresh_wallets:") for v in old), old)
 
     def test_solana_does_not_use_the_lp_nft_gate(self):
         enr = self.enrichment(lp_locked_pct=0.0)
@@ -862,12 +998,15 @@ class TestRisk(unittest.TestCase):
         )
         score = Score(probability=0.90, expected_value=0.5)
         payoff = Payoff(avg_win=1.0, avg_loss=0.25, samples=50, from_history=True)
+        # Bottom of the band is the configured buy floor, not a literal: the
+        # smallest size is what a coin *at the floor* gets.
+        floor = float(STRATEGY.get("playbooks.solana.copy_min_mcap_usd", 50_000))
         lo = Candidate(
             chain=Chain.SOLANA,
             address="lo",
             liquidity_usd=10**7,
             price_usd=1.0,
-            mcap_usd=100_000.0,
+            mcap_usd=floor,
         )
         hi = Candidate(
             chain=Chain.SOLANA,
@@ -969,23 +1108,30 @@ class TestAggressiveLearning(unittest.TestCase):
         cfg = apply_aggressive_learning(STRATEGY, self.store)
         self.assertTrue(cfg.get("aggressive_learning._active"))
         self.assertEqual(int(cfg.get("risk.max_concurrent_positions")), 4)
-        self.assertAlmostEqual(float(cfg.get("risk.max_position_pct")), 0.08, places=4)
-        self.assertGreaterEqual(float(cfg.get("risk.min_position_pct")), 0.05 - 1e-9)
+        self.assertAlmostEqual(
+            float(cfg.get("risk.max_position_pct")),
+            float(STRATEGY.get("risk.max_position_pct")),
+            places=4,
+        )
         self.store.set_param("scoring.min_expected_value", 0.048, "test")
         p, ev = score_floors(cfg, self.store)
-        self.assertAlmostEqual(p, 0.38, places=4)
-        self.assertAlmostEqual(ev, 0.03, places=4)
+        self.assertAlmostEqual(p, 0.28, places=4)
+        self.assertAlmostEqual(ev, 0.02, places=4)
 
     def test_graduates_back_to_production(self):
-        for _ in range(40):
+        need = int(STRATEGY.get("aggressive_learning.graduate_at_closes", 40))
+        for _ in range(need):
             self.store.record_trade(_trade(pnl=-1.0))
         cfg = apply_aggressive_learning(STRATEGY, self.store)
         self.assertFalse(cfg.get("aggressive_learning._active"))
-        self.assertEqual(int(cfg.get("risk.max_concurrent_positions")), 2)
+        self.assertEqual(
+            int(cfg.get("risk.max_concurrent_positions")),
+            int(STRATEGY.get("risk.max_concurrent_positions")),
+        )
         self.assertEqual(self.store.get_kv("aggressive_graduated"), "1")
 
     def test_tiny_bankroll_keeps_two_slots(self):
-        thin = STRATEGY.overlay({"risk": {"equity_usd": 40.0}})
+        thin = STRATEGY.overlay({"risk": {"equity_usd": 40.0, "max_concurrent_positions": 2}})
         cfg = apply_aggressive_learning(thin, self.store)
         self.assertEqual(int(cfg.get("risk.max_concurrent_positions")), 2)
 
@@ -1213,6 +1359,23 @@ class TestSelfTuning(unittest.TestCase):
         self.assertTrue(any("not costing money" in note for note in report.skipped))
         self.assertEqual(self.store.all_params(), {})
 
+    def test_score_floors_ignore_ev_raise_until_enough_closes(self):
+        self.store.set_param("scoring.min_expected_value", 0.119, "test")
+        self.store.set_param("scoring.min_probability", 0.30, "test")
+        p, ev = score_floors(STRATEGY, self.store)
+        self.assertAlmostEqual(p, 0.30, places=4)
+        self.assertAlmostEqual(ev, float(STRATEGY["scoring.min_expected_value"]), places=4)
+
+    def test_no_edge_does_not_raise_ev_until_enough_closes(self):
+        for _ in range(12):
+            self.store.record_trade(
+                _trade(pnl=-8.0, exit_reason=ExitReason.TIME_STOP, error_class=ErrorClass.NO_EDGE)
+            )
+        self.assertLess(self.store.trade_count(), LEARN_EV_AFTER)
+        report = learning.run_postmortem(self.store, STRATEGY)
+        self.assertTrue(any("collect labels first" in note for note in report.skipped))
+        self.assertEqual(self.store.all_params(), {})
+
     def test_postmortem_acts_on_a_dominant_expensive_class(self):
         for _ in range(12):
             self.store.record_trade(
@@ -1230,6 +1393,50 @@ class TestSelfTuning(unittest.TestCase):
         result = learning.train(self.store, STRATEGY)
         self.assertFalse(result.trained)
         self.assertIn("keeping prior weights", result.note)
+
+    def test_training_uses_score_shadows_not_safety_vetoes(self):
+        from alphahound.models import Action, Decision
+
+        feat = Features(copy_signal=1.0, retail_share_delta_5m=0.8)
+        for i in range(40):
+            decision = Decision(
+                candidate=Candidate(chain=Chain.SOLANA, address=f"s{i}", price_usd=1.0),
+                features=feat,
+                score=Score(probability=0.39, expected_value=0.02),
+                action=Action.REJECT_SCORE,
+                reason=f"probability 0.39{i % 9} < 0.420",
+            )
+            self.store.resolve_shadow(self.store.record_decision(decision), 0.80)
+        for i in range(40):
+            skip = Decision(
+                candidate=Candidate(chain=Chain.SOLANA, address=f"t{i}", price_usd=1.0),
+                features=feat,
+                score=Score(probability=0.0, expected_value=0.0),
+                action=Action.REJECT_GATE,
+                reason="top10: 62% unknown",
+            )
+            self.store.resolve_shadow(self.store.record_decision(skip), 0.90)
+        self.assertTrue(learning.shadow_teaches_score("reject_score", "probability 0.4 < 0.42"))
+        self.assertTrue(learning.shadow_teaches_score("reject_gate", "chase: 5m ripped"))
+        self.assertFalse(learning.shadow_teaches_score("reject_gate", "top10: cabaled"))
+        result = learning.train(self.store, STRATEGY)
+        self.assertTrue(result.trained)
+        self.assertEqual(result.samples, 40)
+
+    def test_filter_cost_groups_probability_rejects(self):
+        from alphahound.models import Action, Decision
+
+        for i in range(12):
+            decision = Decision(
+                candidate=Candidate(chain=Chain.SOLANA, address=f"p{i}", price_usd=1.0),
+                features=Features(),
+                score=Score(probability=0.39, expected_value=0.02),
+                action=Action.REJECT_SCORE,
+                reason=f"probability 0.39{i} < 0.420",
+            )
+            self.store.resolve_shadow(self.store.record_decision(decision), 0.80)
+        costs = {c.gate: c for c in learning.filter_cost(self.store)}
+        self.assertEqual(costs["probability"].rejected, 12)
 
     def test_filter_cost_surfaces_expensive_gates(self):
         from alphahound.models import Action, Decision
@@ -1296,6 +1503,49 @@ class TestReviewHistory(unittest.TestCase):
         self.assertEqual(len(fumbles), 1)
         self.assertEqual(fumbles[0]["symbol"], "RUN")
         self.assertEqual(fumbles[0]["contrib"][0][0], "copy_signal")
+
+        live = Decision(
+            candidate=Candidate(chain=Chain.SOLANA, address="now", price_usd=1.0, symbol="NOW"),
+            features=Features(),
+            score=Score(probability=0.2, expected_value=0.0),
+            action=Action.REJECT_GATE,
+            reason="top10: 80%",
+        )
+        self.store.record_decision(live)
+        default = {r["symbol"]: r["outcome"] for r in self.store.review_history()["rows"]}
+        self.assertNotIn("NOW", default)
+        tracking = {r["symbol"]: r["outcome"] for r in self.store.review_history(outcome="tracking")["rows"]}
+        self.assertEqual(tracking["NOW"], "tracking")
+        self.assertNotIn("NOW", {r["symbol"] for r in self.store.review_history(outcome="rejeicao_correta")["rows"]})
+
+    def test_review_keeps_first_sight_mcap(self):
+        from alphahound.models import Score
+
+        first = Decision(
+            candidate=Candidate(
+                chain=Chain.SOLANA, address="keep", price_usd=1.0, symbol="KEEP", mcap_usd=55_000
+            ),
+            features=Features(),
+            score=Score(probability=0.2, expected_value=0.0),
+            action=Action.REJECT_GATE,
+            reason="mcap: 55000 below 100000 floor",
+        )
+        later = Decision(
+            candidate=Candidate(
+                chain=Chain.SOLANA, address="keep", price_usd=1.0, symbol="KEEP", mcap_usd=180_000
+            ),
+            features=Features(),
+            score=Score(probability=0.2, expected_value=0.0),
+            action=Action.REJECT_GATE,
+            reason="cluster: 44% linked supply",
+            ts_ms=first.ts_ms + 200_000,
+        )
+        self.store.resolve_shadow(self.store.record_decision(first), 0.01)
+        self.store.resolve_shadow(self.store.record_decision(later), 0.01)
+        rows = [r for r in self.store.review_history()["rows"] if r["symbol"] == "KEEP"]
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["mcap_first"], 55000)
+        self.assertEqual(rows[-1]["mcap_first"], 55000)
 
 
 class TestExitCopy(unittest.TestCase):
@@ -1367,8 +1617,119 @@ class TestProviderCache(unittest.TestCase):
         asyncio.run(scenario())
         self.assertEqual(len(http.calls), 2, "a cache hit must not hit the network")
         # The second call asks only for what it is missing.
-        self.assertIn("OTHER", http.calls[1])
-        self.assertNotIn("MINT", http.calls[1].rsplit("/", 1)[-1])
+        self.assertIn("other", http.calls[1].lower())
+        self.assertNotIn("mint", http.calls[1].rsplit("/", 1)[-1].lower())
+
+    def test_token_pairs_cache_ignores_address_case(self):
+        class FakeHttp:
+            def __init__(self):
+                self.calls = 0
+
+            def limit(self, *_args, **_kw):
+                pass
+
+            async def get(self, url, **_kw):
+                self.calls += 1
+                return {
+                    "pairs": [
+                        {
+                            "chainId": "solana",
+                            "baseToken": {"address": "0xAbC", "symbol": "X"},
+                            "priceUsd": "1.0",
+                            "liquidity": {"usd": 50_000},
+                            "marketCap": 80_000,
+                        }
+                    ]
+                }
+
+        http = FakeHttp()
+        dex = Dexscreener(http, cache_seconds=60.0)
+
+        async def scenario():
+            a = await dex.token_pairs(["0xabc"])
+            b = await dex.token_pairs(["0xAbC"])
+            self.assertEqual(len(a), 1)
+            self.assertEqual(len(b), 1)
+            self.assertEqual(a[0].mcap_usd, 80_000)
+
+        asyncio.run(scenario())
+        self.assertEqual(http.calls, 1)
+
+    def test_token_pairs_keeps_last_quote_on_fetch_fail(self):
+        class FakeHttp:
+            def __init__(self):
+                self.n = 0
+
+            def limit(self, *_args, **_kw):
+                pass
+
+            async def get(self, url, **_kw):
+                from alphahound.net import HttpError
+
+                self.n += 1
+                if self.n == 1:
+                    return {
+                        "pairs": [
+                            {
+                                "chainId": "solana",
+                                "baseToken": {"address": "mint", "symbol": "X"},
+                                "priceUsd": "1.0",
+                                "liquidity": {"usd": 50_000},
+                                "marketCap": 90_000,
+                            }
+                        ]
+                    }
+                raise HttpError(429, "slow down", url)
+
+        http = FakeHttp()
+        dex = Dexscreener(http, cache_seconds=0.0)
+
+        async def scenario():
+            first = await dex.token_pairs(["mint"])
+            second = await dex.token_pairs(["mint"])
+            self.assertEqual(first[0].mcap_usd, 90_000)
+            self.assertEqual(second[0].mcap_usd, 90_000)
+
+        asyncio.run(scenario())
+
+    def test_the_cheap_endpoint_cannot_spend_the_quote_budget(self):
+        from alphahound.net import Http
+
+        http = Http()
+        http.limit("api.dexscreener.com", rate_per_sec=5.0, burst=8)
+        http.limit("api.dexscreener.com/orders", rate_per_sec=0.8, burst=2)
+
+        pairs = http._bucket("https://api.dexscreener.com/latest/dex/tokens/mint")
+        orders = http._bucket("https://api.dexscreener.com/orders/v1/solana/mint")
+        self.assertIsNot(pairs, orders)
+        self.assertEqual(pairs.rate, 5.0)
+        self.assertEqual(orders.rate, 0.8)
+        # Same prefix, same bucket: the 60/min budget is shared across mints.
+        self.assertIs(orders, http._bucket("https://api.dexscreener.com/orders/v1/bsc/other"))
+
+    def test_every_configured_launchpad_gets_polled(self):
+        from alphahound.discovery import launchpad_queries
+        from alphahound.settings import Config
+
+        strategy = Config(
+            {
+                "launchpads": {
+                    "solana": {"dex_ids": ["pumpfun", "pumpswap"]},
+                    "bnb": {"dex_ids": ["fourmeme"]},
+                    "robinhood_chain": {"dex_ids": ["pons"]},
+                }
+            }
+        )
+
+        class FakeSettings:
+            enabled_chains = (Chain.SOLANA, Chain.BNB)
+
+        # BNB has no stream and no promoter feed, so if it is missing here it is
+        # not discovered at all.
+        self.assertEqual(
+            launchpad_queries(FakeSettings(), strategy),
+            ["pumpfun", "pumpswap", "fourmeme"],
+        )
 
     def test_stamp_uses_pair_birth_not_visor_arrival(self):
         from alphahound.providers import PairSnapshot, pair_created_ms
@@ -1645,6 +2006,23 @@ class TestCrowd(unittest.TestCase):
         self.assertEqual(sized.inside, 2)
         self.assertAlmostEqual(sized.hold_pct, 0.90)
 
+        vs_supply = crowd_read(holders, [], set(), size_pct=0.02, supply=10_000)
+        self.assertEqual(vs_supply.inside, 0)
+
+    def test_das_page_total_is_not_holder_count(self):
+        from alphahound.providers import das_owners
+
+        page = [
+            {"owner": "A", "amount": "10"},
+            {"owner": "A", "amount": "5"},
+            {"owner": "B", "amount": "0"},
+            {"owner": "C", "amount": "20"},
+        ]
+        owners = das_owners(page, decimals=0)
+        self.assertEqual(owners["A"], 15.0)
+        self.assertEqual(set(owners), {"A", "C"})
+        self.assertNotEqual(1, len(owners))  # DAS `total: 1` on limit=1 is a lie
+
     def test_fomo_supply_pct_is_a_score_prior_not_a_gate(self):
         from alphahound.models import Features
         from alphahound.scoring import PRIOR_WEIGHTS, normalize
@@ -1749,7 +2127,8 @@ class TestPlaybook(unittest.TestCase):
         self.assertEqual(copy_signal(age_minutes=120, mcap_usd=150_000, **buying), 0.0)
         self.assertEqual(copy_signal(age_minutes=8, mcap_usd=5_000_000, **buying), 0.0)
         self.assertEqual(copy_signal(age_minutes=8, mcap_usd=51_000_000, **buying), 0.0)
-        self.assertEqual(copy_signal(age_minutes=8, mcap_usd=80_000, **buying), 0.0)
+        floor = float(STRATEGY.get("playbooks.solana.copy_min_mcap_usd", 50_000))
+        self.assertEqual(copy_signal(age_minutes=8, mcap_usd=floor - 1, **buying), 0.0)
         idle = dict(buying, smart_buys=0.0)
         self.assertEqual(copy_signal(age_minutes=8, mcap_usd=150_000, **idle), 0.0)
 
@@ -1861,10 +2240,7 @@ class TestPlaybook(unittest.TestCase):
             },
             weth=weth,
         )
-        self.assertEqual(len(found), 1)
-        self.assertEqual(found[0].address.lower(), meme)
-        self.assertEqual(found[0].source, "hood_stream")
-        self.assertEqual(found[0].dex_id, "uniswap")
+        self.assertEqual(len(found), 0)
 
         pons = candidates_from_hood_log(
             {
@@ -1876,6 +2252,19 @@ class TestPlaybook(unittest.TestCase):
         )
         self.assertEqual(pons[0].address.lower(), meme)
         self.assertEqual(pons[0].dex_id, "pons")
+
+        from alphahound.discovery import PONS_V2_FACTORY, TOPIC_TOKEN_LAUNCHED_V2
+
+        v2 = candidates_from_hood_log(
+            {
+                "address": PONS_V2_FACTORY,
+                "topics": [TOPIC_TOKEN_LAUNCHED_V2, pad(meme), pad("0x" + "2" * 40), pad("0x" + "3" * 40)],
+                "data": "0x",
+            },
+            weth=weth,
+        )
+        self.assertEqual(v2[0].address.lower(), meme)
+        self.assertEqual(v2[0].dex_id, "pons")
 
     def test_hood_stream_is_observe_not_a_buy_bypass(self):
         from alphahound.engine import early_observe_floors, observe_early
@@ -1916,6 +2305,29 @@ class TestPlaybook(unittest.TestCase):
         self.assertFalse(hide_from_visor(["chase: 5m ripped, wait dip"]))
         self.assertFalse(hide_from_visor(["mcap: 90000 below 100000 floor"]))
         self.assertTrue(hide_from_visor(["lp_unlocked: 100% da liquidez livre"]))
+        self.assertTrue(hide_from_visor(["volume: 819 < 5000 (5m)", "cluster: 37% linked supply"]))
+        self.assertFalse(
+            hide_from_visor(["chase: 5m ripped, wait dip", "volume: 2000 < 5000 (5m)"])
+        )
+        from alphahound.engine import boosted_off_radar, bundle_off_wait, keep_on_radar
+
+        self.assertTrue(bundle_off_wait(["volume: 819 < 5000 (5m)", "bundle: launch bundle 45%"]))
+        self.assertFalse(bundle_off_wait(["volume: 819 < 5000 (5m)"]))
+        boosted = Candidate(
+            chain=Chain.SOLANA, address="boost", source="pumpfun_stream", mcap_usd=90_000, dex_paid=True, dex_boosted=True
+        )
+        self.assertTrue(boosted_off_radar(boosted))
+        self.assertFalse(keep_on_radar(boosted, {}, 50_000))
+        inspect = Candidate(
+            chain=Chain.SOLANA, address="boost", source="inspect", mcap_usd=90_000, dex_boosted=True
+        )
+        self.assertFalse(boosted_off_radar(inspect))
+        bundled = Candidate(
+            chain=Chain.SOLANA, address="bun", source="pumpfun_stream", mcap_usd=90_000, dex_paid=True
+        )
+        self.assertFalse(
+            keep_on_radar(bundled, {bundled.key: {"why": "bundle: launch bundle 41%"}}, 50_000)
+        )
         Engine._assert_loop_helpers(Engine)
 
     def test_public_hood_rpc_has_no_jsonrpc_websocket(self):
@@ -1929,16 +2341,16 @@ class TestPlaybook(unittest.TestCase):
         )
 
     def test_hood_factory_log_uses_block_timestamp_when_present(self):
-        from alphahound.discovery import TOPIC_POOL_CREATED, UNI_V3_FACTORY, candidates_from_hood_log
+        from alphahound.discovery import PONS_FACTORY, TOPIC_TOKEN_LAUNCHED, candidates_from_hood_log
 
         weth = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD97"
         meme = "0xa3602804e096cb73bd8344afc1ff3f3390b899c5"
         pad = lambda a: "0x" + a[2:].lower().rjust(64, "0")
         found = candidates_from_hood_log(
             {
-                "address": UNI_V3_FACTORY,
-                "topics": [TOPIC_POOL_CREATED, pad(weth), pad(meme), "0x" + "0" * 62 + "0bb8"],
-                "data": "0x" + "0" * 64 + "0" * 24 + "b" * 40,
+                "address": PONS_FACTORY,
+                "topics": [TOPIC_TOKEN_LAUNCHED, pad(meme)],
+                "data": "0x",
                 "blockTimestamp": hex(1_700_000_000),
             },
             weth=weth,
@@ -1946,13 +2358,161 @@ class TestPlaybook(unittest.TestCase):
         self.assertEqual(found[0].created_at_ms, 1_700_000_000_000)
 
     def test_erc20_string_decode(self):
-        from alphahound.execution.evm import decode_erc20_string
+        from alphahound.execution.evm import decode_erc20_string, pons_registered
 
         # dynamic ABI string "PEPE"
         raw = "0x" + "0" * 62 + "20" + "0" * 62 + "04" + "50455045" + "0" * 56
         self.assertEqual(decode_erc20_string(raw), "PEPE")
         self.assertEqual(decode_erc20_string("0x" + "57455448".ljust(64, "0")), "WETH")
         self.assertEqual(decode_erc20_string("0x"), "")
+        # Live Pons V2: word 0 is the mint, 15 static words, last word is `exists`.
+        mint = "0x83f46adf291ca7d4c7ffd42f77f8ea59e96d4bd8"
+        words = ["0" * 64] * 15
+        words[0] = mint.removeprefix("0x").rjust(64, "0")
+        words[14] = "0" * 63 + "1"
+        self.assertTrue(pons_registered("0x" + "".join(words), mint))
+        # Unknown mint returns an all-zero struct, whatever the field count.
+        self.assertFalse(pons_registered("0x" + "0" * 64 * 15, mint))
+        self.assertFalse(pons_registered("0x" + "0" * 64 * 13, mint))
+        # A struct for a different mint is not a match.
+        other = ["0" * 64] * 15
+        other[0] = ("b" * 40).rjust(64, "0")
+        self.assertFalse(pons_registered("0x" + "".join(other), mint))
+        self.assertFalse(pons_registered("0x", mint))
+
+    def test_watch_row_survives_restart(self):
+        from alphahound.preview import watch_row_to_candidate
+
+        row = {
+            "chain": "solana",
+            "address": "CTALnV64vd1dkMxvtsuBgoYVhzB8tZ1XyRQFNS3ppump",
+            "symbol": "TRONK",
+            "age_min": 84.5,
+            "mcap": 1280957,
+            "vol5m": 8201,
+            "dex": "pumpswap",
+            "source": "dexscreener_boosts",
+            "dex_paid": True,
+        }
+        c = watch_row_to_candidate(row)
+        self.assertIsNotNone(c)
+        self.assertEqual(c.symbol, "TRONK")
+        self.assertTrue(c.dex_paid)
+        self.assertTrue(c.dex_boosted)
+        self.assertGreater(c.created_at_ms, 0)
+
+        stamped = watch_row_to_candidate(
+            {**row, "created_at_ms": 1_700_000_000_000, "discovered_at_ms": 1_700_000_100_000}
+        )
+        self.assertEqual(stamped.created_at_ms, 1_700_000_000_000)
+        self.assertEqual(stamped.discovered_at_ms, 1_700_000_100_000)
+
+    def test_watch_latency_is_engine_clock_not_pair_age(self):
+        from alphahound.engine import stamp_quote, stamp_scored, watch_latency
+        from alphahound.preview import watch_row_to_candidate
+
+        c = Candidate(
+            chain=Chain.SOLANA,
+            address="mint",
+            created_at_ms=1_000_000,
+            discovered_at_ms=1_008_000,
+        )
+        stamp_quote(c, now=1_011_000)
+        stamp_scored(c, now=1_020_000)
+        lat = watch_latency(c, now=1_021_000)
+        self.assertEqual(lat["found_lag_s"], 8.0)
+        self.assertEqual(lat["quote_lag_s"], 3.0)
+        self.assertEqual(lat["scan_lag_s"], 12.0)
+        self.assertEqual(lat["quote_age_s"], 10.0)
+        self.assertEqual(lat["read_age_s"], 1.0)
+        again = watch_row_to_candidate(
+            {
+                "chain": "solana",
+                "address": "mint",
+                "discovered_at_ms": 1_008_000,
+                "first_quoted_ms": 1_011_000,
+                "first_scored_ms": 1_020_000,
+            }
+        )
+        self.assertEqual(again.first_quoted_ms, 1_011_000)
+        self.assertEqual(again.first_scored_ms, 1_020_000)
+
+    def test_restart_keeps_the_radar_not_just_the_cards(self):
+        from alphahound.engine import keep_on_radar, visor_card
+
+        floor = 50_000
+        # Unquoted Pons launch: no card, but the radar must carry it or the
+        # observe-early queue is wiped on every restart.
+        hood = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            mcap_usd=0.0,
+        )
+        self.assertFalse(visor_card(hood, {}, floor))
+        self.assertTrue(keep_on_radar(hood, {}, floor))
+
+        # Priced under the floor, unpaid, skipped or vamp: gone either way.
+        dead = Candidate(chain=Chain.SOLANA, address="m1", source="pump_stream", mcap_usd=9_000)
+        self.assertFalse(keep_on_radar(dead, {}, floor))
+        unpaid = Candidate(
+            chain=Chain.SOLANA, address="m2", source="dexscreener_profiles", mcap_usd=90_000
+        )
+        self.assertFalse(keep_on_radar(unpaid, {}, floor))
+        unpaid.dex_paid = True
+        self.assertTrue(keep_on_radar(unpaid, {}, floor))
+        self.assertTrue(keep_on_radar(unpaid, {unpaid.key: {"call": "skip"}}, floor))
+        unpaid.pack_role = "vamp"
+        self.assertFalse(keep_on_radar(unpaid, {}, floor))
+
+    def test_visor_stale_is_time_on_radar_not_pair_birth(self):
+        from alphahound.engine import visor_seen_stale
+
+        now = 1_800_000_000_000
+        c = Candidate(
+            chain=Chain.SOLANA,
+            address="CTALnV64vd1dkMxvtsuBgoYVhzB8tZ1XyRQFNS3ppump",
+            source="dexscreener_profiles",
+            created_at_ms=now - 300 * 60_000,
+            discovered_at_ms=now - 2 * 60_000,
+            mcap_usd=1_200_000,
+            dex_paid=True,
+        )
+        self.assertFalse(visor_seen_stale(c, 240, now))
+        c.discovered_at_ms = now - 241 * 60_000
+        self.assertTrue(visor_seen_stale(c, 240, now))
+
+    def test_wait_slot_expires_so_new_mints_rotate_in(self):
+        from alphahound.engine import wait_slot_expired
+
+        now = 1_800_000_000_000
+        c = Candidate(
+            chain=Chain.SOLANA,
+            address="CTALnV64vd1dkMxvtsuBgoYVhzB8tZ1XyRQFNS3ppump",
+            source="dexscreener_boosts",
+            discovered_at_ms=now - 21 * 60_000,
+            first_scored_ms=now - 21 * 60_000,
+            mcap_usd=80_000,
+            dex_paid=True,
+        )
+        self.assertTrue(wait_slot_expired(c, {"call": "wait"}, 20, now))
+        self.assertTrue(wait_slot_expired(c, {"call": "skip"}, 20, now))
+        self.assertFalse(wait_slot_expired(c, {"call": "scan"}, 20, now))
+        self.assertFalse(wait_slot_expired(c, {"call": "wait"}, 20, now - 10 * 60_000))
+        c.source = "inspect"
+        self.assertFalse(wait_slot_expired(c, {"call": "wait"}, 20, now))
+
+    def test_heavy_blocks_resend_only_when_they_change(self):
+        from alphahound.preview import HEAVY_KEYS, heavy_sig
+
+        payload = {"watch": [{"mcap": 1}], "sold": [{"pnl": 1}], "fomo": [], "kols": []}
+        sig = heavy_sig(payload)
+        # Same heavy blocks, moving visor: the client's hash still matches.
+        self.assertEqual(sig, heavy_sig({**payload, "watch": [{"mcap": 2}]}))
+        # A closed trade lands: hash moves, so the block is sent again.
+        self.assertNotEqual(sig, heavy_sig({**payload, "sold": [{"pnl": 1}, {"pnl": 2}]}))
+        self.assertIn("sold", HEAVY_KEYS)
+        self.assertNotIn("watch", HEAVY_KEYS)
 
     def test_pnl_curve_sums_per_chain(self):
         from alphahound.preview import pnl_curves
@@ -2066,7 +2626,7 @@ class TestVerdict(unittest.TestCase):
         self.assertEqual(read.label, "cabaled")
         self.assertEqual(read.risk, 0)
         self.assertIsNotNone(bot_veto(read, "solana"))
-        self.assertIsNotNone(bot_veto(read, "robinhood_chain"))
+        self.assertIsNone(bot_veto(read, "robinhood_chain"))
 
     def test_organic_is_not_a_buy(self):
         from alphahound.verdict import bot_veto, classify
@@ -2211,6 +2771,7 @@ class TestTwitterSocials(unittest.TestCase):
         snap = parse_pair(pair)
         c = snap.to_candidate("dexscreener_boosts")
         self.assertTrue(c.dex_paid)
+        self.assertTrue(c.dex_boosted)
         self.assertGreaterEqual(c.dex_profile, 0.99)
         rug = pair_dex_flags({"info": {}, "boosts": {"active": 0}, "baseToken": {"symbol": "X"}})
         self.assertEqual(rug, (False, False, False))
@@ -2222,6 +2783,8 @@ class TestTwitterSocials(unittest.TestCase):
         self.assertTrue(orders_mark_paid({"orders": [{"status": "approved"}], "boosts": []}))
         self.assertFalse(orders_mark_paid({"orders": [], "boosts": []}))
         self.assertFalse(orders_mark_paid([{"type": "tokenBoost", "status": "pending"}]))
+        self.assertFalse(orders_mark_paid([{"type": "tokenBoost", "status": "approved"}]))
+        self.assertFalse(orders_mark_paid({"orders": [], "boosts": [{"status": "approved"}]}))
         self.assertFalse(orders_mark_paid(None))
 
 
@@ -2300,6 +2863,19 @@ class TestRubric(unittest.TestCase):
         )
         r = grade(enr, self.store)
         self.assertGreaterEqual(r.total, 7.0, r.as_visor())
+
+    def test_unmeasured_grade_stays_neutral_five_inside_the_model(self):
+        from alphahound.models import Score
+        from alphahound.rubric import grade
+        from alphahound.signals import Enricher
+
+        cheap = Enricher.free_enrichment(
+            Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0xabc")
+        )
+        r = grade(cheap, self.store)
+        self.assertGreater(r.total, 3.5)
+        self.assertLess(r.total, 6.5)
+        self.assertEqual(Score(probability=0.0, expected_value=0.0).rubric, {})
 
     def test_scorer_vetoes_below_rubric_floor(self):
         from alphahound.scoring import Scorer
@@ -2469,7 +3045,7 @@ class TestDeadMcap(unittest.TestCase):
         self.assertTrue(drop_for_scan_mcap(ds, 50_000))
 
     def test_unpaid_dex_stays_off_the_visor(self):
-        from alphahound.engine import on_scan_visor, unpaid_for_scan
+        from alphahound.engine import keep_unpaid_watch, on_scan_visor, unpaid_for_scan
 
         raw = Candidate(
             chain=Chain.ROBINHOOD_CHAIN,
@@ -2477,11 +3053,17 @@ class TestDeadMcap(unittest.TestCase):
             source="hood_stream",
             mcap_usd=80_000,
         )
-        self.assertTrue(unpaid_for_scan(raw))
-        self.assertFalse(on_scan_visor(raw, 50_000))
-        raw.dex_paid = True
         self.assertFalse(unpaid_for_scan(raw))
         self.assertTrue(on_scan_visor(raw, 50_000))
+        self.assertTrue(keep_unpaid_watch(raw))
+        pump = Candidate(
+            chain=Chain.SOLANA,
+            address="mintpump",
+            source="pumpfun_stream",
+            mcap_usd=80_000,
+        )
+        self.assertFalse(unpaid_for_scan(pump))
+        self.assertTrue(on_scan_visor(pump, 50_000))
         inspect = Candidate(
             chain=Chain.ROBINHOOD_CHAIN,
             address="0xdef",
@@ -2490,6 +3072,118 @@ class TestDeadMcap(unittest.TestCase):
         )
         self.assertFalse(unpaid_for_scan(inspect))
         self.assertTrue(on_scan_visor(inspect, 50_000))
+        ds = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xaaa",
+            source="dexscreener_profiles",
+            mcap_usd=80_000,
+        )
+        self.assertTrue(unpaid_for_scan(ds))
+        self.assertFalse(on_scan_visor(ds, 50_000))
+        self.assertFalse(keep_unpaid_watch(ds))
+        ds.dex_paid = True
+        self.assertFalse(unpaid_for_scan(ds))
+        self.assertTrue(on_scan_visor(ds, 50_000))
+
+    def test_stale_quote_keeps_the_card_but_a_small_mint_never_gets_one(self):
+        from alphahound.engine import floor_dip_ok, visor_card
+
+        now = 1_800_000_000_000
+        # Was above the floor 5s ago: one zero/stale quote keeps the card.
+        self.assertTrue(floor_dip_ok(now - 5_000, 45, now))
+        self.assertFalse(floor_dip_ok(now - 60_000, 45, now))
+        # Never above the floor (HLK at 26k) gets no grace.
+        self.assertFalse(floor_dip_ok(0, 45, now))
+
+        sol = Candidate(
+            chain=Chain.SOLANA,
+            address="CTALnV64vd1dkMxvtsuBgoYVhzB8tZ1XyRQFNS3ppump",
+            source="dexscreener_profiles",
+            mcap_usd=0.0,
+            dex_paid=True,
+        )
+        self.assertTrue(visor_card(sol, {}, 50_000, dip_ok=True))
+        self.assertFalse(visor_card(sol, {}, 50_000))
+        # Priced below the floor: no grace is granted, so no card either.
+        sol.mcap_usd = 40_000
+        self.assertFalse(visor_card(sol, {}, 50_000))
+
+        # A Pons launch waits on the radar until it is priced at or above the floor.
+        hood = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            mcap_usd=0.0,
+        )
+        self.assertFalse(visor_card(hood, {}, 50_000))
+        hood.mcap_usd = 26_000
+        self.assertFalse(visor_card(hood, {}, 50_000))
+        hood.mcap_usd = 74_000
+        self.assertTrue(visor_card(hood, {}, 50_000))
+        # Skip after enrich still occupies the card; hiding it emptied the visor.
+        self.assertTrue(visor_card(hood, {hood.key: {"call": "skip"}}, 50_000))
+
+    def test_overflow_keeps_visor_over_unpaid_hood(self):
+        from alphahound.engine import watch_keep_key
+
+        sol = Candidate(
+            chain=Chain.SOLANA,
+            address="CTALnV64vd1dkMxvtsuBgoYVhzB8tZ1XyRQFNS3ppump",
+            source="dexscreener_profiles",
+            mcap_usd=1_200_000,
+            dex_paid=True,
+        )
+        hood = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            mcap_usd=0.0,
+            dex_paid=False,
+        )
+        reads: dict = {}
+        self.assertLess(watch_keep_key(sol, reads, 50_000), watch_keep_key(hood, reads, 50_000))
+
+    def test_skip_call_still_occupies_a_visor_card(self):
+        from alphahound.engine import visor_card
+
+        c = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            mcap_usd=200_000,
+            dex_paid=True,
+        )
+        reads = {c.key: {"call": "skip", "why": "cluster: 40% linked supply"}}
+        self.assertTrue(visor_card(c, reads, 50_000))
+
+    def test_absorb_watch_keeps_quoted_mcap_on_blank_reemit(self):
+        from alphahound.engine import absorb_watch
+
+        live = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            mcap_usd=1485629,
+            volume_5m_usd=12000,
+            last_scored_ms=9,
+            dex_paid=True,
+        )
+        blank = Candidate(
+            chain=Chain.ROBINHOOD_CHAIN,
+            address="0xabc",
+            source="hood_stream",
+            mcap_usd=0,
+        )
+        absorb_watch(live, blank)
+        self.assertEqual(live.mcap_usd, 1485629)
+        self.assertEqual(live.volume_5m_usd, 12000)
+        self.assertEqual(live.last_scored_ms, 9)
+        self.assertTrue(live.dex_paid)
+        live.dex_id = "pons"
+        blank.dex_id = "uniswap"
+        blank.mcap_usd = 1
+        absorb_watch(live, blank)
+        self.assertEqual(live.dex_id, "pons")
 
     def test_live_floors_replace_stale_mcap_why(self):
         from alphahound.engine import best_setup_p, stamp_live_floors

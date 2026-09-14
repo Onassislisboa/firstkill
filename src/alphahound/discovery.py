@@ -7,7 +7,7 @@ convenient:
 
     pump.fun websocket   sub-second, push
     dexscreener profiles ~seconds, poll
-    dexscreener boosts   ~seconds, poll, and a signal about the promoter
+    launchpad search     ~seconds, poll, one configured venue per round
     watchlist            whenever you say so
 
 Everything is deduplicated and thrown away after `max_candidate_age_minutes`,
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 from dataclasses import dataclass, field
 
@@ -36,6 +37,31 @@ from .providers import DEX_CHAIN_SLUG, Dexscreener
 from .settings import Config, Settings
 
 log = get("discovery")
+
+
+# Dexscreener meters the profile/boost feeds at 60 req/min, and they refresh at
+# human speed anyway. 5s is ~12/min per feed, well clear of the limit.
+PROMO_POLL_MS = 5_000
+
+
+def launchpad_queries(settings: Settings, strategy: Config) -> list[str]:
+    """One search term per configured launchpad, for the enabled chains.
+
+    The profiles feed is chain-agnostic and promoter-driven, so a
+    launchpad nobody is filling socials on is invisible to it: four.meme never
+    showed up at all, which read as "BNB is quiet" rather than "BNB is unpolled".
+    Searching each `dex_ids` entry covers every launchpad the config selects
+    without a per-venue scraper; `_accept` still enforces the origin rule, so a
+    fuzzy search hit on the wrong venue is dropped.
+    """
+    out: list[str] = []
+    for chain in settings.enabled_chains:
+        cfg = strategy.section(f"launchpads.{chain.value}")
+        for dex_id in (cfg or {}).get("dex_ids") or []:
+            term = str(dex_id).strip().lower()
+            if term and term not in out:
+                out.append(term)
+    return out
 
 
 @dataclass(slots=True)
@@ -67,6 +93,9 @@ class Discovery:
         self._queue: asyncio.Queue[Candidate] = asyncio.Queue(maxsize=2000)
         self._tasks: list[asyncio.Task] = []
         self._watchlist: set[str] = set()
+        # cycle([]) is empty, so next(..., None) below is the no-launchpad case.
+        self._launchpads = itertools.cycle(launchpad_queries(settings, strategy))
+        self._promo_at = 0
 
     # -- lifecycle ---------------------------------------------------------
     async def start(self) -> None:
@@ -97,21 +126,16 @@ class Discovery:
         addresses: list[str] = []
         sources: dict[str, str] = {}
 
-        fetched = await asyncio.gather(
-            self.dex.new_profiles(),
-            self.dex.boosted(),
-            return_exceptions=True,
-        )
-        for source, found in (
-            ("dexscreener_profiles", fetched[0]),
-            ("dexscreener_boosts", fetched[1]),
-        ):
-            if isinstance(found, Exception):
-                log.warning("source failed", extra={"source": source, "error": str(found)})
-                continue
+        if now_ms() - self._promo_at >= PROMO_POLL_MS:
+            self._promo_at = now_ms()
+            try:
+                found = await self.dex.new_profiles()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("source failed", extra={"source": "dexscreener_profiles", "error": str(exc)})
+                found = []
             for address in found:
                 if address not in sources:
-                    sources[address] = source
+                    sources[address] = "dexscreener_profiles"
                     addresses.append(address)
 
         for address in self._watchlist:
@@ -120,12 +144,28 @@ class Discovery:
                 addresses.append(address)
 
         out: list[Candidate] = []
+
+        # One launchpad per round, round-robin: every configured venue gets
+        # polled within a few seconds, and the search endpoint shares the 300/min
+        # pairs budget rather than the 60/min profile one.
+        query = next(self._launchpads, None)
+        if query:
+            try:
+                for snap in await self.dex.search(query):
+                    if snap.chain not in self.settings.enabled_chains:
+                        continue
+                    candidate = snap.to_candidate("launchpad_search")
+                    if self._accept(candidate):
+                        out.append(candidate)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("launchpad search failed", extra={"query": query, "error": str(exc)})
+
         # Repeat profile CAs don't need token_pairs again this minute; that
         # call was starving the visor quote loop on the same Dexscreener bucket.
         addresses = [
             a
             for a in addresses
-            if sources.get(a) in {"dexscreener_boosts", "inspect"} or self._pair_unknown(a)
+            if sources.get(a) == "inspect" or self._pair_unknown(a)
         ]
         # token_pairs takes 30 addresses per call, so this is len/30 requests
         # rather than len.
@@ -261,11 +301,11 @@ class Discovery:
             pass
 
     async def _hood_stream(self) -> None:
-        """New Hood pools as they land: Uniswap V3 Factory + Pons TokenLaunched.
+        """Pons TokenLaunched only. Handmade Uniswap V3 pools are ignored.
 
         eth_subscribe when the RPC actually speaks JSON-RPC over WebSocket
         (Alchemy/QuickNode). The public Hood RPC is HTTP-only (wss → 400), so
-        we poll eth_getLogs instead. Dexscreener profiles/boosts stay parallel.
+        we poll eth_getLogs instead. Dexscreener profiles stay parallel.
         """
         http_rpc = (self.settings.rpc_urls.get(Chain.ROBINHOOD_CHAIN) or "").strip()
         weth = (self.settings.rh_chain_weth or "").lower()
@@ -283,8 +323,8 @@ class Discovery:
             return
 
         filt = {
-            "address": [UNI_V3_FACTORY, PONS_FACTORY],
-            "topics": [[TOPIC_POOL_CREATED, TOPIC_TOKEN_LAUNCHED]],
+            "address": [PONS_FACTORY, PONS_V2_FACTORY],
+            "topics": [[TOPIC_TOKEN_LAUNCHED, TOPIC_TOKEN_LAUNCHED_V2]],
         }
         backoff = 1.0
         while True:
@@ -335,19 +375,22 @@ class Discovery:
         log.info("hood stream polling factory logs")
         try:
             while True:
+                caught_up = True
                 try:
                     head = int(await rpc.call("eth_blockNumber", []), 16)
                     if from_block is None:
-                        from_block = max(0, head - 2)
+                        from_block = max(0, head - HOOD_LOG_CHUNK)
                     if head < from_block:
                         from_block = head
                     if head >= from_block:
+                        to_block = min(head, from_block + HOOD_LOG_CHUNK - 1)
+                        caught_up = to_block >= head
                         logs = await rpc.get_logs(
                             {
-                                "address": [UNI_V3_FACTORY, PONS_FACTORY],
-                                "topics": [[TOPIC_POOL_CREATED, TOPIC_TOKEN_LAUNCHED]],
+                                "address": [PONS_FACTORY, PONS_V2_FACTORY],
+                                "topics": [[TOPIC_TOKEN_LAUNCHED, TOPIC_TOKEN_LAUNCHED_V2]],
                                 "fromBlock": hex(from_block),
-                                "toBlock": hex(head),
+                                "toBlock": hex(to_block),
                             }
                         )
                         stamps: dict[int, int] = {}
@@ -376,7 +419,7 @@ class Discovery:
                         if len(seen) > 4000:
                             for old in list(seen)[:2000]:
                                 del seen[old]
-                        from_block = head + 1
+                        from_block = to_block + 1
                     backoff = 1.0
                 except asyncio.CancelledError:
                     raise
@@ -385,7 +428,8 @@ class Discovery:
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
                     continue
-                await asyncio.sleep(1.0)
+                if caught_up:
+                    await asyncio.sleep(1.0)
         finally:
             if owned:
                 await http.aclose()
@@ -394,8 +438,11 @@ class Discovery:
 # Uniswap V3 factory + Pons launch factory, chain 4663.
 UNI_V3_FACTORY = "0x1f7d7550b1b028f7571e69a784071f0205fd2efa"
 PONS_FACTORY = "0xa5aab3f0c6eeadf30ef1d3eb997108e976351feb"
+PONS_V2_FACTORY = "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e"
 TOPIC_POOL_CREATED = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118"
 TOPIC_TOKEN_LAUNCHED = "0xdb51ea9ad51ab453a65a4cb7e60c3cb378c9501bb002609f8f97778fb6c4235a"
+TOPIC_TOKEN_LAUNCHED_V2 = "0x8d4aad4953d0ca700d468f3753aa14432d1b35b43ec6409f051fb6aa43a89607"
+HOOD_LOG_CHUNK = 400
 
 
 def _hood_jsonrpc_ws(http_rpc: str) -> str | None:
@@ -457,7 +504,7 @@ def _is_quote(address: str, weth: str) -> bool:
 
 
 def candidates_from_hood_log(log: dict, *, weth: str = "") -> list[Candidate]:
-    """Parse Uniswap V3 PoolCreated or Pons TokenLaunched into watch cards."""
+    """Parse Pons TokenLaunched. PoolCreated (own LP) is dropped."""
     topics = [str(t).lower() for t in (log.get("topics") or [])]
     if not topics:
         return []
@@ -479,17 +526,12 @@ def candidates_from_hood_log(log: dict, *, weth: str = "") -> list[Candidate]:
             )
         )
 
-    if topics[0] == TOPIC_POOL_CREATED and len(topics) >= 3:
-        token0, token1 = _topic_addr(topics[1]), _topic_addr(topics[2])
-        data = str(log.get("data") or "").replace("0x", "")
-        pool = ("0x" + data[-40:]) if len(data) >= 40 else str(log.get("address") or "")
-        emit(token0, "uniswap", pool)
-        emit(token1, "uniswap", pool)
-        return out
-    if topics[0] == TOPIC_TOKEN_LAUNCHED and len(topics) >= 2:
-        dex = "pons" if emitter == PONS_FACTORY else "uniswap"
-        emit(_topic_addr(topics[1]), dex)
-        return out
+    if (
+        topics[0] in {TOPIC_TOKEN_LAUNCHED, TOPIC_TOKEN_LAUNCHED_V2}
+        and emitter in {PONS_FACTORY, PONS_V2_FACTORY}
+        and len(topics) >= 2
+    ):
+        emit(_topic_addr(topics[1]), "pons")
     return out
 
 

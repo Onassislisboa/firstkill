@@ -16,7 +16,9 @@ from .models import Features
 CLUSTER_CABAL = 0.05
 CLUSTER_BUNDLED = 0.20
 # Ownership cards.
-TOP10_CAUTION, TOP10_FLAG = 0.30, 0.50
+# Keep in lockstep with gates.max_top10_pct. 0.60 lets a typical pump.fun
+# 55% through; mikedyson 61% still flags.
+TOP10_CAUTION, TOP10_FLAG = 0.30, 0.60
 FRESH_CAUTION, FRESH_FLAG = 0.20, 0.30
 # Fresh wallets are expected on a 10-minute pump.fun mint.
 FRESH_MIN_AGE_MIN = 180.0
@@ -203,6 +205,8 @@ def bot_veto(read: DistRead, chain: str) -> str | None:
     if read.label == "bundled":
         return "bundled: " + (read.signals[0] if read.signals else "manufactured supply")
     if read.label == "cabaled":
+        if chain == "robinhood_chain":
+            return None  # visor: Hood EV decides
         return "cabaled: " + (read.signals[0] if read.signals else "insider float")
     if read.label == "unverified" and chain == "solana":
         return "unverified: skip"

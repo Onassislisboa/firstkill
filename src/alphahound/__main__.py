@@ -447,7 +447,7 @@ def cmd_pause(args: argparse.Namespace) -> int:
     settings, strategy = _bootstrap()
     store = Store(settings.state_dir)
     RiskEngine(strategy, store).engage_kill_switch(args.reason or "paused manually")
-    print("kill switch engaged; open positions will be closed on the next tick")
+    print("kill switch engaged; engine will flatten open bags and stop")
     store.close()
     return 0
 
