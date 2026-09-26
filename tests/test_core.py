@@ -1173,10 +1173,17 @@ class TestExits(unittest.TestCase):
     def test_liquidity_drain_outranks_take_profit(self):
         position = self.position()
         self.manager.observe(position, 1.0, 100_000.0)
-        orders = self.manager.evaluate(position, 4.0, 40_000.0)
+        # Pool is gone (under the liquidity floor) even though the mark is 4x.
+        orders = self.manager.evaluate(position, 4.0, 2_000.0)
         self.assertEqual(len(orders), 1)
         self.assertIs(orders[0].reason, ExitReason.LIQUIDITY_DRAIN)
         self.assertEqual(orders[0].fraction, 1.0)
+
+    def test_liq_dip_while_price_is_up_is_not_a_drain(self):
+        position = self.position()
+        self.manager.observe(position, 1.0, 100_000.0)
+        orders = self.manager.evaluate(position, 4.0, 40_000.0)
+        self.assertFalse(any(o.reason is ExitReason.LIQUIDITY_DRAIN for o in orders))
 
     def test_stale_peak_liq_after_restore_is_not_a_drain(self):
         position = self.position()
@@ -1323,7 +1330,12 @@ class TestPostmortem(unittest.TestCase):
         self.assertIs(learning.classify(trade, STRATEGY), ErrorClass.ADVERSE_SELECTION)
 
     def test_honest_bucket_when_nothing_else_explains_it(self):
-        self.assertIs(learning.classify(_trade(), STRATEGY), ErrorClass.NO_EDGE)
+        faded = _trade(exit_reason=ExitReason.TIME_STOP)
+        self.assertIs(learning.classify(faded, STRATEGY), ErrorClass.NO_EDGE)
+
+    def test_hard_stop_is_not_no_edge(self):
+        trade = _trade(pnl=-7.7, exit_reason=ExitReason.STOP_LOSS, mfe=0.0)
+        self.assertIs(learning.classify(trade, STRATEGY), ErrorClass.HARD_STOP)
 
     def test_a_win_that_gave_back_its_peak_is_still_flagged(self):
         trade = _trade(pnl=10.0, exit_reason=ExitReason.TRAILING_STOP, mfe=2.5)
@@ -1437,6 +1449,57 @@ class TestSelfTuning(unittest.TestCase):
             self.store.resolve_shadow(self.store.record_decision(decision), 0.80)
         costs = {c.gate: c for c in learning.filter_cost(self.store)}
         self.assertEqual(costs["probability"].rejected, 12)
+
+    def test_filter_cost_counts_a_loss_beside_a_winner(self):
+        from alphahound.models import Action, Decision
+
+        for pct, addr in ((5.0, "moon"), (-0.80, "rug")):
+            decision = Decision(
+                candidate=Candidate(chain=Chain.SOLANA, address=addr, price_usd=1.0),
+                features=Features(),
+                score=Score(probability=0.2, expected_value=0.0),
+                action=Action.REJECT_SCORE,
+                reason="probability 0.20 < 0.32",
+            )
+            self.store.resolve_shadow(self.store.record_decision(decision), pct)
+        cost = {c.gate: c for c in learning.filter_cost(self.store)}["probability"]
+        self.assertEqual(cost.rejected, 2)
+        self.assertEqual(cost.would_have_won, 1)
+
+    def test_flat_shadow_is_a_loss_and_biased_floors_clear(self):
+        from alphahound.models import Action, Decision
+
+        decision = Decision(
+            candidate=Candidate(chain=Chain.SOLANA, address="flat", price_usd=1.0),
+            features=Features(),
+            score=Score(probability=0.2, expected_value=0.0),
+            action=Action.REJECT_GATE,
+            reason="top10: 70%",
+        )
+        decision_id = self.store.record_decision(decision)
+        self.store.update_shadow(decision_id, 0.40)
+        self.store.resolve_shadow(decision_id, 0.0)
+        self.assertEqual(self.store.repair_flat_shadows(), 1)
+        cf = self.store.conn.execute(
+            "SELECT counterfactual_pct FROM shadow WHERE decision_id = ?",
+            (decision_id,),
+        ).fetchone()[0]
+        self.assertAlmostEqual(cf, -0.60, places=4)
+        self.assertAlmostEqual(learning.shadow_return(1.0, 1.0, 0.40), -0.60, places=4)
+        self.assertAlmostEqual(learning.shadow_return(1.0, 1.0, 0.40, last=0.90), -0.10, places=4)
+        self.store.set_param("scoring.min_probability", 0.107, "filter_cost:probability at 100%")
+        self.store.set_param("scoring.min_expected_value", 0.119, "no_edge at 45% of recent trades")
+        notes = learning.undo_biased_floors(self.store)
+        self.assertEqual(len(notes), 2)
+        self.assertAlmostEqual(self.store.param("scoring.min_probability", 0.32), 0.32)
+        self.assertAlmostEqual(self.store.param("scoring.min_expected_value", 0.03), 0.03)
+
+    def test_stop_label_repair(self):
+        self.store.record_trade(_trade(pnl=-7.7, exit_reason=ExitReason.STOP_LOSS, mfe=0.0))
+        self.assertEqual(self.store.repair_stop_labels(), 1)
+        klass = self.store.conn.execute("SELECT error_class FROM trades").fetchone()[0]
+        self.assertEqual(klass, "hard_stop")
+        self.assertEqual(self.store.repair_stop_labels(), 0)
 
     def test_filter_cost_surfaces_expensive_gates(self):
         from alphahound.models import Action, Decision
@@ -1555,6 +1618,22 @@ class TestExitCopy(unittest.TestCase):
         self.assertIn("stop duro", describe_exit("stop_loss"))
         self.assertIn("funding", describe_code("cluster: 44% linked supply"))
         self.assertIn("esfriou", describe_code("no_edge"))
+        self.assertIn("stop", describe_code("hard_stop"))
+        preview = (Path(__file__).resolve().parents[1] / "src" / "alphahound" / "preview.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("if (!res.ok) throw new Error", preview)
+        self.assertIn("else if (d.running && !(d.watching > 0)) lastWatch = []", preview)
+        self.assertIn("t.klass_why", preview)
+        discovery = (Path(__file__).resolve().parents[1] / "src" / "alphahound" / "discovery.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("ping_interval=None", discovery)
+        signals = (Path(__file__).resolve().parents[1] / "src" / "alphahound" / "signals" / "__init__.py").read_text(
+            encoding="utf-8"
+        )
+        blind = signals[signals.index("if not self.registry.attributable_labels") : signals.index("no terminal fee")]
+        self.assertIn("bot_share", blind)
 
 
 
@@ -2957,6 +3036,19 @@ class TestHold(unittest.TestCase):
         )
         enr = Enrichment(candidate=pos.candidate, features=Features())
         self.assertIn("mint_authority", hold_cut(pos, enr, score, STRATEGY).cut or "")
+
+    def test_unknown_whale_does_not_sell_the_bag(self):
+        from alphahound.scoring import hold_cut
+
+        pos = self._pos(entry_sponsors=[])
+        score = Score(
+            probability=0.7,
+            expected_value=0.1,
+            veto_reasons=["unknown_whale: top holder 37% is not a known KOL/whale"],
+            rubric={"total": 7.2},
+        )
+        enr = Enrichment(candidate=pos.candidate, features=Features())
+        self.assertIsNone(hold_cut(pos, enr, score, STRATEGY).cut)
 
     def test_grace_blocks_cut(self):
         from alphahound.scoring import hold_cut

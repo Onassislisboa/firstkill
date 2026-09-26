@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS shadow (
     price_at_decision REAL NOT NULL,
     best_price REAL NOT NULL,
     worst_price REAL NOT NULL,
+    last_price REAL,
     resolved INTEGER NOT NULL DEFAULT 0,
     counterfactual_pct REAL
 );
@@ -259,6 +260,7 @@ class Store:
             ("trades", "mcap_entry_usd", "REAL NOT NULL DEFAULT 0"),
             ("trades", "mcap_exit_usd", "REAL NOT NULL DEFAULT 0"),
             ("trades", "exit_legs", "TEXT NOT NULL DEFAULT '[]'"),
+            ("shadow", "last_price", "REAL"),
         ):
             existing = {
                 r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -376,9 +378,9 @@ class Store:
     def open_shadow(self, decision_id: int, key: str, price: float) -> None:
         self.conn.execute(
             """INSERT OR IGNORE INTO shadow
-               (decision_id, key, opened_at_ms, price_at_decision, best_price, worst_price)
-               VALUES (?,?,?,?,?,?)""",
-            (decision_id, key, now_ms(), price, price, price),
+               (decision_id, key, opened_at_ms, price_at_decision, best_price, worst_price, last_price)
+               VALUES (?,?,?,?,?,?,?)""",
+            (decision_id, key, now_ms(), price, price, price, price),
         )
 
     def open_shadows(self) -> list[sqlite3.Row]:
@@ -387,9 +389,10 @@ class Store:
     def update_shadow(self, decision_id: int, price: float) -> None:
         self.conn.execute(
             """UPDATE shadow
-               SET best_price = MAX(best_price, ?), worst_price = MIN(worst_price, ?)
+               SET best_price = MAX(best_price, ?), worst_price = MIN(worst_price, ?),
+                   last_price = ?
                WHERE decision_id = ?""",
-            (price, price, decision_id),
+            (price, price, price, decision_id),
         )
 
     def resolve_shadow(self, decision_id: int, counterfactual_pct: float) -> None:
@@ -399,14 +402,17 @@ class Store:
         )
 
     def filter_cost_report(self, limit: int = 200) -> list[sqlite3.Row]:
-        """Rejected candidates that would have won, most profitable first. This
-        is the report that tells you which gate is quietly costing you money."""
+        """Recent resolved shadows, newest first.
+
+        Ordering by counterfactual DESC made every gate look like a winner:
+        the top 1 000 gains were the whole sample.
+        """
         return self.conn.execute(
             """SELECT d.action, d.reason, d.probability, d.expected_value,
                       s.counterfactual_pct, d.key, d.symbol, d.features
                FROM shadow s JOIN decisions d ON d.id = s.decision_id
                WHERE s.resolved = 1
-               ORDER BY s.counterfactual_pct DESC LIMIT ?""",
+               ORDER BY s.decision_id DESC LIMIT ?""",
             (limit,),
         ).fetchall()
 
@@ -742,6 +748,51 @@ class Store:
             "SELECT value FROM param_overrides WHERE name = ?", (name,)
         ).fetchone()
         return float(row["value"]) if row else default
+
+    def param_reason(self, name: str) -> str:
+        row = self.conn.execute(
+            "SELECT reason FROM param_overrides WHERE name = ?", (name,)
+        ).fetchone()
+        return str(row["reason"] or "") if row else ""
+
+    def clear_param(self, name: str, reason: str) -> bool:
+        old = self.conn.execute(
+            "SELECT value FROM param_overrides WHERE name = ?", (name,)
+        ).fetchone()
+        if old is None:
+            return False
+        self.conn.execute("DELETE FROM param_overrides WHERE name = ?", (name,))
+        self.conn.execute(
+            """INSERT INTO param_history (ts_ms, name, old_value, new_value, reason)
+               VALUES (?,?,?,?,?)""",
+            (now_ms(), name, float(old["value"]), float(old["value"]), reason),
+        )
+        return True
+
+    def repair_flat_shadows(self) -> int:
+        """A shadow that never traded above entry was stored as 0%. The loss is worst_price."""
+        cur = self.conn.execute(
+            """UPDATE shadow
+               SET counterfactual_pct = (worst_price / price_at_decision) - 1.0
+               WHERE resolved = 1
+                 AND price_at_decision > 0
+                 AND best_price <= price_at_decision * 1.001
+                 AND worst_price < price_at_decision
+                 AND IFNULL(counterfactual_pct, 0) >= -1e-9"""
+        )
+        return int(cur.rowcount or 0)
+
+    def repair_stop_labels(self) -> int:
+        """A hard stop that was never green is not no_edge."""
+        cur = self.conn.execute(
+            """UPDATE trades
+               SET error_class = 'hard_stop'
+               WHERE exit_reason = 'stop_loss'
+                 AND error_class = 'no_edge'
+                 AND pnl_usd < 0
+                 AND mfe < 0.05"""
+        )
+        return int(cur.rowcount or 0)
 
     def set_param(self, name: str, value: float, reason: str) -> None:
         old = self.conn.execute(

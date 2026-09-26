@@ -536,6 +536,16 @@ class Engine:
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from exc
 
+        repaired = self.store.repair_flat_shadows()
+        relabeled = self.store.repair_stop_labels()
+        if repaired or relabeled:
+            log.info(
+                "repaired biased history",
+                extra={"flat_shadows": repaired, "hard_stops": relabeled},
+            )
+        for note in learning.undo_biased_floors(self.store):
+            log.info(note)
+
         min_p, min_ev = score_floors(self.strategy, self.store)
         log.info(
             "starting",
@@ -1087,8 +1097,11 @@ class Engine:
         for row in stale:
             entry = float(row["price_at_decision"]) or 0.0
             best = float(row["best_price"] or entry)
+            worst = float(row["worst_price"] or entry)
+            last = float(row["last_price"] or 0.0)
             self.store.resolve_shadow(
-                row["decision_id"], (best / entry - 1.0) if entry > 0 else 0.0
+                row["decision_id"],
+                learning.shadow_return(entry, best, worst, last),
             )
             self._resolved_since_learn += 1
 

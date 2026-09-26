@@ -251,7 +251,9 @@ class Discovery:
         backoff = 1.0
         while True:
             try:
-                async with websockets.connect(url, ping_interval=20) as ws:
+                # PumpPortal does not answer client pings; ping_interval=20 dropped
+                # the socket with "no close frame" about once a minute.
+                async with websockets.connect(url, ping_interval=None) as ws:
                     await ws.send(json.dumps({"method": "subscribeNewToken"}))
                     log.info("pump stream connected")
                     backoff = 1.0

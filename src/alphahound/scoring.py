@@ -607,6 +607,11 @@ _HOLD_IGNORE = (
     "rubric:",
     "sponsor:",
     "lp_unlocked:",
+    # Concentration we already accepted at entry. An empty KOL list must not
+    # sell a green bag the moment hold re-reads the same top holder.
+    "unknown_whale",
+    "top10",
+    "cabaled:",
 )
 
 

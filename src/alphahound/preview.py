@@ -1487,7 +1487,12 @@ async function tick() {
   if (inflight) { queued = true; return; }
   inflight = true;
   let d;
-  try { d = await (await fetch('/api?h='+heavySig+'&_='+Date.now(), {cache:'no-store'})).json(); }
+  try {
+    const res = await fetch('/api?h='+heavySig+'&_='+Date.now(), {cache:'no-store'});
+    if (!res.ok) throw new Error('api '+res.status);
+    d = await res.json();
+    if (d && d.error && d.stale_s == null) throw new Error(d.error);
+  }
   catch (err) { $('status').textContent = 'offline'; inflight = false; queued = false; return; }
   // Blocks absent from the reply are the ones we already hold unchanged.
   heavySig = d.heavy_sig || '';
@@ -1519,9 +1524,10 @@ async function tick() {
     if (uni.innerHTML !== uniHtml) uni.innerHTML = uniHtml;
   }
   const incoming = d.watch || [];
-  // Keep the last non-empty paint. Empty watch + watching=0 is Hood unpaid on
-  // radar / a torn file — wiping lastWatch blanks Sol cards the operator still has.
+  // Torn file: engine says cards exist but the array is empty. Keep the paint.
+  // A live engine with watching=0 really has an empty book — drop the ghosts.
   if (incoming.length) lastWatch = incoming;
+  else if (d.running && !(d.watching > 0)) lastWatch = [];
   paintWatch(lastWatch, d.running);
   paintCoin();
   paintHoldTable(d.holds||[]);
@@ -1536,7 +1542,7 @@ async function tick() {
     <td>${t.hold_min != null ? mins(t.hold_min) : '—'}</td>
     <td class="muted" title="${esc(t.exit_why||'')}">${t.exit}
       <div class="meta">${esc(t.exit_why||'')}</div>
-      ${t.exit_note ? '<div class="meta">'+esc(t.exit_note)+'</div>' : ''}
+      ${t.exit_note ? '<div class="meta">'+esc(t.exit_note)+'</div>' : (t.klass_why ? '<div class="meta">'+esc(t.klass_why)+'</div>' : '')}
       <div class="meta">${clock(t.closed_at_ms)}</div>
       ${exitLegsHtml(t.exit_legs)}
     </td></tr>`, 'none closed', 6);

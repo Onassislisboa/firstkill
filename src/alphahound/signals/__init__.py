@@ -763,7 +763,9 @@ class Enricher:
         # not evidence. Flagging it here is what stops the strategy from
         # silently degenerating into "buy anything with volume".
         if not self.registry.attributable_labels:
-            result.unknown.update({"retail_share", "retail_share_delta_5m", "axiom_share"})
+            result.unknown.update(
+                {"retail_share", "retail_share_delta_5m", "axiom_share", "bot_share"}
+            )
             result.notes.append(
                 "no terminal fee accounts labeled; run `alphahound discover-terminals`"
             )

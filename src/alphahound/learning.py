@@ -85,6 +85,9 @@ def classify(trade: TradeRecord, strategy: Config) -> ErrorClass:
     if f.bundle_pct > 0.20 or f.bot_share > 0.30:
         return ErrorClass.ADVERSE_SELECTION
 
+    if trade.exit_reason is ExitReason.STOP_LOSS:
+        return ErrorClass.HARD_STOP
+
     return ErrorClass.NO_EDGE
 
 
@@ -181,6 +184,15 @@ NUDGES: dict[ErrorClass, tuple[Nudge, ...]] = {
             0.01,
             0.40,
             "signal was clean and the trade still faded; demand more edge",
+        ),
+    ),
+    ErrorClass.HARD_STOP: (
+        Nudge(
+            "scoring.min_probability",
+            0.08,
+            0.20,
+            0.70,
+            "hit the hard stop before the trade was ever green; raise the entry bar",
         ),
     ),
     ErrorClass.EXECUTION_FAIL: (
@@ -306,6 +318,35 @@ class FilterCost:
     rejected: int
     would_have_won: int
     median_counterfactual: float
+
+
+def shadow_return(entry: float, best: float, worst: float, last: float = 0.0) -> float:
+    """Hold-to-horizon return. A coin that never went green is the drawdown, not 0%."""
+    if entry <= 0:
+        return 0.0
+    if last > 0:
+        return last / entry - 1.0
+    if best <= entry * 1.001:
+        return worst / entry - 1.0
+    return best / entry - 1.0
+
+
+def undo_biased_floors(store: Store) -> list[str]:
+    """Drop floors the upside-only shadow report and mislabeled stops wrote."""
+    notes: list[str] = []
+    if "filter_cost" in store.param_reason("scoring.min_probability"):
+        if store.clear_param(
+            "scoring.min_probability",
+            "cleared: filter_cost used upside-only shadows",
+        ):
+            notes.append("scoring.min_probability back to config")
+    if store.param_reason("scoring.min_expected_value").startswith("no_edge"):
+        if store.clear_param(
+            "scoring.min_expected_value",
+            "cleared: no_edge nudge counted hard stops",
+        ):
+            notes.append("scoring.min_expected_value back to config")
+    return notes
 
 
 def filter_cost(store: Store, *, win_threshold: float = 0.20) -> list[FilterCost]:
