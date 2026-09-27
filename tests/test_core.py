@@ -127,6 +127,21 @@ class TestLoopBug(unittest.TestCase):
         self.assertFalse(reread_keeps_lane("scan"))
         self.assertFalse(reread_keeps_lane("trade"))
 
+    def test_log_emit_does_not_block_when_the_queue_is_full(self):
+        import logging
+        import queue
+        import time
+
+        from alphahound.log import _DropQueueHandler
+
+        q: queue.Queue = queue.Queue(maxsize=1)
+        q.put_nowait("full")
+        record = logging.LogRecord("alphahound", logging.INFO, __file__, 1, "heartbeat", (), None)
+        started = time.monotonic()
+        _DropQueueHandler(q).emit(record)
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual(q.qsize(), 1)
+
     def test_wait_floors_cleared_promotes_to_enrich(self):
         read = {"call": "wait", "vetoes": ["mcap: 48000 below 50000 floor"]}
         self.assertTrue(wait_floors_cleared(read, []))

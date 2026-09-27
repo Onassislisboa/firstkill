@@ -42,6 +42,9 @@ log = get("discovery")
 # Dexscreener meters the profile/boost feeds at 60 req/min, and they refresh at
 # human speed anyway. 5s is ~12/min per feed, well clear of the limit.
 PROMO_POLL_MS = 5_000
+# PumpPortal does not answer client pings. Without a read deadline a half-open
+# socket sits in recv forever and the firehose looks like a quiet market.
+PUMP_SILENCE_S = 90.0
 
 
 def launchpad_queries(settings: Settings, strategy: Config) -> list[str]:
@@ -253,11 +256,21 @@ class Discovery:
             try:
                 # PumpPortal does not answer client pings; ping_interval=20 dropped
                 # the socket with "no close frame" about once a minute.
-                async with websockets.connect(url, ping_interval=None) as ws:
+                async with websockets.connect(
+                    url, ping_interval=None, open_timeout=15
+                ) as ws:
                     await ws.send(json.dumps({"method": "subscribeNewToken"}))
                     log.info("pump stream connected")
                     backoff = 1.0
-                    async for raw in ws:
+                    while True:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=PUMP_SILENCE_S)
+                        except TimeoutError:
+                            log.warning(
+                                "pump stream silent",
+                                extra={"seconds": PUMP_SILENCE_S},
+                            )
+                            break
                         candidate = self._parse_pump_event(raw)
                         if candidate is None:
                             continue
