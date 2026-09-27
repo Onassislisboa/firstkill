@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
+import logging.handlers
+import queue
 import sys
 from typing import Any
 
@@ -35,14 +37,30 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
+class _DropQueueHandler(logging.handlers.QueueHandler):
+    """Never block the caller. A full queue means the listener is stuck on the pipe."""
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        try:
+            self.queue.put_nowait(record)
+        except queue.Full:
+            pass
+
+
 def setup(level: str = "INFO") -> None:
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(JsonFormatter())
+    # ponytail: one listener thread. A dead terminal fills the stdout pipe and
+    # StreamHandler.write blocks; that used to freeze the whole asyncio loop
+    # for hours with no exception. The listener may block; the bot must not.
+    # Ceiling: 1000 queued lines, then drops. A file handler if you need the rest.
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setFormatter(JsonFormatter())
+    handler = _DropQueueHandler(queue.Queue(maxsize=1000))
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.handlers.QueueListener(handler.queue, stream, respect_handler_level=True).start()
 
 
 def get(name: str) -> logging.Logger:

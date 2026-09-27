@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     unknown TEXT NOT NULL DEFAULT '[]',
     first_ts_ms INTEGER,
     last_ts_ms INTEGER,
-    ticks INTEGER NOT NULL DEFAULT 1
+    ticks INTEGER NOT NULL DEFAULT 1,
+    first_mcap_usd REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_key ON decisions(key);
 CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts_ms);
@@ -66,6 +67,7 @@ CREATE TABLE IF NOT EXISTS shadow (
     price_at_decision REAL NOT NULL,
     best_price REAL NOT NULL,
     worst_price REAL NOT NULL,
+    last_price REAL,
     resolved INTEGER NOT NULL DEFAULT 0,
     counterfactual_pct REAL
 );
@@ -184,6 +186,17 @@ def lock_state_dir(state_dir: Path) -> IO[bytes]:
     return handle
 
 
+def mcap_from_reason(reason: str) -> float:
+    """Parse 'mcap: 71695 below …' from a gate. 0 if that isn't the reason."""
+    parts = (reason or "").split()
+    if len(parts) < 2 or not parts[0].startswith("mcap"):
+        return 0.0
+    try:
+        return float(parts[1].replace(",", ""))
+    except ValueError:
+        return 0.0
+
+
 def episode_kind(action: str, reason: str) -> tuple[str, str]:
     """Gate/score class, not the floats in the message.
 
@@ -232,6 +245,7 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
         # CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so a
         # column added later never appears in a database that already exists.
@@ -240,11 +254,13 @@ class Store:
             ("decisions", "first_ts_ms", "INTEGER"),
             ("decisions", "last_ts_ms", "INTEGER"),
             ("decisions", "ticks", "INTEGER NOT NULL DEFAULT 1"),
+            ("decisions", "first_mcap_usd", "REAL NOT NULL DEFAULT 0"),
             ("trades", "unknown", "TEXT NOT NULL DEFAULT '[]'"),
             ("trades", "symbol", "TEXT NOT NULL DEFAULT ''"),
             ("trades", "mcap_entry_usd", "REAL NOT NULL DEFAULT 0"),
             ("trades", "mcap_exit_usd", "REAL NOT NULL DEFAULT 0"),
             ("trades", "exit_legs", "TEXT NOT NULL DEFAULT '[]'"),
+            ("shadow", "last_price", "REAL"),
         ):
             existing = {
                 r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -271,6 +287,7 @@ class Store:
         key = decision.candidate.key
         action = decision.action.value
         reason = decision.reason or ""
+        first_mcap = self._first_seen_mcap(key, decision.candidate.mcap_usd)
         if decision.action is not Action.ENTER:
             prev = self.conn.execute(
                 """SELECT id, action, IFNULL(reason,'') AS reason,
@@ -297,8 +314,9 @@ class Store:
         cur = self.conn.execute(
             """INSERT INTO decisions (ts_ms, key, chain, symbol, action, probability,
                    expected_value, size_usd, signal_price, features, contributions,
-                   weights_version, reason, unknown, first_ts_ms, last_ts_ms, ticks)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   weights_version, reason, unknown, first_ts_ms, last_ts_ms, ticks,
+                   first_mcap_usd)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 ts,
                 key,
@@ -317,12 +335,38 @@ class Store:
                 ts,
                 ts,
                 1,
+                first_mcap,
             ),
         )
         decision_id = int(cur.lastrowid or 0)
         if decision.action is not Action.ENTER and decision.candidate.price_usd > 0:
             self.open_shadow(decision_id, key, decision.candidate.price_usd)
         return decision_id
+
+    def _first_seen_mcap(self, key: str, live: float) -> float:
+        """Mcap on first visor sight of this mint. Later episodes keep that number."""
+        row = self.conn.execute(
+            "SELECT first_mcap_usd, reason FROM decisions WHERE key = ? ORDER BY id ASC LIMIT 1",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return float(live or 0.0)
+        stored = float(row["first_mcap_usd"] or 0.0)
+        if stored > 0:
+            return stored
+        return mcap_from_reason(row["reason"] or "")
+
+    def _first_mcap_by_key(self) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for r in self.conn.execute(
+            "SELECT key, first_mcap_usd, reason FROM decisions ORDER BY id"
+        ):
+            k = r["key"]
+            if k in out:
+                continue
+            m = float(r["first_mcap_usd"] or 0.0) or mcap_from_reason(r["reason"] or "")
+            out[k] = m
+        return out
 
     def recent_decision_keys(self, since_ms: int) -> set[str]:
         rows = self.conn.execute(
@@ -334,9 +378,9 @@ class Store:
     def open_shadow(self, decision_id: int, key: str, price: float) -> None:
         self.conn.execute(
             """INSERT OR IGNORE INTO shadow
-               (decision_id, key, opened_at_ms, price_at_decision, best_price, worst_price)
-               VALUES (?,?,?,?,?,?)""",
-            (decision_id, key, now_ms(), price, price, price),
+               (decision_id, key, opened_at_ms, price_at_decision, best_price, worst_price, last_price)
+               VALUES (?,?,?,?,?,?,?)""",
+            (decision_id, key, now_ms(), price, price, price, price),
         )
 
     def open_shadows(self) -> list[sqlite3.Row]:
@@ -345,9 +389,10 @@ class Store:
     def update_shadow(self, decision_id: int, price: float) -> None:
         self.conn.execute(
             """UPDATE shadow
-               SET best_price = MAX(best_price, ?), worst_price = MIN(worst_price, ?)
+               SET best_price = MAX(best_price, ?), worst_price = MIN(worst_price, ?),
+                   last_price = ?
                WHERE decision_id = ?""",
-            (price, price, decision_id),
+            (price, price, price, decision_id),
         )
 
     def resolve_shadow(self, decision_id: int, counterfactual_pct: float) -> None:
@@ -357,14 +402,17 @@ class Store:
         )
 
     def filter_cost_report(self, limit: int = 200) -> list[sqlite3.Row]:
-        """Rejected candidates that would have won, most profitable first. This
-        is the report that tells you which gate is quietly costing you money."""
+        """Recent resolved shadows, newest first.
+
+        Ordering by counterfactual DESC made every gate look like a winner:
+        the top 1 000 gains were the whole sample.
+        """
         return self.conn.execute(
             """SELECT d.action, d.reason, d.probability, d.expected_value,
                       s.counterfactual_pct, d.key, d.symbol, d.features
                FROM shadow s JOIN decisions d ON d.id = s.decision_id
                WHERE s.resolved = 1
-               ORDER BY s.counterfactual_pct DESC LIMIT ?""",
+               ORDER BY s.decision_id DESC LIMIT ?""",
             (limit,),
         ).fetchall()
 
@@ -377,8 +425,8 @@ class Store:
     ) -> dict[str, Any]:
         """Decisions + shadow MFE + closed trades, classified for the visor.
 
-        One row per reject decision (or closed trade). Does not write. Unresolved
-        shadows are omitted unless outcome=tracking — they are not 'correct rejects'.
+        One row per reject decision (or closed trade). Does not write.
+        Default includes unresolved shadows as tracking so the tab matches the session.
         """
         outcome = (outcome or "").strip().lower()
         fumble_pct = float(fumble_pct)
@@ -398,6 +446,7 @@ class Store:
             items.sort(key=lambda kv: -abs(kv[1]))
             return [[k, round(v, 4)] for k, v in items[:24]]
 
+        first_mcap = self._first_mcap_by_key()
         rows: list[dict[str, Any]] = []
         want_rej = outcome in ("", "fumble", "rejeicao_correta", "tracking")
         want_ent = outcome in ("", "entrada_correta", "entrada_errada")
@@ -420,6 +469,8 @@ class Store:
             elif outcome == "tracking":
                 sql += " WHERE s.resolved = 0"
             else:
+                # Default "todos" is resolved + entries. Live tracking drowned
+                # the tab (200+ wait/lp shadows) and looked frozen.
                 sql += " WHERE s.resolved = 1"
             sql += " ORDER BY d.ts_ms DESC LIMIT ?"
             params.append(limit)
@@ -449,6 +500,7 @@ class Store:
                         "pnl_usd": None,
                         "outcome": kind,
                         "contrib": contribs(r["contributions"]),
+                        "mcap_first": round(first_mcap.get(r["key"], 0.0)),
                     }
                 )
 
@@ -487,6 +539,7 @@ class Store:
                         "outcome": kind,
                         "contrib": contribs(d["contributions"] if d else "{}"),
                         "closed_at_ms": int(t.closed_at_ms),
+                        "mcap_first": round(first_mcap.get(t.key, 0.0)),
                         "mcap_entry": round(t.mcap_entry_usd),
                         "mcap_exit": round(t.mcap_exit_usd),
                         "exit_legs": legs_for_display(t),
@@ -619,6 +672,9 @@ class Store:
         ).fetchone()
         return row is not None
 
+    def closed_mint_keys(self) -> set[str]:
+        return {str(r["key"]) for r in self.conn.execute("SELECT DISTINCT key FROM trades")}
+
     def enter_count_since(self, since_ms: int) -> int:
         row = self.conn.execute(
             "SELECT COUNT(*) AS n FROM decisions WHERE action = ? AND ts_ms >= ?",
@@ -692,6 +748,51 @@ class Store:
             "SELECT value FROM param_overrides WHERE name = ?", (name,)
         ).fetchone()
         return float(row["value"]) if row else default
+
+    def param_reason(self, name: str) -> str:
+        row = self.conn.execute(
+            "SELECT reason FROM param_overrides WHERE name = ?", (name,)
+        ).fetchone()
+        return str(row["reason"] or "") if row else ""
+
+    def clear_param(self, name: str, reason: str) -> bool:
+        old = self.conn.execute(
+            "SELECT value FROM param_overrides WHERE name = ?", (name,)
+        ).fetchone()
+        if old is None:
+            return False
+        self.conn.execute("DELETE FROM param_overrides WHERE name = ?", (name,))
+        self.conn.execute(
+            """INSERT INTO param_history (ts_ms, name, old_value, new_value, reason)
+               VALUES (?,?,?,?,?)""",
+            (now_ms(), name, float(old["value"]), float(old["value"]), reason),
+        )
+        return True
+
+    def repair_flat_shadows(self) -> int:
+        """A shadow that never traded above entry was stored as 0%. The loss is worst_price."""
+        cur = self.conn.execute(
+            """UPDATE shadow
+               SET counterfactual_pct = (worst_price / price_at_decision) - 1.0
+               WHERE resolved = 1
+                 AND price_at_decision > 0
+                 AND best_price <= price_at_decision * 1.001
+                 AND worst_price < price_at_decision
+                 AND IFNULL(counterfactual_pct, 0) >= -1e-9"""
+        )
+        return int(cur.rowcount or 0)
+
+    def repair_stop_labels(self) -> int:
+        """A hard stop that was never green is not no_edge."""
+        cur = self.conn.execute(
+            """UPDATE trades
+               SET error_class = 'hard_stop'
+               WHERE exit_reason = 'stop_loss'
+                 AND error_class = 'no_edge'
+                 AND pnl_usd < 0
+                 AND mfe < 0.05"""
+        )
+        return int(cur.rowcount or 0)
 
     def set_param(self, name: str, value: float, reason: str) -> None:
         old = self.conn.execute(

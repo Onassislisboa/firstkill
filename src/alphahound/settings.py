@@ -339,6 +339,11 @@ def apply_aggressive_learning(strategy: Config, store: Any) -> Config:
     )
 
 
+# no_edge self-tune raises EV until the book is empty. Ignore that raise until
+# enough closes exist so paper still fills and the trainer gets labels.
+LEARN_EV_AFTER = 150
+
+
 def score_floors(strategy: Config, store: Any) -> tuple[float, float]:
     """p/EV used to enter. Aggressive ignores self-tune so learning can actually enter."""
     prod_p = float(strategy.get("scoring.min_probability", 0.56))
@@ -349,10 +354,11 @@ def score_floors(strategy: Config, store: Any) -> tuple[float, float]:
             float(sec.get("min_probability", prod_p)),
             float(sec.get("min_expected_value", prod_ev)),
         )
-    return (
-        store.param("scoring.min_probability", prod_p),
-        store.param("scoring.min_expected_value", prod_ev),
-    )
+    p = store.param("scoring.min_probability", prod_p)
+    # ponytail: sqlite EV wins over toml and starved entries; toml EV until LEARN_EV_AFTER
+    if store.trade_count() < LEARN_EV_AFTER:
+        return p, prod_ev
+    return p, store.param("scoring.min_expected_value", prod_ev)
 
 
 def aggressive_closes_since_on(store: Any) -> int:

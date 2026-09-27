@@ -83,6 +83,7 @@ ERROR_WHY: dict[str, str] = {
     "exit_too_fast": "Ganhou, mas devolveu a maior parte do que chegou a estar positivo.",
     "exit_too_slow": "Chegou a subir o bastante para ter realizado e mesmo assim fechou perdido.",
     "no_edge": "O sinal na entrada estava ok; o token simplesmente esfriou.",
+    "hard_stop": "Bateu o stop antes de ficar no verde. A entrada é que estava errada.",
     "rug": "A liquidez evaporou e o trade fechou no prejuízo.",
     "late_entry": "O fill ficou bem mais caro que o preço do sinal.",
     "slippage_blowout": "A entrada escorregou demais no fill.",
@@ -194,6 +195,8 @@ class ErrorClass(str, Enum):
     # The honest bucket. The signal was fine and the token simply faded. If
     # this is not your largest loss class, your taxonomy is lying to you.
     NO_EDGE = "no_edge"
+    # Hit the stop before the trade was ever green. Not "the signal was fine".
+    HARD_STOP = "hard_stop"
 
 
 @dataclass(slots=True)
@@ -228,6 +231,9 @@ class Candidate:
     discovered_at_ms: int = field(default_factory=now_ms)
     ret_5m: float = 0.0
     last_scored_ms: int = 0
+    first_scored_ms: int = 0
+    quoted_at_ms: int = 0
+    first_quoted_ms: int = 0
     pack_role: str = ""
     pack_stem: str = ""
     main_key: str = ""
@@ -236,6 +242,7 @@ class Candidate:
     dex_paid: bool = False
     dex_photo: bool = False
     dex_aligned: bool = False
+    dex_boosted: bool = False
 
     @property
     def dex_profile(self) -> float:

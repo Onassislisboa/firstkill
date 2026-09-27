@@ -24,12 +24,16 @@ max_candidate_age_minutes = 240
 max_candidates_per_tick = 0
 # How many enrichments run at once. Sequential was one SCAN pill on the visor.
 enrich_concurrency = 4
-# Discovery dumps hundreds of pairs. Cap the visor and skip the rest; vamps
-# drop first, mains stay. Unseen names rotate in next scan.
-max_watching = 40
+# Discovery dumps hundreds of pairs. Cap visor *cards* at this N. Unquoted
+# Hood waits sit in a separate pool of the same size, so they cannot eat cards.
+max_watching = 12
+# Wait/skip this long then drop — new mints get the slot. 0 = off.
+max_wait_minutes = 20
 # Full enrich this often. Quotes still tick; new coins jump the queue.
-rescore_seconds = 15
-# Below this, skip visor/enrich. Buy floor is playbook copy_min (100k), not this.
+rescore_seconds = 8
+# Bundle/LP skip stays off the visor this long so it cannot steal a card again.
+skip_ban_minutes = 120
+# Below this, skip visor/enrich. Buy floor is playbook copy_min (50k), not this.
 dead_mcap_usd = 50000
 # Proof of life, with a breakdown of what rejected everything. 0 disables.
 heartbeat_seconds = 60.0
@@ -83,7 +87,8 @@ bundle_cache_seconds = 60
 max_unknown_top1_pct = 0.50
 # Circulating top-10 (LP and burn already excluded) above this, unless known
 # wallets explain most of that share, is a dump waiting to happen.
-max_top10_pct = 0.50
+# 0.60: typical pump.fun ~55% can fill; mikedyson 61% still skips.
+max_top10_pct = 0.60
 # Fraction of pool LP that is *not* burned or in a known locker. Near 1.0 means
 # the position NFT (Hood V4/V3) or LP token (BNB V2) sits in a wallet that can drain now.
 # 0 disables. Does not verify lock duration or that the locker isn't team-owned.
@@ -102,7 +107,7 @@ lp_locker_addresses = []
 require_launchpad = true
 
 [launchpads.solana]
-# pump.fun only. Graduates keep the `pump` mint suffix even on PumpSwap.
+# pump.fun / PumpSwap only. A `pump` mint on Meteora or Raydium is not a pass.
 dex_ids = ["pumpfun", "pumpswap"]
 mint_suffixes = ["pump"]
 
@@ -112,10 +117,9 @@ mint_suffixes = ["pump"]
 dex_ids = ["fourmeme"]
 
 [launchpads.robinhood_chain]
-# Pons and Pools.trade. Graduates land on Uniswap V4, which Dexscreener labels
-# `uniswap` - on this chain that is the launchpad exit, not a stealth pool.
-# The Robinhood brokerage (majors, US app) is a different product and is off.
-dex_ids = ["pons", "pools", "uniswap"]
+# Pons factory only. Handmade Uniswap pools and Pools.trade are out.
+# A Pons mint that later quotes as `uniswap` keeps dex_id=pons on the visor.
+dex_ids = ["pons"]
 
 
 # ---------------------------------------------------------------------------
@@ -198,14 +202,14 @@ ignore_mcap_usd = 50000000
 # ---------------------------------------------------------------------------
 [scoring]
 # Minimum modeled win probability to consider a trade.
-min_probability = 0.42
+min_probability = 0.32
 # Minimum expected value, as a fraction of position size, AFTER subtracting
 # every cost we can predict. A positive score with negative EV is a losing
 # trade with good self-esteem.
-min_expected_value = 0.04
+min_expected_value = 0.03
 # Stage-2 0–10 composite. Weights: dist 20, crowd 25, flow 20, chart 25, narrative 10.
 # Below this the token is not a buy candidate even if EV looks fine.
-min_rubric = 4.0
+min_rubric = 3.0
 # Until this many closed trades exist, the model has no opinion worth acting
 # on and every feature contributes at its prior weight.
 min_trades_for_learned_weights = 40
@@ -219,13 +223,12 @@ prior_winner_ladder_reach = [[1, 0.60], [2, 0.25], [3, 0.15]]
 # ---------------------------------------------------------------------------
 # Aggressive learning. One `enabled` flip. Production [scoring]/[risk] above
 # stay the graduate-to values. Does not touch gates (LP, mint, bundle, cluster).
-# Floors from unique reject_score p/EV: 0.38/0.03 ≈ 3× vs 0.42/0.048.
 # ---------------------------------------------------------------------------
 [aggressive_learning]
 enabled = true
 graduate_at_closes = 40
-min_probability = 0.38
-min_expected_value = 0.03
+min_probability = 0.28
+min_expected_value = 0.02
 max_concurrent_positions = 4
 
 
@@ -244,9 +247,9 @@ max_position_pct = 0.16
 # At copy_min mcap this fraction of equity; interpolates up to max_position_pct at copy_max.
 min_position_pct = 0.06
 min_position_usd = 10.0
-# Two open at once so a weak bag cannot occupy the only slot.
-max_concurrent_positions = 2
-max_positions_per_chain = 2
+# Fill the book so paper learning gets more closes. Gates still skip rugs.
+max_concurrent_positions = 4
+max_positions_per_chain = 4
 # Hard cap on size as a fraction of pool liquidity. This binds long before the
 # equity cap does on a small pool, and it is the difference between a position
 # you can exit and a position you are.
@@ -258,8 +261,8 @@ max_entries_per_day = 0
 # Fractional Kelly. Full Kelly is correct only if your probabilities are
 # correct, and yours are not.
 kelly_fraction = 0.25
-# Realized loss in a single day that halts trading until manually resumed.
-daily_loss_limit_pct = 0.12
+# 0 = off. Paper learning phase — no daily loss halt.
+daily_loss_limit_pct = 0
 # Streak cooldown sits out the next runner. Off: wait on the coin instead.
 consecutive_loss_limit = 0
 cooldown_minutes_base = 0
@@ -278,7 +281,7 @@ take_profit_ladder = [[1.50, 0.20], [2.20, 0.20], [3.50, 0.20]]
 # Trailing stop, activated only after the first ladder rung fills. [auto]
 trailing_stop_pct = 0.18
 # Hard stop from entry. [auto]
-stop_loss_pct = 0.35
+stop_loss_pct = 0.50
 # A dead coin is capital with an opportunity cost. A working one is allowed
 # to sit: time stop only fires if it has not moved.
 time_stop_minutes = 240
@@ -364,14 +367,13 @@ shadow_track_minutes = 180
 
 
 # ---------------------------------------------------------------------------
-# Per-chain playbooks. Hood is the live venue; Solana/BNB stay in the file
-# but ENABLED_CHAINS should be robinhood_chain until Sol recovers.
+# Per-chain playbooks. Solana is pump.fun, BNB is four.meme, Hood is Pons.
 # ---------------------------------------------------------------------------
 [playbooks.solana]
 # Coins die in minutes and vamps are everywhere. Short window, tight cluster.
 max_age_minutes = 45
 copy_max_age_minutes = 30
-copy_min_mcap_usd = 100000
+copy_min_mcap_usd = 50000
 copy_max_mcap_usd = 2000000
 max_cluster_pct = 0.20
 max_unknown_top1_pct = 0.28
@@ -381,7 +383,7 @@ require_sponsor = false
 
 [playbooks.bnb]
 copy_max_age_minutes = 25
-copy_min_mcap_usd = 100000
+copy_min_mcap_usd = 50000
 copy_max_mcap_usd = 2000000
 max_cluster_pct = 0.45
 
@@ -389,12 +391,14 @@ max_cluster_pct = 0.45
 # Dip, hold, runner. Don't chase a 5m rip; first take later so the bag can reprice.
 max_age_minutes = 240
 copy_max_age_minutes = 90
-copy_min_mcap_usd = 100000
+copy_min_mcap_usd = 50000
 copy_max_mcap_usd = 2000000
 max_cluster_pct = 0.20
 max_bundle_pct = 0.20
+# Pons LP is an NFT in a wallet — there is no public locker. 0 = don't skip every Hood mint.
+max_lp_unlocked_pct = 0
 min_volume_5m = 5000
 min_twitter_mentions = 2
-max_chase_ret_5m = 0.12
+max_chase_ret_5m = 0.35
 thesis_cut_from_peak = 0.40
 take_profit_ladder = [[2.00, 0.15], [3.50, 0.15], [6.00, 0.20]]

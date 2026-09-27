@@ -73,10 +73,14 @@ class PositionManager:
         orders: list[ExitOrder] = []
 
         drain = self._p("liquidity_drawdown_exit", 0.35)
+        floor = float(self.strategy.get("gates.min_liquidity_usd", 15_000))
+        # A rip whose quoted pool is thinner is not a rug. Drain only when the
+        # book is gone (under the liquidity floor) or the price is already down.
         if (
             position.peak_liquidity_usd > 0
             and liquidity_usd > 0
             and liquidity_usd < position.peak_liquidity_usd * (1.0 - drain)
+            and (liquidity_usd < floor or price <= position.entry_price)
         ):
             return [
                 ExitOrder(
